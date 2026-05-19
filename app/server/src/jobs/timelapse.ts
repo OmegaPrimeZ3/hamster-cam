@@ -14,7 +14,7 @@ import * as db from '../db.js';
 import { runFfmpeg } from '../frigate.js';
 import { pickTemplate, render } from '../narratives.js';
 
-const logger = pino({ name: 'timelapse-job' });
+const logger = pino({ name: 'timelapse-job', level: process.env['LOG_LEVEL'] ?? 'info' });
 
 const MIN_FRAMES = 30;
 const TARGET_OUTPUT_SECONDS = 30;

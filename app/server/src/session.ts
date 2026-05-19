@@ -1,7 +1,7 @@
 // app/server/src/session.ts
 // Fastify preHandlers that gate every protected route on a valid session
-// cookie. Real implementation against db.ts — no stubs here, this is Stage 1
-// final code.
+// cookie. Backed by db.ts; the cookie value is the random session id and
+// nothing else.
 //
 // PLAN §7.6.3.
 

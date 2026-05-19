@@ -13,7 +13,7 @@ import { getZyphr } from '../zyphr.js';
 
 const execFileP = promisify(execFile);
 
-const logger = pino({ name: 'disk-watch-job' });
+const logger = pino({ name: 'disk-watch-job', level: process.env['LOG_LEVEL'] ?? 'info' });
 
 export type DiskWatchSeverity = 'ok' | 'warn' | 'critical';
 

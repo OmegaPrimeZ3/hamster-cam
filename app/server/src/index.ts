@@ -46,7 +46,7 @@ import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
 import { appRouter, createContext } from './trpc.js';
 
 const execFile = promisify(execFileCb);
-const logger = pino({ name: 'hamster-app' });
+const logger = pino({ name: 'hamster-app', level: process.env['LOG_LEVEL'] ?? 'info' });
 
 export type AppServer = Awaited<ReturnType<typeof buildFastify>>;
 

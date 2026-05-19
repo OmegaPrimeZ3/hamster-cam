@@ -16,7 +16,7 @@ import * as db from './db.js';
 import { extractClip } from './frigate.js';
 import { getZyphr } from './zyphr.js';
 
-const logger = pino({ name: 'share' });
+const logger = pino({ name: 'share', level: process.env['LOG_LEVEL'] ?? 'info' });
 
 const HOUR_MS = 60 * 60 * 1000;
 const ATTACH_LIMIT_BYTES = 20 * 1024 * 1024; // 20MB — typical mail-provider cap

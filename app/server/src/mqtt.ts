@@ -15,7 +15,7 @@ import pino from 'pino';
 import { getConfig } from './config.js';
 import { handleFrigateEvent, type FrigateEvent } from './narrator.js';
 
-const logger = pino({ name: 'mqtt' });
+const logger = pino({ name: 'mqtt', level: process.env['LOG_LEVEL'] ?? 'info' });
 
 const EVENTS_TOPIC = 'frigate/events';
 const CAMERA_STATUS_TOPIC = 'frigate/+/status';

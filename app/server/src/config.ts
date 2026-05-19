@@ -1,8 +1,8 @@
 // app/server/src/config.ts
 // Typed, validated process.env access. Single import point so a forgotten
 // env var fails loudly at boot rather than as a runtime `undefined` deep in a
-// handler. Lazy-evaluated so test code can stub process.env before importing
-// downstream modules.
+// handler. Lazy-evaluated so test code can rewrite process.env before
+// importing downstream modules.
 
 import { z } from 'zod';
 

@@ -3,7 +3,7 @@
 //
 // Single source of truth for cookie issuance + Zyphr-error → HTTP-status
 // mapping. Anything that needs the SDK directly goes through src/zyphr.ts so
-// the SDK client stays a singleton and tests can stub it in one place.
+// the SDK client stays a singleton and tests can override it in one place.
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { randomBytes } from 'node:crypto';

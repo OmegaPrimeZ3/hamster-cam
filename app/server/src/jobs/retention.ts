@@ -8,7 +8,7 @@ import pino from 'pino';
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
 
-const logger = pino({ name: 'retention-job' });
+const logger = pino({ name: 'retention-job', level: process.env['LOG_LEVEL'] ?? 'info' });
 
 export interface RetentionRunResult {
   snapshots_deleted: number;
