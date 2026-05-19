@@ -1,0 +1,18 @@
+[Unit]
+Description=go2rtc watchdog — probe HTTP+RTSP and escalate on persistent failure
+Documentation=https://github.com/aaroncoppock/hamster-cam
+After=go2rtc.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/go2rtc-watchdog.sh
+# The script handles its own logging and always exits 0; running as root
+# lets it call `systemctl restart go2rtc` and `systemctl reboot` on
+# escalation without sudo plumbing.
+User=root
+Group=root
+
+# Lock down the surface to what the script actually needs.
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true

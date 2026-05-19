@@ -1,0 +1,46 @@
+# go2rtc — per-Pi RTSP listener for one IMX462 USB camera.
+#
+# Deployment target: /etc/go2rtc/go2rtc.yaml on each Pi Zero 2 W.
+# Secrets (RTSP_PASSWORD) live in /etc/go2rtc/go2rtc.env (chmod 600, root-owned)
+# and are loaded by the go2rtc.service unit's EnvironmentFile= directive.
+# See docs/SETUP_PI_ZERO.md steps 5–7.
+#
+# Tunables an operator may want to adjust live in the `streams.camera` exec line:
+#   -input_format mjpeg  ← IMX462 ships hardware MJPEG; keep this unless you've
+#                          confirmed a different format with `v4l2-ctl --list-formats-ext`.
+#   -framerate 15        ← bumping above 15 fps on the Pi Zero 2 W's quad-A53 is
+#                          a recipe for dropped frames; tune in concert with the
+#                          Frigate-side `detect.fps` setting on the Mac Mini.
+#   -video_size 1280x720 ← downsize here (e.g. 960x540) if the radio link can't
+#                          sustain 720p over WiFi from the cage room.
+#
+# The `exec:` source pipes the v4l2 capture straight into RTSP with `-c copy`
+# so the Pi never re-encodes — that's the whole reason this stack works on a
+# $15 board. If `-c copy` ever fails (codec mismatch), check that MJPEG is
+# the actual capture format before reaching for libx264 (which the Pi can't
+# realtime-encode at 720p).
+
+# go2rtc's built-in HTTP API + web UI. Used by the watchdog to probe liveness
+# (curl http://localhost:1984/api/streams) and by humans for stream debugging.
+api:
+  listen: ":1984"
+
+# RTSP listener locked with username + password. The password is read from the
+# RTSP_PASSWORD env var which go2rtc interpolates at startup.
+rtsp:
+  listen: ":8554"
+  username: hamster
+  password: ${RTSP_PASSWORD}
+
+# Logging — info is the right balance for a watchdog'd production deployment.
+# Bump to "debug" temporarily when troubleshooting; remember to revert before
+# the SD card's syslog ring fills.
+log:
+  level: info
+  format: text
+
+# One stream per Pi (each Pi only has one camera attached). Frigate on the Mac
+# Mini pulls this as rtsp://hamster:<password>@hamster-cam-N.local:8554/camera.
+streams:
+  camera:
+    - exec:ffmpeg -hide_banner -loglevel warning -f v4l2 -input_format mjpeg -framerate 15 -video_size 1280x720 -i /dev/video0 -c copy -f rtsp {output}
