@@ -1,0 +1,36 @@
+# Node / build output
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.vite/
+coverage/
+.turbo/
+
+# Environment files — keep .env.example tracked, ignore real values
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# SQLite database files and on-host storage
+/db/*.db
+/db/*.db-*
+*.sqlite
+/storage/
+
+# OS noise
+.DS_Store
+Thumbs.db
+*.log
+.vscode/*.log
+
+# Editor backups
+*~
+*.swp
+*.swo
+
+# Python (Frigate runs in Docker but local trainer/tooling scripts may land in-tree)
+__pycache__/
+*.pyc
+.venv/
