@@ -1,0 +1,20 @@
+# Project-wide yamllint config.
+#
+# Validators in CI / docs run `yamllint pi-zero/go2rtc.yaml mac-mini/frigate-config.yml`
+# — this file relaxes the few defaults that don't fit ops YAML (long ffmpeg
+# exec lines, no in-file `---` markers because every file here is a single
+# document).
+extends: default
+
+rules:
+  line-length:
+    max: 200
+    level: warning
+  document-start: disable
+  comments:
+    require-starting-space: true
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  truthy:
+    allowed-values: ['true', 'false', 'on', 'off']
+    check-keys: false

@@ -1,0 +1,158 @@
+# Mac Mini Docker Compose stack — Mosquitto, Frigate, Caddy, Cloudflare DDNS.
+#
+# The hamster-app Fastify backend is NOT in this file. It runs on the host
+# under systemd (see app/server/hamster-app.service). Caddy reverse-proxies
+# to it via host.docker.internal:3000 (mapped to host-gateway on Linux).
+#
+# Pinned image versions:
+#   eclipse-mosquitto:2.0.22                  — MQTT broker (last stable 2.0.x)
+#   ghcr.io/blakeblackshear/frigate:0.17.1    — Frigate NVR + AI detector
+#   favonia/cloudflare-ddns:1.16.2            — Actively-maintained DDNS updater
+#                                               (oznu/cloudflare-ddns is dead, 5yo)
+#   Caddy is built locally from ./caddy/Dockerfile pinning caddy:2.11.3 +
+#   caddy:2-builder for the xcaddy plugin layer.
+#
+# Bring-up order (per docs/SETUP_MAC_MINI.md):
+#   1) docker compose up -d mosquitto
+#   2) docker compose up -d frigate
+#   3) docker compose up -d cloudflare-ddns caddy
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    container_name: hamster-mosquitto
+    restart: unless-stopped
+    # Only published on localhost — Frigate and the host-side backend both
+    # reach it via the compose network (mosquitto:1883) or via 127.0.0.1:1883.
+    # If you need an off-host MQTT client, bind to the LAN IP instead.
+    ports:
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    healthcheck:
+      # mosquitto_sub returns immediately on a successful connect-and-subscribe;
+      # -E exits as soon as the connection completes. -q 0 keeps the log quiet.
+      test:
+        - CMD-SHELL
+        - >-
+          mosquitto_sub -h 127.0.0.1 -p 1883
+          -u "$$MQTT_USERNAME" -P "$$MQTT_PASSWORD"
+          -t '$$SYS/#' -C 1 -E -W 5 >/dev/null 2>&1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    environment:
+      # Surfaced so the healthcheck can authenticate; the broker itself
+      # reads creds from the passwd file inside the config volume.
+      - MQTT_USERNAME=${MQTT_USERNAME}
+      - MQTT_PASSWORD=${MQTT_PASSWORD}
+
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:0.17.1
+    container_name: hamster-frigate
+    restart: unless-stopped
+    privileged: false
+    shm_size: 256mb
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    # iGPU for OpenVINO. /dev/dri must exist on the host (intel-opencl-icd +
+    # intel-media-va-driver-non-free, per docs/SETUP_MAC_MINI.md step 3).
+    devices:
+      - /dev/dri:/dev/dri
+    # NO published ports — Caddy reaches Frigate's web UI / API on the
+    # compose network at http://frigate:5000. The host-side backend reaches
+    # it via host.docker.internal (see app/server/.env: FRIGATE_URL).
+    expose:
+      - "5000"
+    volumes:
+      - ./frigate-config.yml:/config/config.yml:ro
+      - ./storage/frigate:/media/frigate
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+    environment:
+      - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD}
+      - MQTT_USERNAME=${MQTT_USERNAME}
+      - MQTT_PASSWORD=${MQTT_PASSWORD}
+      # Make the LAN IPs predictable in logs even when running rootless.
+      - TZ=${TZ:-Etc/UTC}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5000/api/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  caddy:
+    build:
+      context: ./caddy
+      dockerfile: Dockerfile
+    image: hamster-cam/caddy:local
+    container_name: hamster-caddy
+    restart: unless-stopped
+    # CADDY_HTTPS_PORT (default 2053) is the single inbound TCP+UDP port the
+    # router forwards. The Cloudflare Origin Rule maps edge :443 → origin
+    # :2053 (see docs/PLAN.md §7.2 step 5).
+    ports:
+      - "${CADDY_HTTPS_PORT:-2053}:${CADDY_HTTPS_PORT:-2053}/tcp"
+      - "${CADDY_HTTPS_PORT:-2053}:${CADDY_HTTPS_PORT:-2053}/udp"
+    # Canonical Linux fix for "Caddy reaches the host-side Fastify backend":
+    # remap host.docker.internal to the docker bridge gateway. macOS Docker
+    # Desktop resolves the same name natively, so the override is harmless
+    # there. The backend listens on host port ${PORT:-3000}.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      # Mount /var/log/caddy so fail2ban on the host (or a sidecar) can tail
+      # the JSON access log. Operator must `sudo mkdir -p /var/log/caddy &&
+      # sudo chown 1000:1000 /var/log/caddy` once on the Mac Mini.
+      - /var/log/caddy:/var/log/caddy
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CADDY_EMAIL=${CADDY_EMAIL}
+      - CADDY_HOSTNAME=${CADDY_HOSTNAME}
+      - CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT:-2053}
+    healthcheck:
+      # Caddy exposes its admin API on :2019 inside the container.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  cloudflare-ddns:
+    # favonia/cloudflare-ddns is the maintained successor to the dead
+    # oznu/cloudflare-ddns. Same scoped-token model; no shell in the image
+    # (distroless), so it's small and hard to pop.
+    image: favonia/cloudflare-ddns:1.16.2
+    container_name: hamster-cloudflare-ddns
+    restart: unless-stopped
+    # The image is distroless and ships its own non-root user/uid.
+    network_mode: host
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - DOMAINS=${CLOUDFLARE_SUBDOMAIN}.${CLOUDFLARE_ZONE}
+      - PROXIED=true
+      - IP4_PROVIDER=cloudflare.trace
+      - IP6_PROVIDER=none
+      - UPDATE_CRON=@every 5m
+      - TZ=${TZ:-Etc/UTC}
+    cap_drop:
+      - ALL
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,17 @@
+[Unit]
+Description=go2rtc watchdog — periodic probe of HTTP+RTSP liveness
+Documentation=https://github.com/aaroncoppock/hamster-cam
+
+[Timer]
+# Give the system 2 minutes after boot before the first probe so go2rtc has
+# time to bind its sockets and ffmpeg has time to negotiate with the camera.
+OnBootSec=2min
+# Then probe every 60 seconds. Paired with the 3-strike restart / 10-strike
+# reboot thresholds in go2rtc-watchdog.sh that gives ~3 min to "service
+# restart" and ~10 min to "Pi reboot" once go2rtc wedges.
+OnUnitActiveSec=60s
+Unit=go2rtc-watchdog.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

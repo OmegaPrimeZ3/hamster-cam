@@ -1,0 +1,37 @@
+[Unit]
+Description=go2rtc — RTSP listener for the hamster-cam Pi Zero
+Documentation=https://github.com/AlexxIT/go2rtc https://github.com/aaroncoppock/hamster-cam
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# RTSP_PASSWORD ships in this root-only env file (chmod 600). Keeping the
+# secret here rather than on the ExecStart command line keeps it out of
+# /proc/<pid>/cmdline and out of `ps` output.
+EnvironmentFile=/etc/go2rtc/go2rtc.env
+ExecStart=/usr/local/bin/go2rtc -config /etc/go2rtc/go2rtc.yaml
+Restart=always
+RestartSec=5
+
+# User=root is intentional. The IMX462 lives at /dev/video0, which is owned
+# root:video on Raspberry Pi OS. The cleaner alternative is to run as a
+# non-root user added to the `video` group — but that user also needs to
+# bind :1984 and :8554 (both >1024, so unprivileged is fine there). If you
+# tighten this, also drop the EnvironmentFile permissions to match the new
+# uid. Keeping root for the family-cam deployment because the watchdog
+# (which calls `systemctl restart go2rtc` and `systemctl reboot`) is itself
+# a root unit, and one privilege boundary is simpler to reason about.
+User=root
+Group=root
+
+# Defensive hardening — go2rtc only needs to read /dev/video0, write to its
+# tmp dir, and talk to the network.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log /run
+
+[Install]
+WantedBy=multi-user.target
