@@ -1,0 +1,32 @@
+# hamster-cam — fail2ban jail watching Caddy access logs for /auth/* abuse.
+#
+# Deployment target on the Mac Mini:
+#   /etc/fail2ban/jail.d/caddy.local
+#   /etc/fail2ban/filter.d/caddy-auth.conf  (sibling file in this repo)
+#
+# After dropping both files in place, on the Mac Mini:
+#   sudo apt install -y fail2ban
+#   sudo systemctl enable --now fail2ban
+#   sudo fail2ban-client status caddy-auth
+#
+# The `action = iptables-allports` line bans the source IP at the host
+# iptables/nftables layer — which is the right choice for the documented
+# topology where Caddy runs in a Docker container with the host firewall
+# in front. If you ever swap to running Caddy outside Docker or on a host
+# without iptables (some hardened distros), switch to `action = nftables`
+# or the docker-aware `iptables[chain=DOCKER-USER]` action and remove this
+# comment.
+
+[caddy-auth]
+enabled = true
+filter = caddy-auth
+# Caddy writes JSON access logs at /var/log/caddy/access.log inside the
+# container. The compose mount surfaces them on the host at the same path
+# (see mac-mini/docker-compose.yml — caddy.volumes). fail2ban runs on the
+# host and reads the file directly.
+logpath = /var/log/caddy/access.log
+backend = auto
+maxretry = 10
+findtime = 10m
+bantime = 1h
+action = iptables-allports[name=caddy-auth]
