@@ -1,0 +1,103 @@
+# hamster-cam Caddy config.
+#
+# This file lives at /etc/caddy/Caddyfile inside the container; the host
+# copy is mac-mini/caddy/Caddyfile.
+#
+# Hardening references: docs/PLAN.md §7.5, §7.7. Env vars come from
+# /opt/hamster-cam/.env via the compose service definition.
+{
+	email {env.CADDY_EMAIL}
+
+	# Non-standard HTTPS port — see PLAN §7.4. Every site below shares
+	# this listener; Caddy SNI-routes by hostname, so adding services
+	# later never requires a new router forward.
+	https_port {$CADDY_HTTPS_PORT:2053}
+
+	# Port 80 is intentionally NOT forwarded at the router, so the
+	# auto-redirect shim has nothing to bind. Skip it entirely.
+	auto_https disable_redirects
+
+	# Strong defaults for log volume — JSON access logs roll out below.
+	log {
+		format json
+	}
+}
+
+# Snippet shared by every site: Cloudflare-DNS-01 TLS, compression,
+# defense-in-depth security headers (PLAN §7.7), and access logging.
+(common) {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	encode zstd gzip
+
+	header {
+		# 1-year HSTS, includeSubDomains + preload-ready.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		# MIME-sniff protection (legacy browsers).
+		X-Content-Type-Options "nosniff"
+		# Clickjacking (frame-ancestors in CSP is the modern equivalent; this
+		# is the legacy-UA belt-and-braces).
+		X-Frame-Options "DENY"
+		# Don't leak the URL on outbound nav.
+		Referrer-Policy "no-referrer"
+		# Lock down powerful browser APIs the app doesn't use.
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), accelerometer=(), gyroscope=()"
+		# Cross-origin isolation hygiene.
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		# Tight CSP. `media-src self blob:` covers go2rtc WebRTC/MSE blobs;
+		# `connect-src` covers tRPC (same-origin) + the Zyphr API + same-
+		# origin WebSocket for tRPC subscriptions.
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://api.zyphr.dev wss://{host}; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+		# Hide the Caddy banner.
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10mb
+			roll_keep 10
+		}
+		format json
+	}
+}
+
+# Primary site — the kid-facing cam app.
+{$CADDY_HOSTNAME} {
+	import common
+
+	# Throttle brute-force attempts on /auth/* paths. Zyphr does its own
+	# 429 rate-limiting (PLAN §7.6.5); this is the edge belt-and-braces.
+	# The caddy-ratelimit plugin's `zone` is keyed on remote_host; 20
+	# events / 1 min / IP is generous enough not to false-positive a
+	# household but tight enough to defeat a credential-stuffing run.
+	@auth_paths path /auth/*
+	rate_limit @auth_paths {
+		zone auth {
+			key {remote_host}
+			events 20
+			window 1m
+		}
+	}
+
+	# Reverse-proxy to the host-side Fastify app. The compose service
+	# injects `host.docker.internal:host-gateway` so this resolves on
+	# Linux as well as macOS Docker Desktop. Pass real IP through.
+	# Caddy already forwards X-Forwarded-For / X-Forwarded-Proto / Host
+	# by default, so we only need to override X-Real-IP (which Caddy
+	# doesn't set automatically).
+	reverse_proxy host.docker.internal:3000 {
+		header_up X-Real-IP {remote_host}
+	}
+}
+
+# Future-services template — see PLAN §7.5.1.
+# Drop in a new block, point DNS at Cloudflare (orange-cloud), reload Caddy.
+# No new router forward needed — SNI multiplexes everything on :2053.
+#
+# blog.{env.CLOUDFLARE_ZONE} {
+#     import common
+#     reverse_proxy host.docker.internal:2368
+# }

@@ -1,0 +1,185 @@
+# Frigate — three Pi Zero cameras, MQTT to local Mosquitto, OpenVINO
+# inference on the Mac Mini's Intel UHD 630 iGPU.
+#
+# This file is rendered by Frigate with `{ENV}` substitutions at startup
+# — keep secrets out of here and in /opt/hamster-cam/.env.
+#
+# See docs/PLAN.md §4 and docs/SETUP_MAC_MINI.md step 8 for the bring-up
+# procedure (zone editor, model swap, etc.). Zone NAMES below
+# (`wheel`, `food`, `water`) MUST match app/server/src/narratives.ts.
+
+mqtt:
+  enabled: true
+  host: mosquitto
+  port: 1883
+  # Same broker, same credentials as the backend. PLAN §2.3 + .env.example —
+  # one MQTT_USERNAME / MQTT_PASSWORD pair is reused across every client.
+  user: "{MQTT_USERNAME}"
+  password: "{MQTT_PASSWORD}"
+  topic_prefix: frigate
+  client_id: frigate-mac-mini
+  stats_interval: 60
+
+# OpenVINO on the iGPU. The default `ssdlite_mobilenet_v2` model ships
+# inside the Frigate image and knows the COCO classes (which includes
+# `mouse` and `cat` — see PLAN §4.3 "quick path"). Swap to a custom
+# YOLO IR after the Roboflow training round; just point `path` at a
+# file in /config and update labelmap.
+detectors:
+  ov:
+    type: openvino
+    device: GPU
+
+model:
+  width: 300
+  height: 300
+  input_tensor: nhwc
+  input_pixel_format: bgr
+  path: /openvino-model/ssdlite_mobilenet_v2.xml
+  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
+
+# Defaults applied to every camera unless overridden. Per-PLAN §8 retention
+# math: continuous = 3 days, event clips = 30 days.
+record:
+  enabled: true
+  retain:
+    days: 3
+    mode: motion
+  events:
+    pre_capture: 5
+    post_capture: 5
+    retain:
+      default: 30
+      mode: active_objects
+
+snapshots:
+  enabled: true
+  timestamp: false
+  bounding_box: true
+  retain:
+    default: 14
+
+# `mouse` and `cat` are COCO classes the default detector already knows —
+# good enough to fire the wheel/food/water zones until a custom YOLO ships.
+# `min_score` of 0.30 is intentionally lenient per PLAN §4.3 "quick path".
+objects:
+  track:
+    - mouse
+    - cat
+  filters:
+    mouse:
+      min_score: 0.30
+      threshold: 0.50
+    cat:
+      min_score: 0.30
+      threshold: 0.50
+
+ffmpeg:
+  hwaccel_args: preset-vaapi
+  output_args:
+    record: preset-record-generic-audio-copy
+
+# Per-camera blocks. Zones are placeholders — the operator uses Frigate's
+# zone editor in the web UI to draw real boxes over each cage and then
+# Frigate writes the updated coordinates back into this file. See
+# docs/SETUP_MAC_MINI.md step 8.3. Names must match the narrator's
+# expectations.
+cameras:
+  hamster_cam_1:
+    ffmpeg:
+      inputs:
+        - path: rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera
+          roles:
+            - detect
+            - record
+    detect:
+      width: 1280
+      height: 720
+      fps: 5
+    objects:
+      track:
+        - mouse
+        - cat
+      filters:
+        mouse:
+          min_score: 0.30
+        cat:
+          min_score: 0.30
+    zones:
+      wheel:
+        coordinates: 0.05,0.10,0.45,0.10,0.45,0.55,0.05,0.55
+      food:
+        coordinates: 0.55,0.10,0.95,0.10,0.95,0.55,0.55,0.55
+      water:
+        coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
+
+  hamster_cam_2:
+    ffmpeg:
+      inputs:
+        - path: rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera
+          roles:
+            - detect
+            - record
+    detect:
+      width: 1280
+      height: 720
+      fps: 5
+    objects:
+      track:
+        - mouse
+        - cat
+      filters:
+        mouse:
+          min_score: 0.30
+        cat:
+          min_score: 0.30
+    zones:
+      wheel:
+        coordinates: 0.05,0.10,0.45,0.10,0.45,0.55,0.05,0.55
+      food:
+        coordinates: 0.55,0.10,0.95,0.10,0.95,0.55,0.55,0.55
+      water:
+        coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
+
+  hamster_cam_3:
+    ffmpeg:
+      inputs:
+        - path: rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-3.local:8554/camera
+          roles:
+            - detect
+            - record
+    detect:
+      width: 1280
+      height: 720
+      fps: 5
+    objects:
+      track:
+        - mouse
+        - cat
+      filters:
+        mouse:
+          min_score: 0.30
+        cat:
+          min_score: 0.30
+    zones:
+      wheel:
+        coordinates: 0.05,0.10,0.45,0.10,0.45,0.55,0.05,0.55
+      food:
+        coordinates: 0.55,0.10,0.95,0.10,0.95,0.55,0.55,0.55
+      water:
+        coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
+
+go2rtc:
+  streams:
+    hamster_cam_1:
+      - "rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera"
+    hamster_cam_2:
+      - "rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera"
+    hamster_cam_3:
+      - "rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-3.local:8554/camera"
+
+logger:
+  default: info
+  logs:
+    frigate.app: info
+    frigate.mqtt: info
