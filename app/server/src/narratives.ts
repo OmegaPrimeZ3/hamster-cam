@@ -1,7 +1,6 @@
 // app/server/src/narratives.ts
-// Pure template strings — no I/O, no SDK calls. Real implementation lives here
-// at Stage 1; the narrator that picks from these strings is the Stage 2a stub
-// in narrator.ts.
+// Pure template strings — no I/O, no SDK calls. The narrator that picks
+// from these templates lives in narrator.ts.
 //
 // PLAN §5.4 Diary.
 

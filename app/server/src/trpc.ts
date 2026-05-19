@@ -27,6 +27,8 @@ import * as db from './db.js';
 import { resolveSession } from './session.js';
 import * as frigate from './frigate.js';
 import { triggerForgotPassword, registerAccount, ZyphrEmailTaken } from './zyphr.js';
+import { saveManualSnapshot, getRecentEvents } from './narrator.js';
+import { startShareJob } from './share.js';
 
 // ---------------------------------------------------------------------------
 // Context
@@ -421,21 +423,33 @@ const activityRouter = router({
       return db.listDiaryEntriesBetween(start, end).map(diaryToDTO);
     }),
 
-  // Manual "Take a photo!" from the maximized view. Body stage-2a; the IO is
-  // final here because the frontend's `MaximizedCamera` component depends on
-  // the returned diary entry shape.
+  // Manual "Take a photo!" from the maximized view. Returns the diary entry
+  // the frontend renders inline.
   snapshot: protectedProcedure
     .input(z.object({ camera_id: z.number().int() }))
     .output(diaryEntrySchema)
-    .mutation(() => {
-      throw new TRPCError({
-        code: 'NOT_IMPLEMENTED',
-        message: 'Stage 2a will implement activity.snapshot',
+    .mutation(async ({ input }) => {
+      const camera = db.getCameraById(input.camera_id);
+      if (!camera) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'camera not found' });
+      }
+      const now = Date.now();
+      // Frigate exposes a `latest.jpg` for any tracked camera; we cache that
+      // image into STORAGE_PATH/snapshots/<camera>-<ts>.jpg. The file write is
+      // best-effort: if Frigate isn't reachable we still record the diary
+      // row with an empty media_path so the timestamp lands in the day's
+      // feed.
+      const mediaRel = await frigate.captureLatestSnapshot(camera.name, now);
+      const entry = await saveManualSnapshot({
+        cameraId: camera.id,
+        takenAt: now,
+        mediaPath: mediaRel,
       });
+      return diaryToDTO(entry);
     }),
 
   // Admin-only debugging view: the in-memory ring buffer the narrator keeps
-  // for tuning TRANSITION_WINDOW_MS / MIN_DWELL_MS. Stage 2a.
+  // for tuning TRANSITION_WINDOW_MS / MIN_DWELL_MS.
   recentEvents: adminProcedure
     .meta({ audit: false })
     .input(z.void())
@@ -446,12 +460,7 @@ const activityRouter = router({
       type: z.enum(['new', 'update', 'end']),
       at: z.number().int(),
     })))
-    .query(() => {
-      throw new TRPCError({
-        code: 'NOT_IMPLEMENTED',
-        message: 'Stage 2a will implement activity.recentEvents',
-      });
-    }),
+    .query(() => getRecentEvents()),
 });
 
 // ---------------------------------------------------------------------------
@@ -467,13 +476,28 @@ const statsRouter = router({
       restful_ratio: z.number().min(0).max(1),
     }))
     .query(() => {
-      // Real aggregation is Stage 2a's job. Returning zeros from real data
-      // here would silently mask Stage 2a never running; throw instead so a
-      // forgotten implementation surfaces loudly in dev.
-      throw new TRPCError({
-        code: 'NOT_IMPLEMENTED',
-        message: 'Stage 2a will implement stats.today',
-      });
+      const start = startOfLocalDay(new Date());
+      const end = start + 24 * 60 * 60 * 1000;
+      const entries = db.listDiaryEntriesBetween(start, end);
+      let wheelMs = 0;
+      let snackVisits = 0;
+      let restfulMs = 0;
+      let activeMs = 0;
+      for (const e of entries) {
+        const dur = e.duration_ms ?? 0;
+        if (e.activity === 'wheel') wheelMs += dur;
+        if (e.activity === 'food') snackVisits += 1;
+        if (e.activity === 'resting') restfulMs += dur;
+        if (e.activity && e.activity !== 'snapshot' && e.activity !== 'timelapse') {
+          activeMs += dur;
+        }
+      }
+      const restfulRatio = activeMs > 0 ? Math.min(1, restfulMs / activeMs) : 0;
+      return {
+        wheel_ms: wheelMs,
+        snack_visits: snackVisits,
+        restful_ratio: restfulRatio,
+      };
     }),
 });
 
@@ -697,12 +721,13 @@ const shareRouter = router({
       recipient_id: z.number().int(),
     }))
     .output(shareLogSchema)
-    .mutation(() => {
-      // Body needs ffmpeg + Zyphr emails. Stage 2a.
-      throw new TRPCError({
-        code: 'NOT_IMPLEMENTED',
-        message: 'Stage 2a will implement share.send',
+    .mutation(async ({ ctx, input }) => {
+      const row = await startShareJob({
+        userId: ctx.user.id,
+        recipientId: input.recipient_id,
+        diaryEntryId: input.diary_entry_id,
       });
+      return row;
     }),
 
   /** Live status of a previously-queued send. Polled by the frontend. */

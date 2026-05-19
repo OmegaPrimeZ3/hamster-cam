@@ -5,5 +5,9 @@ export default defineConfig({
     include: ['test/**/*.test.ts'],
     environment: 'node',
     testTimeout: 10_000,
+    env: {
+      // Silence pino during tests; individual tests that need logs override.
+      LOG_LEVEL: 'silent',
+    },
   },
 });
