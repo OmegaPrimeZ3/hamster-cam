@@ -1,0 +1,24 @@
+[Unit]
+Description=hamster-cam Fastify + tRPC app server
+Documentation=https://github.com/aaron/hamster-cam
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hamster
+Group=hamster
+WorkingDirectory=/opt/hamster-cam/app/server
+EnvironmentFile=/opt/hamster-cam/.env
+ExecStart=/usr/bin/node /opt/hamster-cam/app/server/dist/index.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# Sensible hardening — tweak per deployment if it interferes with /opt/hamster-cam.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

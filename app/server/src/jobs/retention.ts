@@ -1,9 +1,14 @@
 // app/server/src/jobs/retention.ts
-// Nightly retention sweep:
-//   - delete snapshots older than settings.snapshot_retention_days
-//   - clear `media_path` on timelapses older than settings.timelapse_retention_days
-//   - prune audit_log rows older than settings.audit_retention_days
-// PLAN §8 Disk-space planning + alerts.
+// Nightly retention sweep. PLAN §8.
+
+import { unlink } from 'node:fs/promises';
+import { join, isAbsolute } from 'node:path';
+import pino from 'pino';
+
+import { getConfig } from '../config.js';
+import * as db from '../db.js';
+
+const logger = pino({ name: 'retention-job' });
 
 export interface RetentionRunResult {
   snapshots_deleted: number;
@@ -11,6 +16,72 @@ export interface RetentionRunResult {
   audit_rows_deleted: number;
 }
 
+function days(n: number): number {
+  return n * 24 * 60 * 60 * 1000;
+}
+
+function readSettingInt(key: string, fallback: number): number {
+  const raw = db.getSetting(key);
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+async function deleteFileBestEffort(absOrRel: string): Promise<void> {
+  const cfg = getConfig();
+  const abs = isAbsolute(absOrRel) ? absOrRel : join(cfg.STORAGE_PATH, absOrRel);
+  await unlink(abs).catch((err: NodeJS.ErrnoException) => {
+    if (err.code !== 'ENOENT') {
+      logger.warn({ path: abs, err: err.message }, 'failed to delete retention file');
+    }
+  });
+}
+
 export async function runRetentionJob(): Promise<RetentionRunResult> {
-  throw new Error('Stage 2a will implement jobs.retention.runRetentionJob');
+  const now = Date.now();
+  const snapWindow = days(readSettingInt('snapshot_retention_days', 90));
+  const tlWindow = days(readSettingInt('timelapse_retention_days', 30));
+  const auditWindow = days(readSettingInt('audit_retention_days', 365));
+
+  // Snapshots — delete file then row.
+  const snapshotsToDelete = db.listSnapshotsBetween(0, now - snapWindow);
+  for (const snap of snapshotsToDelete) {
+    await deleteFileBestEffort(snap.path);
+  }
+  const snapshotsDeleted = db.deleteSnapshotsOlderThan(now - snapWindow);
+  const snapshotDiaryDeleted = db.deleteOldSnapshotDiaryEntries(now - snapWindow);
+
+  // Timelapses — clear the media file + null out the media_path column.
+  // The diary entry itself stays so the audit/admin history isn't rewritten.
+  const cutoffTl = now - tlWindow;
+  const oldTimelapses = db.listDiaryEntriesByKindBetween('timelapse', 0, cutoffTl);
+  let timelapseFiles = 0;
+  for (const entry of oldTimelapses) {
+    if (entry.media_path) {
+      await deleteFileBestEffort(entry.media_path);
+      timelapseFiles += 1;
+    }
+  }
+  db.clearOldTimelapseMedia(cutoffTl);
+
+  const auditRowsDeleted = db.deleteAuditOlderThan(now - auditWindow);
+
+  // Also opportunistically purge expired sessions — cheap and keeps the
+  // table from growing forever in a long-lived install.
+  db.purgeExpiredSessions(now);
+
+  logger.info(
+    {
+      snapshotsDeleted,
+      snapshotDiaryDeleted,
+      timelapseFiles,
+      auditRowsDeleted,
+    },
+    'retention sweep complete',
+  );
+  return {
+    snapshots_deleted: snapshotsDeleted,
+    timelapse_media_cleared: timelapseFiles,
+    audit_rows_deleted: auditRowsDeleted,
+  };
 }
