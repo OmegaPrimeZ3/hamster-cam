@@ -1,0 +1,53 @@
+{
+  "name": "@hamster-cam/server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./trpc": {
+      "types": "./dist/trpc.d.ts",
+      "import": "./dist/trpc.js"
+    }
+  },
+  "bin": {
+    "hamster": "dist/bootstrap.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "migrate": "tsx src/migrate.ts",
+    "bootstrap-admin": "tsx src/bootstrap.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "10.0.1",
+    "@trpc/server": "10.45.2",
+    "@zyphr-dev/node-sdk": "0.1.24",
+    "better-sqlite3": "11.3.0",
+    "fastify": "5.0.0",
+    "mqtt": "5.10.1",
+    "node-cron": "3.0.3",
+    "pino": "9.4.0",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.11",
+    "@types/node": "20.16.10",
+    "@types/node-cron": "3.0.11",
+    "tsup": "8.3.0",
+    "tsx": "4.19.1",
+    "typescript": "5.6.2",
+    "vitest": "2.1.1"
+  }
+}
