@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["node", "vite/client", "vite-plugin-pwa/client", "vitest/globals", "@testing-library/jest-dom"],
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+    "allowSyntheticDefaultImports": true,
+    "useDefineForClassFields": true,
+    "noEmit": true,
+    "exactOptionalPropertyTypes": false
+  },
+  "include": ["src/**/*", "test/**/*", "vite.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}
