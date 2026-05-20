@@ -7,14 +7,14 @@ import { existsSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import pino from 'pino';
 
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
 import { runFfmpeg } from '../frigate.js';
+import { childLogger } from '../logger.js';
 import { pickTemplate, render } from '../narratives.js';
 
-const logger = pino({ name: 'timelapse-job', level: process.env['LOG_LEVEL'] ?? 'info' });
+const logger = childLogger('timelapse-job');
 
 const MIN_FRAMES = 30;
 const TARGET_OUTPUT_SECONDS = 30;

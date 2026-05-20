@@ -26,7 +26,6 @@ import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
 import { fastifyTRPCPlugin } from '@trpc/server/adapters/fastify';
 import cron, { type ScheduledTask } from 'node-cron';
-import pino from 'pino';
 
 import {
   forgotPassword,
@@ -41,17 +40,25 @@ import { getDb, purgeExpiredSessions } from './db.js';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRetentionJob } from './jobs/retention.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
+import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
 import { appRouter, createContext } from './trpc.js';
 
 const execFile = promisify(execFileCb);
-const logger = pino({ name: 'hamster-app', level: process.env['LOG_LEVEL'] ?? 'info' });
 
 export type AppServer = Awaited<ReturnType<typeof buildFastify>>;
 
 function buildFastify() {
-  return Fastify({ loggerInstance: logger });
+  // trustProxy covers loopback + the docker bridge subnet so Fastify treats
+  // the X-Real-IP / X-Forwarded-For headers Caddy sets as authoritative
+  // (paired with Security-Review Finding 1's `trusted_proxies cloudflare`
+  // Caddy block). 172.16.0.0/12 is broad enough to cover every default
+  // docker bridge network the compose stack will see.
+  return Fastify({
+    loggerInstance: logger,
+    trustProxy: ['127.0.0.1', '::1', '172.16.0.0/12'],
+  });
 }
 
 export async function buildServer(): Promise<AppServer> {
@@ -88,7 +95,11 @@ export async function buildServer(): Promise<AppServer> {
   app.post('/auth/password/forgot', forgotPassword);
   app.post('/auth/password/reset', resetPassword);
 
-  // REST: /health  (no auth — local-only; Caddy rate-limits the path)
+  // REST: /health is reachable on the LAN for docker healthchecks; Caddy
+  // returns 404 to external requests via an internal-IP allowlist (see the
+  // infra-engineer Stage 5 fix for Security-Review Finding 3). Kept
+  // unauthenticated here because docker healthchecks can't carry session
+  // cookies — the Caddy ACL is what keeps the path off the public internet.
   app.get('/health', async () => {
     const result = {
       ok: true,

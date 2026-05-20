@@ -253,6 +253,15 @@ export async function me(
 /**
  * POST /auth/password/forgot — body `{ email }`. Always returns 204 so we
  * never leak whether the email is in our system.
+ *
+ * Security-Review Finding 7: previously we branched on
+ * `db.getUserByEmail(email)` and skipped the outbound Zyphr call when the
+ * email had no local mirror. That skip was measurable in milliseconds and
+ * partially defeated the non-enumeration contract — an attacker could
+ * timing-compare a list of emails to find which had a local row. Fix is to
+ * ALWAYS call triggerForgotPassword regardless of local-mirror state. The
+ * helper already swallows errors, and Zyphr's own non-enumeration handling
+ * is the authoritative protection at that layer.
  */
 export async function forgotPassword(
   req: FastifyRequest,
@@ -265,12 +274,9 @@ export async function forgotPassword(
     reply.code(204).send();
     return;
   }
-  const { email } = parsed.data;
-  // Only call Zyphr if there's a matching local row — saves Zyphr quota and
-  // keeps the surface dead-simple for callers.
-  if (db.getUserByEmail(email)) {
-    await triggerForgotPassword(email);
-  }
+  // Unconditionally fan out to Zyphr — defeats the timing oracle the previous
+  // branch-on-local-mirror logic exposed.
+  await triggerForgotPassword(parsed.data.email);
   reply.code(204).send();
 }
 
