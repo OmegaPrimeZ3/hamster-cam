@@ -202,7 +202,7 @@ pnpm dev
 If you'd rather drive the workspaces independently (e.g. restart just the
 backend), use two terminals: `pnpm -F server dev` and `pnpm -F web dev`.
 
-Open <http://localhost:5173> and sign in:
+Open <http://localhost:5181> and sign in:
 
 - **Email:** `dev@hamster.local`
 - **Password:** `hunterhunter`
@@ -216,7 +216,7 @@ to factory defaults.
 
 **Ports.** Backend defaults to **5180** (deliberately off the crowded 3000
 range so multiple Node projects can run in parallel); web defaults to
-**5173**. Both halves read the same env vars — set them once and `pnpm dev`
+**5181**. Both halves read the same env vars — set them once and `pnpm dev`
 propagates them to both children:
 
 ```sh

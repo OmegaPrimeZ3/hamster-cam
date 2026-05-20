@@ -6,7 +6,7 @@
 // - Path alias `@` → `src/`
 // - Dev proxy `/trpc` / `/auth` / `/snapshots` / `/stream` → the local
 //   backend so `pnpm dev` works against a running server. The backend port
-//   defaults to 5180 (deliberately off the crowded 3000 range so multiple
+//   defaults to 5181 (deliberately off the crowded 3000 range so multiple
 //   projects can run in parallel) and is overridable via HC_BACKEND_PORT.
 //   The dev launcher in app/server/src/dev.ts reads the same env var.
 // - vite-plugin-pwa configured per PLAN §5.4 Workbox strategies:
@@ -97,7 +97,7 @@ export default defineConfig({
     },
   },
   server: {
-    port: Number.parseInt(process.env['HC_WEB_PORT'] ?? '5173', 10),
+    port: Number.parseInt(process.env['HC_WEB_PORT'] ?? '5181', 10),
     host: true,
     proxy: (() => {
       const backend = `http://localhost:${process.env['HC_BACKEND_PORT'] ?? '5180'}`;

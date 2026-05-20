@@ -20,6 +20,12 @@ interface DevUser {
 export interface DevZyphrMock {
   /** `http://127.0.0.1:<port>/v1` — pass to the backend via ZYPHR_BASE_URL. */
   baseUrl: string;
+  /**
+   * Idempotently put a user into the in-memory store. Used by the dev
+   * launcher to re-populate the stub on every restart, because the local
+   * SQLite users table persists across runs but this stub does not.
+   */
+  seedUser: (user: DevUser) => void;
   close: () => Promise<void>;
 }
 
@@ -99,6 +105,9 @@ export async function startDevZyphrMock(): Promise<DevZyphrMock> {
 
   return {
     baseUrl: `http://127.0.0.1:${port}/v1`,
+    seedUser(user) {
+      users.set(user.email.toLowerCase(), { ...user, email: user.email.toLowerCase() });
+    },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }

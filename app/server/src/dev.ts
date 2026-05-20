@@ -68,9 +68,21 @@ async function main(): Promise<void> {
       throw err;
     });
     logger.info({ email: DEV_EMAIL, password: DEV_PASSWORD }, '[dev] bootstrapped admin');
-  } else {
-    logger.info('[dev] admin already exists; sign in with your previous credentials');
   }
+
+  // The Zyphr stub is in-memory and forgets its users on every launcher
+  // restart, but the local SQLite users table persists at <repo>/.dev/db/.
+  // Re-seed the stub with every local user under DEV_PASSWORD so login keeps
+  // working after a restart without having to wipe .dev/.
+  for (const u of db.listUsers()) {
+    zyphr.seedUser({
+      email: u.email,
+      password: DEV_PASSWORD,
+      zyphr_user_id: u.zyphr_user_id,
+      name: u.display_name,
+    });
+  }
+  logger.info({ count: db.countUsers(), password: DEV_PASSWORD }, '[dev] re-seeded Zyphr stub from local users');
 
   if (!db.getSetting('pet_name')) {
     db.setSetting('pet_name', DEV_PET_NAME);
@@ -83,7 +95,7 @@ async function main(): Promise<void> {
     {
       sandbox,
       backend: `http://localhost:${process.env['PORT']}`,
-      web: `http://localhost:${process.env['HC_WEB_PORT'] ?? '5173'}`,
+      web: `http://localhost:${process.env['HC_WEB_PORT'] ?? '5181'}`,
       email: DEV_EMAIL,
       password: DEV_PASSWORD,
     },

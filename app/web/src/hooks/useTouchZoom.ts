@@ -98,16 +98,6 @@ export function useTouchZoom(args: UseTouchZoomArgs = {}): UseTouchZoomReturn {
   }, []);
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
-    const target = e.currentTarget as Element & {
-      setPointerCapture?: (id: number) => void;
-    };
-    if (target.setPointerCapture) {
-      try {
-        target.setPointerCapture(e.pointerId);
-      } catch {
-        /* setPointerCapture occasionally throws on synthetic events; ignore */
-      }
-    }
     const rect = (e.currentTarget as Element).getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -135,6 +125,9 @@ export function useTouchZoom(args: UseTouchZoomArgs = {}): UseTouchZoomReturn {
     swipeCommittedRef.current = false;
 
     if (pointersRef.current.size === 2) {
+      // Multi-touch zoom — claim exclusive ownership so the second finger
+      // can't accidentally trigger an underlying control on release.
+      capturePointer(e);
       const ps = Array.from(pointersRef.current.values());
       const p1 = ps[0]!;
       const p2 = ps[1]!;
@@ -158,8 +151,15 @@ export function useTouchZoom(args: UseTouchZoomArgs = {}): UseTouchZoomReturn {
         originY: (midY / rect.height) * 100,
       }));
     } else if (pointersRef.current.size === 1 && state.scale > 1) {
+      // Already zoomed → this single touch will be a pan, claim ownership.
+      capturePointer(e);
       setState((s) => ({ ...s, mode: 'pan' }));
     } else {
+      // First touch at scale 1 — could be a tap on a button, the start of a
+      // swipe, or a double-tap. Do NOT capture yet; if it turns into a swipe,
+      // onPointerMove claims capture at the moment it commits. Leaving the
+      // pointer uncaptured here lets clicks reach interactive children
+      // (close button, PIP, snapshot, etc.).
       setState((s) => ({ ...s, mode: 'idle' }));
     }
   }, [reset, state.scale, state.offsetX, state.offsetY]);
@@ -210,6 +210,10 @@ export function useTouchZoom(args: UseTouchZoomArgs = {}): UseTouchZoomReturn {
         Math.abs(totalDx) > Math.abs(totalDy)
       ) {
         swipeCommittedRef.current = true;
+        // Now that we've committed to a swipe, claim the pointer so the rest
+        // of the gesture (and the eventual pointerup) stay with the bind
+        // container instead of getting handed back to a child on release.
+        capturePointer(e);
         setState((s) => ({ ...s, mode: 'swipe' }));
       }
     }
@@ -287,4 +291,16 @@ function clamp(value: number, min: number, max: number): number {
   if (value < min) return min;
   if (value > max) return max;
   return value;
+}
+
+function capturePointer(e: React.PointerEvent): void {
+  const target = e.currentTarget as Element & {
+    setPointerCapture?: (id: number) => void;
+  };
+  if (!target.setPointerCapture) return;
+  try {
+    target.setPointerCapture(e.pointerId);
+  } catch {
+    /* occasionally throws on synthetic events; safe to ignore */
+  }
 }
