@@ -1,19 +1,19 @@
 # remy-hamster
 
-> A weekend-buildable, child-friendly pet camera system with AI activity
-> detection and a storybook-style activity diary.
+> A weekend-buildable, child-friendly pet camera. Cheap Pi-Zero cameras,
+> on-device AI, a storybook activity diary, and now a tiny AI ghostwriter
+> that tucks your hamster in at night.
 
 <!-- Hero placeholder — drop a 5-second GIF of the tablet view here once the
-     UI is screen-recordable. See PLAN §9.4 for sizing notes. -->
+     UI is screen-recordable. -->
 ![Hero — tablet view of the camera grid + diary](docs/hero.png)
 
 ## The story
 
-I built this for my daughter. She loves Remy, her hamster, and Remy lives
-in a cage in a room she's not always in. So we set out to give her a way
-to peek in on him from anywhere — running on his wheel, sneaking a
-midnight snack, or curled up asleep — and to read a little diary of his
-day.
+I built this for my daughter. She loves Remy, her hamster. Remy lives in
+a cage in a room she's not always in. So we set out to give her a way to
+peek in on him from anywhere — running on his wheel, sneaking a midnight
+snack, curled up asleep — and to read a little diary of his day.
 
 What started as "stick a webcam on a Pi" turned into a full self-hosted
 multi-camera AI activity-tracking pet-cam, because that's what happens
@@ -23,25 +23,69 @@ a step-by-step plan that takes a weekend.
 
 If you build one, please send a photo.
 
+## Table of contents
+
+- [What it does](#what-it-does) — feature tour
+- [Who is this for?](#who-is-this-for)
+- [Hardware shopping list](#hardware-shopping-list)
+- [Quick start](#quick-start)
+- [Run locally for UI review](#run-locally-for-uiux-review) — no Pis, no Frigate
+- [Configuration & secrets](#configuration--secrets)
+- [Optional features & how to enable them](#optional-features--how-to-enable-them)
+- [Architecture](#architecture)
+- [Tech stack](#tech-stack)
+- [Customization](#customization)
+- [Contributing](#contributing)
+
 ## What it does
 
-- Multi-camera live streaming from cheap WiFi-connected Pi Zero rigs
-- On-device AI detection (Frigate + OpenVINO) flags activity in zones:
-  wheel, food bowl, water, hideaway, etc.
-- Renders raw events as a kid-friendly storybook diary:
+### Core
+
+- **Live multi-camera streaming** from cheap WiFi-connected Pi Zero rigs
+  (3 cameras shipped by default, scales out).
+- **On-device AI activity detection** via Frigate + OpenVINO. Per-zone
+  boxes flag wheel, food bowl, water, tunnel, hideaway, and more.
+- **Kid-friendly storybook diary** translates raw events into prose:
   *"Remy went for a run on the wheel — 8 min!"*
-- Earns playful badges (Night Owl, Marathon Runner, Foodie)
-- One-tap snapshot button saves treasured memories
-- Self-hosted at a real domain (`cam.remy-hamster.com`) with dynamic
-  DNS, TLS, and SSO auth so grandma can watch from her couch
-- **Zyphr.dev email/password sign-in with role-based access** — the
-  Login form is rendered by our app and matches the kid-friendly
-  theme; the backend proxies credentials to Zyphr's `/auth/login`
-  API; admins create every account from Settings (calls Zyphr's
-  `/auth/register`); child accounts see cameras and the diary but
-  can't reach Settings; Zyphr handles password storage, hashing,
-  and rate-limiting
-- Designed tablet-first, 64px tap targets, read-aloud support
+  Each entry is a torn-page card with a soft watercolor tint.
+- **Playful badges** earned automatically: Night Owl, Marathon Runner,
+  Foodie, Early Bird, Memory Keeper, Hat Trick — plus distance badges
+  (Mile High Club, Marathon Club, Ultra) when the wheel odometer is on.
+- **🏃 Wheel odometer** *(optional, see below)*: stick a piece of dark
+  tape on the wheel rim and the app counts rotations from the camera
+  feed. The diary then says *"… ran on the wheel for 8 min · 0.27 mi"*
+  and the stats strip shows weekly distance.
+- **One-tap snapshot button** saves the moment to a Memory Keeper feed.
+- **Nightly time-lapse** stitches the day's snapshots into a 25–35s MP4,
+  watermarked and tucked into the diary the next morning.
+
+### Sharing & access
+
+- **Self-hosted at your own domain** (`cam.remy-hamster.com`) with
+  dynamic DNS, Let's Encrypt TLS, and a non-standard HTTPS port so
+  Grandma can watch from her couch.
+- **Zyphr.dev email/password sign-in** with role-based access.
+  Our own kid-friendly Login form; the backend proxies credentials to
+  Zyphr's API; Zyphr handles password storage, hashing, and rate-limiting.
+- **Two roles:** `admin` manages everything, `child` sees cameras and
+  the diary but never the Settings drawer.
+- **Send-a-Clip:** share an individual diary card via email to a
+  pre-approved recipient list.
+
+### Whimsy & accessibility
+
+- **Tablet-first**, 64-px tap targets, large readable type, dark mode.
+- **🔊 Read-aloud TTS** on every diary card. Pre-readers tap the speaker
+  icon and the browser narrates the storybook sentence. No backend, no
+  cost, no tracking — pure `SpeechSynthesis`.
+- **🤖 AI daily storybook recap** *(optional, see below)*: each night
+  Google Gemini writes one warm paragraph summarizing the day's events.
+  Kids wake up to a fresh recap pinned to the top of yesterday's diary.
+- **🔔 Push notifications** *(optional, see below)*: rare-moment alerts
+  — first-of-day, waking-up, long wheel runs — straight to your phone or
+  tablet. Per-activity toggles, quiet hours, browser-native Web Push.
+- **PWA install** with iOS/Android home-screen icons, splash screens,
+  landscape lock, and offline shell.
 
 ## Who is this for?
 
@@ -49,8 +93,10 @@ If you build one, please send a photo.
 - Tinkerers who like Pi Zeros, Docker Compose, and self-hosted everything
 - Pet owners who already enjoy Frigate and want a cuddlier UI on top of it
 
-You don't need to be a hamster owner. The whole UI is themable to any pet
-— the onboarding wizard lets you pick a name, emoji, and color palette.
+You don't need to be a hamster owner. The whole UI is themable to any
+pet — the onboarding wizard lets you pick a name, emoji, and color
+palette, and the narrator ships defaults for hamsters, rabbits, cats,
+dogs, parrots, lizards, fish, and turtles.
 
 ## Hardware shopping list
 
@@ -69,85 +115,255 @@ The Mac Mini is the brain. Any always-on Linux box with an Intel iGPU
 (for OpenVINO) or a Coral USB stick will work — a NUC, an old laptop,
 even a beefier Raspberry Pi 5 with a Coral.
 
+## Quick start
+
+Roughly four hours spread across an evening or two. The TL;DR:
+
+1. **Flash Ubuntu Server** onto the Mac Mini, install Docker.
+2. **Bring up Mosquitto + Frigate** via Docker Compose.
+3. **Flash three Pi Zero 2 Ws** as RTSP camera servers (go2rtc).
+4. **Point Frigate at the cameras**, define zones (wheel, food, water…).
+5. From your dev machine: `cp .env.example .env`, fill it in, then
+   `pnpm install && ./deploy.sh`.
+6. **Set up DDNS + Caddy + auth**, forward the non-standard HTTPS
+   port at your router (`CADDY_HTTPS_PORT`, default `2053`, TCP **and**
+   UDP for HTTP/3). Add a Cloudflare Origin Rule that maps edge `:443`
+   → origin `:2053` so visitors keep using the clean URL.
+7. **Open the URL on a tablet**, run the onboarding wizard, done.
+
+Detailed Mac Mini and Pi Zero setup guides:
+- [`docs/SETUP_MAC_MINI.md`](docs/SETUP_MAC_MINI.md)
+- [`docs/SETUP_PI_ZERO.md`](docs/SETUP_PI_ZERO.md)
+
+## Run locally for UI/UX review
+
+For poking the UI without provisioning Pis, Frigate, or a real Zyphr
+tenant. One command from the repo root runs both halves in parallel
+with prefixed output:
+
+```sh
+pnpm install
+pnpm dev
+```
+
+If you'd rather drive the workspaces independently (e.g. restart just
+the backend), use two terminals: `pnpm -F server dev` and `pnpm -F web dev`.
+
+Open <http://localhost:5181> and sign in:
+
+- **Email:** `dev@hamster.local`
+- **Password:** `hunterhunter`
+
+The Today feed lands pre-populated with wheel / food / water / bathroom
+/ transition / resting / exploring entries so every diary card variant
+renders on first load.
+
+State persists at `<repo>/.dev/` (SQLite + storage); `rm -rf .dev`
+resets to factory defaults.
+
+**Ports.** Backend defaults to **5180**, web to **5181**. Override:
+
+```sh
+HC_BACKEND_PORT=5274 HC_WEB_PORT=5174 pnpm dev
+```
+
+**Other overrides** (all optional): `HC_DEV_EMAIL`, `HC_DEV_PASSWORD`,
+`HC_DEV_DISPLAY_NAME`, `HC_DEV_PET_NAME`, `HC_DEV_SANDBOX`,
+`DATABASE_PATH`, `STORAGE_PATH`.
+
+**What's missing vs. production.** No MQTT (so no live diary updates
+from Frigate events), no real camera streams (the seeded cameras have
+placeholder RTSP URLs), no real Zyphr (the in-process stub accepts the
+seeded password only). For end-to-end auth/network testing against
+your real Zyphr tenant, use `pnpm -F server dev:raw` with your own
+`.env`.
+
 ## Configuration & secrets
 
-Before you bring anything up you'll need to gather a handful of
-credentials and pick a few hostnames. Everything the stack reads
-comes from a single `.env` file on the Mac Mini at
-`/opt/hamster-cam/.env` (chmod 600, owned by the app user). A
-fully-commented [`.env.example`](.env.example) lives at the repo
-root — `cp .env.example .env` and fill in the placeholders.
+Everything the stack reads comes from a single `.env` file on the Mac
+Mini at `/opt/hamster-cam/.env` (chmod 600, owned by the app user). A
+fully-commented [`.env.example`](.env.example) lives at the repo root
+— `cp .env.example .env` and fill in the placeholders.
 
 ### Accounts you need to create
 
 | Service | What you need | Where to get it |
 |---|---|---|
-| **Zyphr.dev** | An account + an application + a server-side API key (`zy_live_…`) | [zyphr.dev](https://zyphr.dev) → dashboard → API Keys |
-| **Cloudflare** | An account + a registered domain on Cloudflare DNS + a scoped API token | [dash.cloudflare.com](https://dash.cloudflare.com) → My Profile → API Tokens → *Create Token* with `Zone : DNS : Edit` scoped to your one zone |
-
-That's the entire external dependency list. No paid SaaS, no third
-SMS provider, no separate email host — Zyphr handles password-reset
-emails and the share-clip emails through its own messaging API.
+| **Zyphr.dev** *(required)* | An account + an application + a server-side API key (`zy_live_…`) | [zyphr.dev](https://zyphr.dev) → dashboard → API Keys |
+| **Cloudflare** *(required)* | An account + a registered domain on Cloudflare DNS + a scoped API token | [dash.cloudflare.com](https://dash.cloudflare.com) → My Profile → API Tokens → *Create Token* with `Zone : DNS : Edit` scoped to your one zone |
+| **Google AI Studio** *(optional — only for the AI nightly recap)* | A Gemini API key (free tier is enough) | [aistudio.google.com](https://aistudio.google.com/app/apikey) → *Create API key* |
 
 ### Environment variables at a glance
 
-This table mirrors [`.env.example`](.env.example) line for line; if a
-variable shows up here it shows up there and vice versa.
+This table mirrors [`.env.example`](.env.example). If a variable is
+listed there it's listed here and vice versa.
 
 | Variable | Purpose | Notes |
 |---|---|---|
-| `ZYPHR_API_KEY` | Authenticates the backend against Zyphr's API | Format: `zy_live_…`. Auth endpoints are open at Zyphr; key is still passed by the SDK. |
+| `ZYPHR_API_KEY` | Authenticates the backend against Zyphr's API | Format `zy_live_…`. Required. |
 | `ZYPHR_BASE_URL` | Override the Zyphr API host | *Optional.* Defaults to `https://api.zyphr.dev/v1`. |
-| `ZYPHR_FROM_EMAIL` | Sender address for Zyphr-delivered emails | Used by Send-a-Clip and disk-critical alerts. Must be a domain verified in your Zyphr dashboard. |
-| `CLOUDFLARE_API_TOKEN` | Updates the A record on IP change + issues Let's Encrypt certs via DNS-01 | Scoped: `Zone : DNS : Edit` on one zone only. |
-| `CLOUDFLARE_ZONE` | Your apex domain at Cloudflare | e.g. `remy-hamster.com`. |
+| `ZYPHR_FROM_EMAIL` | Sender address for Zyphr-delivered emails | Used by Send-a-Clip and disk-critical alerts. |
+| `CLOUDFLARE_API_TOKEN` | DDNS + DNS-01 cert issuance | Scoped: `Zone : DNS : Edit` on one zone only. |
+| `CLOUDFLARE_ZONE` | Your apex domain | e.g. `remy-hamster.com`. |
 | `CLOUDFLARE_SUBDOMAIN` | The subdomain the cam runs at | e.g. `cam` → `cam.remy-hamster.com`. |
-| `RTSP_USERNAME` | Locks the go2rtc RTSP listener on each Pi Zero | Defaults to `hamster`. |
-| `RTSP_PASSWORD` | The RTSP password | `openssl rand -base64 24`. Mirrored to each Pi at `/etc/go2rtc/go2rtc.env`. |
-| `FRIGATE_RTSP_PASSWORD` | What Frigate sends to the Pi Zeros | Must equal `RTSP_PASSWORD`. Defaults to `${RTSP_PASSWORD}` via env-file interpolation. |
-| `MQTT_URL` | Where the backend reaches Mosquitto | `mqtt://mosquitto:1883` on the compose network. |
-| `MQTT_USERNAME` | Mosquitto username | Used by Frigate **and** the backend. Don't run the broker open. |
-| `MQTT_PASSWORD` | Mosquitto password | Stored in the Mosquitto `passwd` file (see Quick start step 4). |
-| `FRIGATE_URL` | Where the backend reaches Frigate's REST API | `http://frigate:5000` on the compose network. |
-| `PORT` | Fastify listen port | Defaults to `3000`; Caddy reverse-proxies here via `host.docker.internal:3000`. |
-| `DATABASE_PATH` | SQLite file location | e.g. `/opt/hamster-cam/db/hamster.db`. The backend runs migrations against this on boot. |
-| `STORAGE_PATH` | Where snapshots + nightly time-lapse MP4s land | e.g. `/opt/hamster-cam/storage`. Retention policies (see PLAN §8) live in the `settings` table. |
+| `GEMINI_API_KEY` | Enables the nightly AI storybook recap | **Optional.** If unset the recap job logs `skipped: no_api_key` and exits cleanly. Free at [aistudio.google.com](https://aistudio.google.com/app/apikey). |
+| `GEMINI_MODEL` | Which Gemini model writes the recap | *Optional.* Defaults to `gemini-2.0-flash`. |
+| `RTSP_USERNAME` / `RTSP_PASSWORD` | Locks the go2rtc RTSP listener on each Pi | Generate password with `openssl rand -base64 24`. |
+| `FRIGATE_RTSP_PASSWORD` | What Frigate sends to the Pi Zeros | Must equal `RTSP_PASSWORD`. |
+| `MQTT_URL` / `MQTT_USERNAME` / `MQTT_PASSWORD` | Mosquitto credentials | Don't run the broker open even on a Docker network. |
+| `FRIGATE_URL` | Where the backend reaches Frigate | `http://frigate:5000` on the compose network. |
+| `PORT` | Fastify listen port | Defaults to `3000`. |
+| `DATABASE_PATH` | SQLite file location | e.g. `/opt/hamster-cam/db/hamster.db`. |
+| `STORAGE_PATH` | Snapshots + time-lapse MP4s | e.g. `/opt/hamster-cam/storage`. |
 | `SESSION_TTL_DAYS` | Session cookie lifetime | Defaults to `30`. |
-| `CADDY_HTTPS_PORT` | Non-standard HTTPS port at the firewall | Defaults to `2053`. Must be one of Cloudflare's proxied HTTPS ports: `443, 2053, 2083, 2087, 2096, 8443`. |
-| `CADDY_EMAIL` | Let's Encrypt account contact | Used for cert expiry notifications. |
-| `CADDY_HOSTNAME` | The FQDN you serve at | e.g. `cam.remy-hamster.com`. Must have an A record (proxied/orange-cloud) at Cloudflare. |
-| `MAC_MINI_HOST` | SSH target for `deploy.sh` | Hostname or IP. Dev-machine-side. |
-| `MAC_MINI_USER` | SSH user for `deploy.sh` | Defaults to `hamster`. |
-| `MAC_MINI_PATH` | Remote install root | Defaults to `/opt/hamster-cam`. |
-| `TZ` | Container timezone | IANA name, e.g. `America/Los_Angeles`. Defaults to `Etc/UTC`. |
+| `CADDY_HTTPS_PORT` | Non-standard HTTPS port at the firewall | Defaults to `2053`. Must be one of Cloudflare's proxied ports. |
+| `CADDY_EMAIL` | Let's Encrypt account contact | For cert expiry notifications. |
+| `CADDY_HOSTNAME` | The FQDN you serve at | e.g. `cam.remy-hamster.com`. |
+| `MAC_MINI_HOST` / `MAC_MINI_USER` / `MAC_MINI_PATH` | SSH target for `deploy.sh` | Dev-machine-side. |
+| `TZ` | Container timezone | IANA name, defaults to `Etc/UTC`. |
 
 ### Per-Pi-Zero secrets
 
-Each Pi also needs a tiny env file at `/etc/go2rtc/go2rtc.env`
-(chmod 600, root-owned) containing only the RTSP password:
+Each Pi also needs a tiny env file at `/etc/go2rtc/go2rtc.env` (chmod
+600, root-owned) containing only the RTSP password:
 
 ```sh
 RTSP_PASSWORD=<same value as the Mac Mini's .env>
 ```
 
-The shipped `go2rtc.service` references it via `EnvironmentFile=`,
-so go2rtc reads the password at boot without it ever appearing on
-a command line or in `/proc`.
+The shipped `go2rtc.service` references it via `EnvironmentFile=`, so
+go2rtc reads the password at boot without it ever appearing on a
+command line or in `/proc`.
 
 ### What's NOT in `.env`
 
 - **Admin account credentials.** The first admin is created via the
   bootstrap CLI (`pnpm hamster bootstrap-admin --email … --password …`)
-  on the Mac Mini, then every subsequent account is admin-created
-  from Settings → Users in the running app. No default password is
-  ever baked into the deployment.
-- **Pet name, camera URLs, theme.** Stored in the SQLite `settings`
-  and `cameras` tables — the admin configures them through the UI
-  during onboarding. They aren't environment concerns.
+  on the Mac Mini, then every subsequent account is admin-created from
+  Settings → Users. No default password is ever baked in.
+- **Pet name, camera URLs, theme, notification preferences, wheel
+  odometer config, distance unit.** Stored in the SQLite `settings`,
+  `cameras`, and `notification_preferences` tables — configured
+  through the UI.
 
 > **Never commit `.env`.** The repo's root `.gitignore` lists it.
 > Always commit changes to `.env.example` so contributors can see
 > what's expected.
+
+## Optional features & how to enable them
+
+Every optional feature has a safety gate: if the configuration is
+missing, the feature stays silent and the rest of the app keeps
+working. Nothing crashes the server.
+
+### 🤖 AI daily storybook recap (Google Gemini)
+
+**What it does.** Every night at 23:58 local, the backend reads the
+day's diary entries and asks Gemini to write one warm 2–4 sentence
+storybook paragraph. The result lands as a `recap` diary entry pinned
+above the time-lapse — kids wake up to a fresh recap of yesterday.
+
+> *"Remy had a busy day! He ran on his wheel for fourteen minutes,
+> visited the food bowl four times, and finished the evening curled
+> up in his cozy nest. A very small fuzzy adventurer."*
+
+**How to enable.**
+1. Get a free API key from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
+   Sign in with a Google account, click *Create API key*, copy it.
+2. Add to your `.env`:
+   ```sh
+   GEMINI_API_KEY=AIzaSyA...your-key-here
+   GEMINI_MODEL=gemini-2.0-flash
+   ```
+3. Restart the backend (`docker compose restart hamster-app`).
+
+**Cost.** Gemini 2.0 Flash's free tier gives 1,500 requests/day. This
+app uses one request per night. You will never approach the limit.
+
+**If the key is missing or revoked,** the recap job logs and exits
+cleanly. Every other feature keeps working.
+
+### 🔊 Read-aloud TTS
+
+**What it does.** A speaker icon appears on every diary card. Tap it
+and your browser speaks the storybook sentence aloud — useful for
+pre-readers and for accessibility. Re-tap to stop. The voice picks
+itself from your OS's installed speech synths, biased toward
+child-friendly English voices.
+
+**How to enable.** Already on. Toggle off in Settings → Pet → "Read
+diary aloud" if you'd rather have silent cards.
+
+**Privacy.** Uses your browser's built-in `SpeechSynthesis` API. No
+backend call, no audio leaves the device, no cost.
+
+### 🔔 Push notifications
+
+**What it does.** Subscribes your tablet or phone to native Web Push
+notifications. By default you'll get a notification only on **rare
+moments**: the first wheel run of the day, your pet waking up after a
+quiet stretch, an extra-long wheel session. Quiet hours (default
+9pm–7am) suppress everything.
+
+**How to enable.**
+1. Open the app on the device you want notified, log in.
+2. Settings → Notifications → toggle "Send me notifications on this
+   device" → grant the browser permission prompt.
+3. Customize per-activity toggles, rare-only mode, and quiet hours.
+4. Hit "Send test notification" to verify.
+
+**iOS PWA caveat.** iOS only delivers push to PWAs that have been
+*Added to Home Screen*. The Notifications tab calls this out when it
+detects an iOS browser that isn't running standalone.
+
+**VAPID keys** are generated on first boot and stored in the SQLite
+`settings` table — you don't need to configure anything in `.env`.
+
+### 🏃 Wheel odometer
+
+**What it does.** Counts actual wheel rotations by watching for a
+high-contrast mark crossing a fixed line in the camera frame. The
+narrator multiplies rotations by the wheel's circumference to get
+meters, attaches that to the wheel diary entry, and the StatsStrip
+shows cumulative distance for the week. Three lifetime distance
+badges unlock at 1 mile, marathon, and 100 miles.
+
+**How to enable.**
+1. **Stick a piece of dark gaffer tape** (or electrical tape, or even
+   a Sharpie blob) on the rim of the wheel. About 1–2 cm wide. This
+   is the only physical change you'll make.
+2. Open Settings → Cameras → the wheel camera → **Wheel odometer**
+   section.
+3. Toggle "Enable wheel odometer" on.
+4. Confirm **Wheel diameter (mm)** matches your wheel (default 152mm
+   = 6"; measure across the wheel's outer rim).
+5. Adjust **Detection band Y position** so the horizontal red line
+   sits across the wheel rim where the tape passes.
+6. Hit **Test detection**. The cropped band image appears; you'll
+   see "Tape visible ✓" once your tape passes through. If the ratio
+   stays low, drop the **Dark threshold** slider; if it stays high
+   even without the tape, raise it.
+7. Save. From the next wheel session onward, the diary cards will
+   carry an `≈ 0.15 mi` note.
+
+**Privacy / cost.** Zero. Detection runs locally on the Mac Mini
+against the camera's RTSP feed — no frames leave your network.
+
+**If the toggle is off** per camera, the feature is silent. Diary
+entries keep working without distance numbers.
+
+### 📨 Send-a-Clip email sharing
+
+**What it does.** A "Send a clip" button on every diary card lets you
+email the entry to a pre-approved recipient (Grandma's email, your
+partner, etc.) via Zyphr's messaging API.
+
+**How to enable.** Set `ZYPHR_FROM_EMAIL` in `.env` and verify the
+sending domain in your Zyphr dashboard. Recipients are managed from
+Settings → Sharing.
+
+**If `ZYPHR_FROM_EMAIL` is missing,** the share button still renders
+but the send action returns an error — no app crash.
 
 ## Architecture
 
@@ -161,7 +377,14 @@ a command line or in `/proc`.
 3× IMX462 USB cam ──┘  (go2rtc)     WiFi│  ├── Mosquitto MQTT        │
                                       │  ├── App backend (Fastify)   │
                                       │  │   ├── SQLite             │
-                                      │  │   └── MQTT subscriber    │
+                                      │  │   ├── MQTT subscriber    │
+                                      │  │   ├── Cron jobs:         │
+                                      │  │   │   ├── 23:55 timelapse│
+                                      │  │   │   ├── 23:58 recap*   │
+                                      │  │   │   ├── 02:00 retention│
+                                      │  │   │   └── 03:00 disk-watch│
+                                      │  │   ├── Web Push fanout    │
+                                      │  │   └── Zyphr SDK (auth)   │
                                       │  └── App frontend (React)   │
                                       │      served by backend       │
                                       └──────────────────────────────┘
@@ -169,69 +392,9 @@ a command line or in `/proc`.
                                               Daughter's tablet
                                               over the open internet
                                               (DDNS + Caddy + auth)
+
+                                       * optional, off without GEMINI_API_KEY
 ```
-
-## Quick start
-
-Full build instructions live in [`docs/PLAN.md`](docs/PLAN.md) — eight
-phases, ~4 hours spread across an evening or two. The TL;DR:
-
-1. Flash Ubuntu Server onto the Mac Mini, install Docker
-2. Bring up Mosquitto + Frigate via Docker Compose
-3. Flash and configure three Pi Zero 2 Ws as RTSP camera servers
-4. Point Frigate at the cameras, define zones (wheel, food, water)
-5. `pnpm install && ./deploy.sh` from your dev machine
-6. Set up dynamic DNS + Caddy + auth, forward your non-standard
-   HTTPS port at the router (`CADDY_HTTPS_PORT`, default `2053`,
-   TCP **and** UDP for HTTP/3). Add a Cloudflare Origin Rule that
-   maps edge `:443` → origin `:2053` so visitors keep using the
-   clean URL with no port suffix.
-7. Open the URL on a tablet, run the onboarding wizard, done
-
-## Run locally for UI/UX review
-
-For poking the UI without provisioning Pis, Frigate, or a real Zyphr tenant.
-One command from the repo root runs both halves in parallel with prefixed
-output (`@hamster-cam/server` / `@hamster-cam/web`):
-
-```sh
-pnpm install
-pnpm dev
-```
-
-If you'd rather drive the workspaces independently (e.g. restart just the
-backend), use two terminals: `pnpm -F server dev` and `pnpm -F web dev`.
-
-Open <http://localhost:5181> and sign in:
-
-- **Email:** `dev@hamster.local`
-- **Password:** `hunterhunter`
-
-The Today feed lands populated with wheel / food / water / bathroom /
-transition / resting / exploring entries so every diary card variant
-renders on first load.
-
-State persists at `<repo>/.dev/` (SQLite + storage); `rm -rf .dev` resets
-to factory defaults.
-
-**Ports.** Backend defaults to **5180** (deliberately off the crowded 3000
-range so multiple Node projects can run in parallel); web defaults to
-**5181**. Both halves read the same env vars — set them once and `pnpm dev`
-propagates them to both children:
-
-```sh
-HC_BACKEND_PORT=5274 HC_WEB_PORT=5174 pnpm dev
-```
-
-**Other overrides** (all optional): `HC_DEV_EMAIL`, `HC_DEV_PASSWORD`,
-`HC_DEV_DISPLAY_NAME`, `HC_DEV_PET_NAME`, `HC_DEV_SANDBOX`,
-`DATABASE_PATH`, `STORAGE_PATH`.
-
-**What's missing vs. production.** No MQTT (so no live diary updates from
-Frigate events), no real camera streams (the seeded cameras have placeholder
-RTSP URLs), no real Zyphr (the in-process stub accepts the seeded password
-only). For end-to-end auth/network testing against your real Zyphr tenant,
-use `pnpm -F server dev:raw` with your own `.env`.
 
 ## Tech stack
 
@@ -239,7 +402,11 @@ use `pnpm -F server dev:raw` with your own `.env`.
 - **Brain:** Frigate (NVR + object detection, OpenVINO accelerated)
 - **Messaging:** Mosquitto MQTT (Frigate's event bus)
 - **App backend:** Fastify + tRPC + better-sqlite3 + MQTT subscriber
+  + `web-push` for Web Push fan-out + Google Gemini for the nightly
+  storybook recap
 - **App frontend:** Vite + React + TypeScript + Framer Motion + Radix UI
+- **PWA:** vite-plugin-pwa with a small hand-rolled push/notificationclick
+  service worker (`public/sw-push.js`)
 - **Transport:** Cloudflare DDNS + Caddy reverse proxy with Let's
   Encrypt TLS on a non-standard port (SNI-routed for multi-site
   hosting)
@@ -250,17 +417,46 @@ use `pnpm -F server dev:raw` with your own `.env`.
   `zyphr.auth.passwordReset.forgotPassword`); our own Login form (no
   Zyphr-hosted page); opaque server-side sessions in SQLite with
   HttpOnly `__Host-session` cookie; two roles (`admin` / `child`)
-  enforced server-side; admins provision every account from
-  Settings → Users
+  enforced server-side
 - **Host OS:** Ubuntu Server 24.04 LTS on a Mac Mini
+
+## Authentication & accounts
+
+The Login form is **rendered by our app** and matches the rest of the
+kid-friendly UI — no redirect to a third-party hosted page. Submitting
+the form POSTs `{ email, password }` to our backend, which proxies to
+[**Zyphr.dev**](https://zyphr.dev)'s `POST /auth/login` API. Zyphr
+handles password storage, hashing, and rate-limiting; our backend
+handles authorization (role checks against a local mirror) and issues
+an opaque HttpOnly session cookie.
+
+**Two roles** live in the app's local mirror:
+
+- **`admin`** — full access. Manages cameras, pet settings, every
+  account (create, trigger password reset, delete), and notification
+  preferences from a five-tab Settings drawer. Account creation calls
+  Zyphr's `/auth/register`; password reset triggers `/auth/password/forgot`.
+- **`child`** — view-only. Sees cameras, the diary, badges, and
+  snapshots. **No Settings, no gear icon.** Password changes are
+  admin-driven via the email reset flow.
+
+**No public sign-up.** New accounts are admin-created from inside the
+app. The very first admin is created with a one-time CLI command on
+the Mac Mini (`pnpm hamster bootstrap-admin --email … --display-name …
+--password …`) so a default password is never baked into the image.
+
+Error-handling surfaces `ZyphrAuthenticationError`,
+`ZyphrRateLimitError`, etc., and role checks happen server-side
+before every protected tRPC procedure.
 
 ## Customization
 
-Not a hamster person? Change the pet emoji and palette in the onboarding
-wizard. Add or remove cameras at any time from Settings → Cameras.
-Tweak the narrative templates in `app/server/src/narratives.ts` to match
-your pet's vibe — we've shipped defaults for hamsters, rabbits, cats,
-dogs, parrots, lizards, fish, and turtles.
+Not a hamster person? Change the pet emoji and palette in the
+onboarding wizard. Add or remove cameras at any time from Settings →
+Cameras. Tweak the narrative templates in
+`app/server/src/narratives.ts` to match your pet's vibe — we've shipped
+defaults for hamsters, rabbits, cats, dogs, parrots, lizards, fish,
+and turtles.
 
 ## Contributing
 
@@ -274,57 +470,21 @@ PRs welcome, especially:
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) (coming in v0.2) for the
 basics.
 
-## Authentication & accounts
-
-The Login form is **rendered by our app** and matches the rest of the
-kid-friendly UI — no redirect to a third-party hosted page. Submitting
-the form POSTs `{ email, password }` to our backend, which proxies to
-[**Zyphr.dev**](https://zyphr.dev)'s `POST /auth/login` API. Zyphr
-handles the password storage, hashing, and rate-limiting; our backend
-handles authorization (role checks against a local mirror) and issues an
-opaque HttpOnly session cookie.
-
-**Two roles** live in the app's local mirror:
-
-- **`admin`** — full access. Manages cameras, pet settings, and every
-  account (create, trigger password reset, delete) from a Users tab in
-  the Settings drawer. Account creation calls Zyphr's `/auth/register`;
-  password reset triggers `/auth/password/forgot`.
-- **`child`** — view-only. Sees cameras, the diary, badges, and snapshots.
-  **No Settings, no gear icon, no Users tab.** Password changes are
-  admin-driven (via the email reset flow).
-
-**No public sign-up.** New accounts are admin-created from inside the
-app. The very first admin is created with a one-time CLI command on the
-Mac Mini (`pnpm hamster bootstrap-admin --email … --display-name … --password …`)
-so a default password is never baked into the image.
-
-Integration uses the official
-[`@zyphr-dev/node-sdk`](https://www.npmjs.com/package/@zyphr-dev/node-sdk)
-on the backend, so we don't hand-roll HTTP plumbing —
-`zyphr.auth.login.loginEndUser`,
-`zyphr.auth.registration.registerEndUser`,
-`zyphr.auth.passwordReset.forgotPassword`, etc. See **Phase 7.6** in
-[`docs/PLAN.md`](docs/PLAN.md) for the endpoint-to-SDK-method table,
-error-handling pattern (`ZyphrAuthenticationError`,
-`ZyphrRateLimitError`, …), role enforcement, and the deliberate
-limitations (no admin-set password, no admin-delete at Zyphr) inherent
-to Zyphr's user-centric API.
-
 ## Acknowledgments
 
 This project stands on the shoulders of giants:
 
 - [**Frigate**](https://frigate.video) — the NVR doing all the heavy
   lifting
-- [**go2rtc**](https://github.com/AlexxIT/go2rtc) — the magic that turns
-  $35 USB cameras into low-latency WebRTC streams
+- [**go2rtc**](https://github.com/AlexxIT/go2rtc) — the magic that
+  turns $35 USB cameras into low-latency WebRTC streams
 - [**Zyphr.dev**](https://zyphr.dev) — email/password auth-as-a-service
-  via a clean REST API, so we render our own Login UI but never store a
-  single password ourselves
+  so we render our own Login UI but never store a single password
 - [**Caddy**](https://caddyserver.com) — automatic TLS that just works
-- [**t2linux**](https://wiki.t2linux.org) — getting Ubuntu onto an Intel
-  Mac Mini's T2 chip is solved because of these heroes
+- [**Google Gemini**](https://aistudio.google.com) — the tiny
+  ghostwriter for the nightly storybook recap
+- [**t2linux**](https://wiki.t2linux.org) — getting Ubuntu onto an
+  Intel Mac Mini's T2 chip is solved because of these heroes
 
 And of course Remy, the hamster who unknowingly volunteered for QA.
 

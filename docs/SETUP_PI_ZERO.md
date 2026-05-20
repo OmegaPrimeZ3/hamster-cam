@@ -8,9 +8,9 @@ restarts (or reboots) the Pi when go2rtc wedges.
 Estimated time: about 30 minutes for the first Pi, then 10-15 minutes
 each for the second and third if you clone the first SD card.
 
-For broader context (architecture diagram, hardware bill of materials,
-how this fits with the Mac Mini), see [PLAN.md](./PLAN.md).
-For Mac Mini setup, see [SETUP_MAC_MINI.md](./SETUP_MAC_MINI.md).
+For the architecture diagram and hardware bill of materials see the
+[main README](../README.md). For Mac Mini setup, see
+[SETUP_MAC_MINI.md](./SETUP_MAC_MINI.md).
 
 
 ## Prerequisites
@@ -24,8 +24,8 @@ For Mac Mini setup, see [SETUP_MAC_MINI.md](./SETUP_MAC_MINI.md).
 - A dev machine with Raspberry Pi Imager installed
 - Your home WiFi credentials
 - An RTSP password that you have already chosen and recorded in the
-  Mac Mini's .env as RTSP_PASSWORD (see PLAN.md section 7.6 and
-  .env.example). The same password is used on every Pi.
+  Mac Mini's .env as RTSP_PASSWORD (see [.env.example](../.env.example)).
+  The same password is used on every Pi.
 
 
 ## Step 1 - Flash Raspberry Pi OS Lite

@@ -10,11 +10,10 @@ Estimated time: about 2 hours total spread across base OS install
 (~1 hour), services bring-up (~45 min), and Frigate configuration
 (~30 min once the Pi Zeros are streaming).
 
-For broader context (architecture diagram, hardware bill of materials,
-how this fits with the Pi Zeros), see [PLAN.md](./PLAN.md).
-For Pi Zero setup, see [SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md).
-For the env-var reference, see [.env.example](../.env.example) at
-the repo root.
+For the architecture diagram and hardware bill of materials, see the
+[main README](../README.md). For Pi Zero setup, see
+[SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md). For the env-var reference, see
+[.env.example](../.env.example) at the repo root.
 
 
 ## Prerequisites
@@ -96,8 +95,8 @@ Linux installation. The cleanest path is the t2linux.org Ubuntu guide.
 
 8. **Reserve a static DHCP lease** for the Mac Mini in your router
    so its LAN IP does not drift. Note its MAC address from
-   `ip link show`. You will need a stable LAN IP for port forwarding
-   in Phase 7 (see PLAN.md).
+   `ip link show`. You will need a stable LAN IP for the port-forward
+   step further down in this guide.
 
 
 ## Step 2 - Install Docker
@@ -345,16 +344,18 @@ docker compose logs -f
 
 Wait for Caddy to issue its Let's Encrypt cert via the Cloudflare
 DNS-01 challenge. You should see "certificate obtained successfully"
-in the Caddy logs within about 30 seconds. If it does not, see
-PLAN.md section 7.2 (Cloudflare DDNS setup) and 7.5 (Caddy reverse
-proxy) for the diagnostic flow.
+in the Caddy logs within about 30 seconds. If it does not, double-check
+your `CLOUDFLARE_API_TOKEN` scope (must be `Zone:DNS:Edit` on the one
+zone) and that the `CADDY_HOSTNAME` matches the A record at Cloudflare.
 
 
 ## Step 10 - Deploy the app
 
 The application backend and frontend are deployed from the dev
-machine via `deploy.sh`. See PLAN.md section 6 for the deploy script
-contract.
+machine via `deploy.sh` at the repo root. The script rsyncs the
+prebuilt server `dist/` and web `dist/` directories to
+`MAC_MINI_PATH` over SSH and restarts the `hamster-app` systemd
+service.
 
 After the first deploy installs the `hamster-app` systemd service:
 
@@ -416,7 +417,7 @@ Before declaring the Mac Mini ready, confirm:
   `device_cgroup_rules` in `mac-mini/docker-compose.yml`.
 - **Caddy fails to obtain a cert**: usually a Cloudflare API token
   scope problem. The token needs `Zone:DNS:Edit` on the specific
-  zone, not "All zones". See PLAN.md section 7.2.
+  zone, not "All zones".
 - **Frigate streams are black** or show "Cannot open RTSP source":
   check the password in `.env` matches each Pi's
   `/etc/go2rtc/go2rtc.env`. Test the URL directly with VLC.
