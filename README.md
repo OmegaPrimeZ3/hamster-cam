@@ -191,17 +191,16 @@ phases, ~4 hours spread across an evening or two. The TL;DR:
 ## Run locally for UI/UX review
 
 For poking the UI without provisioning Pis, Frigate, or a real Zyphr tenant.
-Two terminals from the repo root:
+One command from the repo root runs both halves in parallel with prefixed
+output (`@hamster-cam/server` / `@hamster-cam/web`):
 
 ```sh
-# Terminal 1 — backend with in-process Zyphr stub, auto-bootstrapped admin,
-# seed cameras + a day of diary entries.
 pnpm install
-pnpm -F server dev
-
-# Terminal 2 — Vite dev server, proxies tRPC/auth/snapshots/stream to the backend.
-pnpm -F web dev
+pnpm dev
 ```
+
+If you'd rather drive the workspaces independently (e.g. restart just the
+backend), use two terminals: `pnpm -F server dev` and `pnpm -F web dev`.
 
 Open <http://localhost:5173> and sign in:
 
@@ -217,13 +216,11 @@ to factory defaults.
 
 **Ports.** Backend defaults to **5273** (deliberately off the crowded 3000
 range so multiple Node projects can run in parallel); web defaults to
-**5173**. Both halves read shared env vars — change them together:
+**5173**. Both halves read the same env vars — set them once and `pnpm dev`
+propagates them to both children:
 
 ```sh
-HC_BACKEND_PORT=5274 pnpm -F server dev
-HC_BACKEND_PORT=5274 pnpm -F web dev
-# Override the web port too if 5173 is taken:
-HC_WEB_PORT=5174 HC_BACKEND_PORT=5274 pnpm -F web dev
+HC_BACKEND_PORT=5274 HC_WEB_PORT=5174 pnpm dev
 ```
 
 **Other overrides** (all optional): `HC_DEV_EMAIL`, `HC_DEV_PASSWORD`,

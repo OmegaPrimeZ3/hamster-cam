@@ -83,11 +83,11 @@ async function main(): Promise<void> {
     {
       sandbox,
       backend: `http://localhost:${process.env['PORT']}`,
-      web: 'http://localhost:5173',
+      web: `http://localhost:${process.env['HC_WEB_PORT'] ?? '5173'}`,
       email: DEV_EMAIL,
       password: DEV_PASSWORD,
     },
-    '[dev] backend up — now run `pnpm -F web dev` and sign in',
+    '[dev] backend up — open the web URL and sign in (run `pnpm dev` from the repo root to start both halves at once)',
   );
 }
 
