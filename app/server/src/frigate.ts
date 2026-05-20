@@ -7,7 +7,9 @@
 // share-clip job, etc.) treat that as "unknown" and display accordingly.
 
 import { spawn } from 'node:child_process';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { isIP } from 'node:net';
 import { join } from 'node:path';
 
 import { getConfig } from './config.js';
@@ -136,13 +138,38 @@ export async function getCameraStats(cameraName: string): Promise<CameraStats> {
 // testStream — quick reachability check before saving a camera URL
 // ---------------------------------------------------------------------------
 
+// Override hook so unit tests can stub DNS lookup without monkey-patching the
+// global dns module. Production keeps the real `node:dns/promises` `lookup`.
+export interface TestStreamDeps {
+  /** Resolves a hostname to an IP. Default: `dns.lookup`. */
+  lookup?: (hostname: string) => Promise<{ address: string; family: 4 | 6 }>;
+  /** HTTP HEAD probe. Default: global fetch. */
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * Probe an http(s) or rtsp(/rtmp) stream URL for reachability.
+ *
+ * Security-Review Finding 2 (SSRF): for http(s) URLs we
+ *   1. reject any literal-IP that lands in a private/loopback/link-local/CGNAT
+ *      range (IPv4 and IPv6), the IPv4-mapped-IPv6 equivalents, or the AWS-
+ *      style metadata endpoint at 169.254.0.0/16
+ *   2. resolve the hostname through DNS and re-check the result against the
+ *      same allowlist — defeats DNS-rebinding where evil.com → 127.0.0.1
+ *   3. issue the HEAD with `redirect: 'manual'` so a 302 to an internal target
+ *      doesn't transparently get followed.
+ *
+ * rtsp:// / rtmp:// short-circuit to "shape valid" since we can't probe them
+ * with fetch and the UI's live preview surfaces failures fast. Anything else
+ * is rejected.
+ */
 export async function testStream(
   url: string,
+  deps: TestStreamDeps = {},
 ): Promise<{ ok: boolean; status: number | null }> {
-  // RTSP can't be probed with fetch — best we can do is parse the URL and
-  // confirm the scheme. For http(s) we issue a short HEAD with a tight
-  // timeout. Anything else (rtsp://) we accept as "shape valid" without
-  // confirming, since the UI's preview will surface failures fast.
+  const lookup = deps.lookup ?? defaultLookup;
+  const doFetch = deps.fetchFn ?? fetch;
+
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -155,16 +182,159 @@ export async function testStream(
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     return { ok: false, status: null };
   }
+
+  // URL.hostname strips brackets from IPv6 literals already.
+  const host = parsed.hostname;
+  if (host.length === 0) return { ok: false, status: null };
+
+  // Step 1: reject literal-IP / hostname strings that are themselves internal.
+  if (isInternalHost(host)) {
+    return { ok: false, status: null };
+  }
+
+  // Step 2: when the host isn't a literal IP, resolve it and re-check. This
+  // catches DNS-rebinding (`evil.com` resolving to 127.0.0.1 / 10.0.0.0/8 / ..).
+  if (isIP(host) === 0) {
+    try {
+      const { address } = await lookup(host);
+      if (isInternalHost(address)) {
+        return { ok: false, status: null };
+      }
+    } catch {
+      // Couldn't resolve — treat as unreachable rather than fall through to a
+      // fetch that would also fail. Returning here matches the existing
+      // "no response" semantics the frontend already handles.
+      return { ok: false, status: null };
+    }
+  }
+
+  // Step 3: HEAD with explicit manual-redirect so a 3xx to a now-internal
+  // host doesn't get transparently followed.
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 3_000);
   try {
-    const res = await fetch(url, { method: 'HEAD', signal: ctrl.signal });
+    const res = await doFetch(url, {
+      method: 'HEAD',
+      signal: ctrl.signal,
+      redirect: 'manual',
+    });
+    // A manual-redirect response carries status 0 in the spec'd `Response` and
+    // status 3xx in node's undici. Either way we surface the literal status
+    // and let the admin see "302 redirect" without us silently chasing it.
     return { ok: res.ok, status: res.status };
   } catch {
     return { ok: false, status: null };
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ---------------------------------------------------------------------------
+// isInternalHost — IPv4 + IPv6 allow-deny list of ranges no outbound probe
+// should ever reach. Exported for unit-tests.
+// ---------------------------------------------------------------------------
+
+/**
+ * True when the hostname/IP should be treated as inside the trust boundary
+ * (loopback, link-local, RFC1918, CGNAT, IPv6 ULA / link-local / loopback,
+ * or the AWS-style metadata endpoint).
+ *
+ * Accepts either a raw IP literal or a hostname like `localhost`.
+ */
+export function isInternalHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  // Hostname literals that always map to loopback.
+  if (lower === 'localhost' || lower === 'ip6-localhost' || lower === 'ip6-loopback') {
+    return true;
+  }
+  // Strip an optional zone-id (e.g. `fe80::1%en0`) before classifying.
+  const noZone = lower.includes('%') ? lower.slice(0, lower.indexOf('%')) : lower;
+  const family = isIP(noZone);
+  if (family === 4) return isInternalIPv4(noZone);
+  if (family === 6) return isInternalIPv6(noZone);
+  // Non-IP hostnames that aren't 'localhost' aren't *literally* internal; the
+  // caller's DNS-lookup step will catch resolutions into internal space.
+  return false;
+}
+
+function isInternalIPv4(ip: string): boolean {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return false;
+  const octets = parts.map((p) => Number.parseInt(p, 10));
+  if (octets.some((n) => !Number.isFinite(n) || n < 0 || n > 255)) return false;
+  const a = octets[0] ?? 0;
+  const b = octets[1] ?? 0;
+  // 0.0.0.0/8 — "this network", per RFC 1122; covers 0.0.0.0 as well.
+  if (a === 0) return true;
+  // 127.0.0.0/8 loopback
+  if (a === 127) return true;
+  // 10.0.0.0/8 RFC1918
+  if (a === 10) return true;
+  // 172.16.0.0/12 RFC1918
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  // 192.168.0.0/16 RFC1918
+  if (a === 192 && b === 168) return true;
+  // 169.254.0.0/16 link-local (covers AWS-style metadata endpoint)
+  if (a === 169 && b === 254) return true;
+  // 100.64.0.0/10 CGNAT
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+function isInternalIPv6(ip: string): boolean {
+  // Quick-path on the well-known literals first.
+  if (ip === '::' || ip === '::1') return true;
+
+  // IPv4-mapped-IPv6 (::ffff:10.0.0.1, etc.). Detect by suffix-dot and re-use
+  // the v4 classifier on the embedded dotted-quad.
+  const lastColon = ip.lastIndexOf(':');
+  if (ip.includes('.') && lastColon !== -1) {
+    const tail = ip.slice(lastColon + 1);
+    if (isIP(tail) === 4) {
+      return isInternalIPv4(tail);
+    }
+  }
+
+  // Expand to lowercase canonical groups. Crude expansion is enough for prefix
+  // checks because the first group tells us the range.
+  const groups = expandIPv6(ip);
+  if (!groups) return false;
+  const first = groups[0] ?? 0;
+  // fc00::/7 — Unique-Local Addresses (first 7 bits are 1111110 → fc00-fdff).
+  if ((first & 0xfe00) === 0xfc00) return true;
+  // fe80::/10 — link-local (fe80-febf).
+  if ((first & 0xffc0) === 0xfe80) return true;
+  return false;
+}
+
+/** Returns 8 numeric groups for a valid IPv6 literal, or null. */
+function expandIPv6(ip: string): number[] | null {
+  // Split on `::` (at most once) to capture leading and trailing halves.
+  const dcParts = ip.split('::');
+  if (dcParts.length > 2) return null;
+  const head = dcParts[0] === '' ? [] : (dcParts[0]?.split(':') ?? []);
+  const tail = dcParts[1] === undefined || dcParts[1] === ''
+    ? []
+    : dcParts[1].split(':');
+  const fill = 8 - head.length - tail.length;
+  if (dcParts.length === 1 && head.length !== 8) return null;
+  if (dcParts.length === 2 && fill < 0) return null;
+  const zeros = Array.from({ length: Math.max(0, fill) }, () => '0');
+  const all = [...head, ...zeros, ...tail];
+  if (all.length !== 8) return null;
+  const out: number[] = [];
+  for (const g of all) {
+    if (g.length === 0 || g.length > 4) return null;
+    const n = Number.parseInt(g, 16);
+    if (!Number.isFinite(n) || n < 0 || n > 0xffff) return null;
+    out.push(n);
+  }
+  return out;
+}
+
+async function defaultLookup(hostname: string): Promise<{ address: string; family: 4 | 6 }> {
+  const { address, family } = await dnsLookup(hostname);
+  return { address, family: family === 6 ? 6 : 4 };
 }
 
 // ---------------------------------------------------------------------------
