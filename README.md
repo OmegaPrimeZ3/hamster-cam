@@ -214,7 +214,7 @@ renders on first load.
 State persists at `<repo>/.dev/` (SQLite + storage); `rm -rf .dev` resets
 to factory defaults.
 
-**Ports.** Backend defaults to **5273** (deliberately off the crowded 3000
+**Ports.** Backend defaults to **5180** (deliberately off the crowded 3000
 range so multiple Node projects can run in parallel); web defaults to
 **5173**. Both halves read the same env vars — set them once and `pnpm dev`
 propagates them to both children:

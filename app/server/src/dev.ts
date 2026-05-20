@@ -9,10 +9,10 @@
 // Then start the web app with `pnpm -F web dev` (Vite proxies /trpc, /auth,
 // /snapshots, /stream to the backend) and sign in.
 //
-// Port convention: backend listens on HC_BACKEND_PORT (default 5273) so
+// Port convention: backend listens on HC_BACKEND_PORT (default 5180) so
 // multiple Node projects can run in parallel without colliding on the
 // usual 3000. The Vite dev server in app/web/vite.config.ts reads the
-// same env var. Override both halves together if 5273 is also taken:
+// same env var. Override both halves together if 5180 is also taken:
 //
 //     HC_BACKEND_PORT=5274 pnpm -F server dev
 //     HC_BACKEND_PORT=5274 pnpm -F web dev
@@ -51,7 +51,7 @@ async function main(): Promise<void> {
   process.env['STORAGE_PATH'] = process.env['STORAGE_PATH'] ?? path.join(sandbox, 'storage');
   // Keep PORT off the crowded 3000 default so the launcher can run alongside
   // other Node projects. Vite's proxy reads HC_BACKEND_PORT from the same env.
-  process.env['PORT'] = process.env['PORT'] ?? process.env['HC_BACKEND_PORT'] ?? '5273';
+  process.env['PORT'] = process.env['PORT'] ?? process.env['HC_BACKEND_PORT'] ?? '5180';
   process.env['NODE_ENV'] = 'development';
 
   const db = await import('./db.js');
