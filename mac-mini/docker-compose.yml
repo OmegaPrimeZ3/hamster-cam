@@ -132,11 +132,17 @@ services:
     # favonia/cloudflare-ddns is the maintained successor to the dead
     # oznu/cloudflare-ddns. Same scoped-token model; no shell in the image
     # (distroless), so it's small and hard to pop.
+    #
+    # Runs on the default compose bridge network — no `network_mode: host`
+    # needed because IP4_PROVIDER=cloudflare.trace discovers the public
+    # IP via an outbound HTTPS call (works on any bridge) and IP6_PROVIDER
+    # is disabled. Keeping the container in its own netns preserves
+    # Docker's namespace isolation; defense-in-depth alongside the
+    # distroless image, cap_drop ALL, read_only, and no-new-privileges
+    # already in this service definition.
     image: favonia/cloudflare-ddns:1.16.2
     container_name: hamster-cloudflare-ddns
     restart: unless-stopped
-    # The image is distroless and ships its own non-root user/uid.
-    network_mode: host
     environment:
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
       - DOMAINS=${CLOUDFLARE_SUBDOMAIN}.${CLOUDFLARE_ZONE}
