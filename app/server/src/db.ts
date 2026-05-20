@@ -68,6 +68,7 @@ export type DiaryActivity =
   | 'wheel'
   | 'food'
   | 'water'
+  | 'bathroom'
   | 'resting'
   | 'exploring'
   | 'hiding'

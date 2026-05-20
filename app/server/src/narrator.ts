@@ -75,7 +75,7 @@ export interface FrigateEvent {
 // ---------------------------------------------------------------------------
 
 type Activity =
-  | 'wheel' | 'food' | 'water' | 'resting'
+  | 'wheel' | 'food' | 'water' | 'bathroom' | 'resting'
   | 'exploring' | 'hiding';
 
 /**
@@ -98,6 +98,7 @@ function matchKeyword(value: string): Activity | null {
   if (v.includes('wheel')) return 'wheel';
   if (v.includes('food') || v.includes('bowl') || v.includes('feed')) return 'food';
   if (v.includes('water') || v.includes('drink')) return 'water';
+  if (v.includes('bathroom') || v.includes('potty') || v.includes('litter') || v.includes('toilet')) return 'bathroom';
   if (v.includes('bed') || v.includes('nest') || v.includes('sleep') || v.includes('rest')) return 'resting';
   if (v.includes('hide') || v.includes('cave') || v.includes('burrow')) return 'hiding';
   return null;

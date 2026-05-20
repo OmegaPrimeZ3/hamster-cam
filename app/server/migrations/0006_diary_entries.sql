@@ -11,7 +11,7 @@ CREATE TABLE diary_entries (
   occurred_at   INTEGER NOT NULL,
   kind          TEXT    NOT NULL DEFAULT 'narrative'
                   CHECK (kind IN ('narrative','snapshot','timelapse')),
-  activity      TEXT,                                  -- 'wheel'|'food'|'water'|'resting'|'exploring'|'hiding'|'transition'|'snapshot'|'timelapse'
+  activity      TEXT,                                  -- 'wheel'|'food'|'water'|'bathroom'|'resting'|'exploring'|'hiding'|'transition'|'snapshot'|'timelapse'
   narrative     TEXT    NOT NULL,                      -- rendered sentence, e.g. "🎡 Peanut went for a run..."
   pet_name      TEXT,                                  -- snapshot of pet name at write time (so a rename doesn't rewrite history)
   camera_id     INTEGER REFERENCES cameras(id) ON DELETE SET NULL,
