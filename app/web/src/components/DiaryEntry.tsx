@@ -97,7 +97,12 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
         display: 'flex',
         flexDirection: entry.kind === 'timelapse' ? 'column' : 'row',
         gap: 12,
-        alignItems: entry.kind === 'timelapse' ? 'stretch' : 'flex-start',
+        alignItems:
+          entry.kind === 'timelapse'
+            ? 'stretch'
+            : entry.kind === 'snapshot'
+              ? 'center'
+              : 'flex-start',
         borderRadius: 20,
         backgroundImage: `linear-gradient(${style.bgTint}, ${style.bgTint})`,
         boxShadow: `inset 4px 0 0 0 ${style.accent}, 0 6px 16px rgba(0, 0, 0, 0.06)`,
