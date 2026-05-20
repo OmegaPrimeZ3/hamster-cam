@@ -105,17 +105,21 @@ async function main(): Promise<void> {
 
 function seedCamerasAndDiary(db: typeof import('./db.js')): void {
   if (db.listCameras().length === 0) {
+    // Split the zone vocabulary across the two cameras so the union-based
+    // scoreboard shows multiple distinct tiles on first boot.
     db.createCamera({
       name: 'hamster_cam_1',
       emoji: '🐹',
       stream_url: 'rtsp://hamster:dev@hamster-cam-1.local:8554/camera',
       enabled: true,
+      zones: ['wheel', 'food', 'water'],
     });
     db.createCamera({
       name: 'hamster_cam_2',
       emoji: '🛏️',
       stream_url: 'rtsp://hamster:dev@hamster-cam-2.local:8554/camera',
       enabled: true,
+      zones: ['bathroom', 'resting', 'tunnel'],
     });
     logger.info('[dev] seeded 2 cameras');
   }

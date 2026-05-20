@@ -1,14 +1,31 @@
 // app/web/src/components/StatsStrip.tsx
 //
-// The Today stats scoreboard per PLAN §5.4. Three rounded tiles — wheel time,
-// snack visits, restful ratio — rendered side by side (wrapping on narrow
-// viewports). Wheel emoji spins faster the more the hamster ran; reduced-
-// motion users see a static wheel.
+// The Today stats scoreboard. The server returns one entry per zone the
+// operator has wired up across their cameras (or, on a brand-new install,
+// whatever activities have shown up today). We render one tile per returned
+// zone, sharing colour + emoji vocabulary with DiaryEntry so the scoreboard
+// and the diary read as the same world.
+//
+// The wheel tile still spins — faster when the hamster ran more, frozen
+// under reduced-motion. Other activities sit still; we can add per-activity
+// micro-animations later if there's a reason.
 
 import { TRPCClientError } from '@trpc/client';
 import { useReducedMotion } from 'framer-motion';
 import type { AppRouter } from '@hamster-cam/server/trpc';
 import { trpc } from '../trpc';
+import {
+  activityStyle,
+  isZoneActivity,
+  zoneMetric,
+  type ZoneActivity,
+} from '../lib/activity-style';
+
+interface ZoneTileData {
+  activity: ZoneActivity;
+  count: number;
+  total_ms: number;
+}
 
 export function StatsStrip(): JSX.Element {
   const reduced = useReducedMotion();
@@ -17,20 +34,20 @@ export function StatsStrip(): JSX.Element {
   });
 
   if (stats.isLoading) {
+    // We don't know N before the query lands, so render three generic
+    // placeholders using common activities — enough to fill the strip
+    // without flashing a different layout the moment data arrives.
     return (
       <Scoreboard>
-        <Tile label="MIN ON WHEEL" emoji="🎡" number="…" />
-        <Tile label="SNACKS" emoji="🥕" number="…" />
-        <Tile label="RESTFUL" emoji="💤" number="…" />
+        <PlaceholderTile activity="wheel" />
+        <PlaceholderTile activity="food" />
+        <PlaceholderTile activity="resting" />
       </Scoreboard>
     );
   }
 
   if (stats.error) {
     const e = stats.error as TRPCClientError<AppRouter>;
-    // Stats aren't ready (Stage 2a hasn't shipped the aggregator yet) —
-    // surface a friendly, transparent placeholder rather than an alarming
-    // toast.
     if (e.data?.code === 'NOT_IMPLEMENTED' || e.data?.code === 'INTERNAL_SERVER_ERROR') {
       return (
         <Scoreboard>
@@ -49,20 +66,37 @@ export function StatsStrip(): JSX.Element {
     );
   }
 
-  const wheelMinutes = Math.round(data.wheel_ms / 60_000);
-  const restfulPct = Math.round(data.restful_ratio * 100);
-  const spinSeconds = reduced ? null : wheelSpinSeconds(data.wheel_ms);
+  // Narrow server's broader DiaryActivity union down to ZoneActivity. The
+  // statsRouter only ever returns zone-eligible activities, but the d.ts type
+  // is the wider DiaryActivity — narrow at the boundary, don't cast.
+  const zones: ZoneTileData[] = data.zones.flatMap((z) =>
+    isZoneActivity(z.activity)
+      ? [{ activity: z.activity, count: z.count, total_ms: z.total_ms }]
+      : [],
+  );
+
+  if (zones.length === 0) {
+    return (
+      <Scoreboard>
+        <FallbackTile text="🐾 Configure zones on your cameras in Settings → Cameras to see today's scoreboard." />
+      </Scoreboard>
+    );
+  }
+
+  // Find the wheel tile (if present) so we can scale its spin to today's
+  // wheel time. Brief calls out wheel as the only activity with motion.
+  const wheelZone = zones.find((z) => z.activity === 'wheel');
+  const wheelSpin = reduced || !wheelZone ? null : wheelSpinSeconds(wheelZone.total_ms);
 
   return (
     <Scoreboard>
-      <Tile
-        label="MIN ON WHEEL"
-        emoji="🎡"
-        number={wheelMinutes}
-        emojiSpinSeconds={spinSeconds}
-      />
-      <Tile label="SNACKS" emoji="🥕" number={data.snack_visits} />
-      <Tile label="RESTFUL" emoji="💤" number={`${restfulPct}%`} />
+      {zones.map((zone) => (
+        <ZoneTile
+          key={zone.activity}
+          zone={zone}
+          spinSeconds={zone.activity === 'wheel' ? wheelSpin : null}
+        />
+      ))}
     </Scoreboard>
   );
 }
@@ -80,22 +114,21 @@ function wheelSpinSeconds(wheelMs: number): number {
   const MAX = 6;
   if (wheelMs <= 0) return MAX;
   const minutes = wheelMs / 60_000;
-  // Linear interp from 0 → 60+ minutes onto MAX → MIN.
   const t = Math.min(1, minutes / 60);
   const speed = MAX - t * (MAX - MIN);
   return Math.max(MIN, Math.min(MAX, speed));
 }
 
 function Scoreboard({ children }: { children: React.ReactNode }): JSX.Element {
-  // Inline the @keyframes once per render — scoped to this component via a
-  // unique class so we don't pollute index.css (another track owns it).
+  // Inline the @keyframes so we don't have to touch index.css. Scoped name
+  // (hc-stats-wheel-spin) so it can't collide with anything else.
   return (
     <section
       aria-label="Today's stats"
       style={{
         display: 'flex',
         flexWrap: 'wrap',
-        gap: 10,
+        gap: 8,
       }}
     >
       <style>{`
@@ -109,23 +142,25 @@ function Scoreboard({ children }: { children: React.ReactNode }): JSX.Element {
   );
 }
 
-interface TileProps {
-  label: string;
-  emoji: string;
-  number: number | string;
-  /** When set, the emoji spins with this period (seconds). */
-  emojiSpinSeconds?: number | null;
+interface ZoneTileProps {
+  zone: ZoneTileData;
+  /** When set, the emoji spins with this period (seconds). Wheel-only. */
+  spinSeconds: number | null;
 }
 
-function Tile({ label, emoji, number, emojiSpinSeconds }: TileProps): JSX.Element {
+function ZoneTile({ zone, spinSeconds }: ZoneTileProps): JSX.Element {
+  const style = activityStyle(zone.activity);
+  const metric = zoneMetric(zone.activity);
+  const isDuration = metric.primaryMetric === 'duration';
+  const value = isDuration ? Math.round(zone.total_ms / 60_000) : zone.count;
+
   const emojiStyle: React.CSSProperties = {
     fontSize: 24,
     lineHeight: 1,
     display: 'inline-block',
   };
-  if (emojiSpinSeconds != null) {
-    emojiStyle.animation = `hc-stats-wheel-spin ${emojiSpinSeconds}s linear infinite`;
-    // Spinning emojis can blur in dark mode; nudge the rendering hint.
+  if (spinSeconds != null) {
+    emojiStyle.animation = `hc-stats-wheel-spin ${spinSeconds}s linear infinite`;
     emojiStyle.willChange = 'transform';
   }
 
@@ -138,20 +173,45 @@ function Tile({ label, emoji, number, emojiSpinSeconds }: TileProps): JSX.Elemen
         background: 'var(--surface)',
         border: '1px solid var(--border)',
         borderRadius: 16,
+        // 4px inset left stripe in the activity accent — same technique
+        // DiaryEntry uses so the two surfaces visibly belong together.
+        boxShadow: `inset 4px 0 0 0 ${style.accent}`,
+        paddingLeft: 18, // make room for the stripe
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'space-between',
         gap: 8,
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 8,
+        }}
+      >
         <span
           className="display"
           style={{ fontFamily: "'Fredoka', sans-serif", fontSize: 36, lineHeight: 1 }}
         >
-          {number}
+          {value}
+          {isDuration && (
+            <span
+              style={{
+                fontSize: 14,
+                marginLeft: 4,
+                color: 'var(--text-muted)',
+                fontWeight: 500,
+              }}
+            >
+              min
+            </span>
+          )}
         </span>
-        <span aria-hidden style={emojiStyle}>{emoji}</span>
+        <span aria-hidden style={emojiStyle}>
+          {style.badgeEmoji}
+        </span>
       </div>
       <span
         style={{
@@ -162,7 +222,60 @@ function Tile({ label, emoji, number, emojiSpinSeconds }: TileProps): JSX.Elemen
           fontWeight: 600,
         }}
       >
-        {label}
+        {metric.unitLabel}
+      </span>
+    </div>
+  );
+}
+
+function PlaceholderTile({ activity }: { activity: ZoneActivity }): JSX.Element {
+  const style = activityStyle(activity);
+  const metric = zoneMetric(activity);
+  return (
+    <div
+      style={{
+        flex: '1 1 140px',
+        minHeight: 104,
+        padding: 14,
+        background: 'var(--surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 16,
+        boxShadow: `inset 4px 0 0 0 ${style.accent}`,
+        paddingLeft: 18,
+        display: 'flex',
+        flexDirection: 'column',
+        justifyContent: 'space-between',
+        gap: 8,
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 8,
+        }}
+      >
+        <span
+          className="display"
+          style={{ fontFamily: "'Fredoka', sans-serif", fontSize: 36, lineHeight: 1 }}
+        >
+          …
+        </span>
+        <span aria-hidden style={{ fontSize: 24, lineHeight: 1, display: 'inline-block' }}>
+          {style.badgeEmoji}
+        </span>
+      </div>
+      <span
+        style={{
+          fontSize: 12,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+          color: 'var(--text-muted)',
+          fontWeight: 600,
+        }}
+      >
+        {metric.unitLabel}
       </span>
     </div>
   );

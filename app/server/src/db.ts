@@ -54,6 +54,8 @@ export interface CameraRow {
   position: number;
   enabled: 0 | 1;
   created_at: number;
+  /** Operator-configured zone keywords for this camera (matches narrator vocabulary). */
+  zones: string[];
 }
 
 export interface SnapshotRow {
@@ -289,15 +291,16 @@ function statements(): Statements {
       'SELECT * FROM cameras WHERE enabled = 1 ORDER BY position ASC, id ASC',
     ),
     cameraInsert: db.prepare(`
-      INSERT INTO cameras (name, emoji, stream_url, position, enabled, created_at)
-      VALUES (@name, @emoji, @stream_url, @position, @enabled, @created_at)
+      INSERT INTO cameras (name, emoji, stream_url, position, enabled, created_at, zones)
+      VALUES (@name, @emoji, @stream_url, @position, @enabled, @created_at, @zones)
     `),
     cameraUpdate: db.prepare(`
       UPDATE cameras
          SET name       = @name,
              emoji      = @emoji,
              stream_url = @stream_url,
-             enabled    = @enabled
+             enabled    = @enabled,
+             zones      = @zones
        WHERE id = @id
     `),
     cameraDelete: db.prepare('DELETE FROM cameras WHERE id = ?'),
@@ -604,14 +607,38 @@ export function purgeExpiredSessions(now: number = Date.now()): void {
 // Cameras
 // ---------------------------------------------------------------------------
 
+/**
+ * The raw SQLite row stores `zones` as a JSON-encoded TEXT column. Every
+ * camera row leaving the DB layer goes through this so callers see the
+ * typed `string[]` they expect.
+ */
+function decodeCameraRow(raw: unknown): CameraRow {
+  const r = raw as Omit<CameraRow, 'zones'> & { zones: string | null };
+  let zones: string[] = [];
+  if (typeof r.zones === 'string' && r.zones.length > 0) {
+    try {
+      const parsed = JSON.parse(r.zones) as unknown;
+      if (Array.isArray(parsed)) {
+        zones = parsed.filter((z): z is string => typeof z === 'string');
+      }
+    } catch {
+      // Malformed payload — fall back to empty, log nothing (operator will
+      // see "no zones" in the UI and can re-save).
+    }
+  }
+  return { ...r, zones };
+}
+
 export function getCameraById(id: number): CameraRow | null {
-  return (statements().cameraById.get(id) as CameraRow | undefined) ?? null;
+  const raw = statements().cameraById.get(id);
+  return raw ? decodeCameraRow(raw) : null;
 }
 
 export function listCameras(includeDisabled: boolean = true): CameraRow[] {
-  return includeDisabled
-    ? (statements().cameraList.all() as CameraRow[])
-    : (statements().cameraListEnabled.all() as CameraRow[]);
+  const rows = includeDisabled
+    ? statements().cameraList.all()
+    : statements().cameraListEnabled.all();
+  return rows.map((r) => decodeCameraRow(r));
 }
 
 export interface CreateCameraInput {
@@ -619,6 +646,7 @@ export interface CreateCameraInput {
   emoji: string;
   stream_url: string;
   enabled: boolean;
+  zones?: string[];
 }
 
 export function createCamera(input: CreateCameraInput): CameraRow {
@@ -631,6 +659,7 @@ export function createCamera(input: CreateCameraInput): CameraRow {
     position,
     enabled: input.enabled ? 1 : 0,
     created_at: Date.now(),
+    zones: JSON.stringify(input.zones ?? []),
   });
   const id = Number(result.lastInsertRowid);
   const row = getCameraById(id);
@@ -644,6 +673,7 @@ export interface UpdateCameraInput {
   emoji: string;
   stream_url: string;
   enabled: boolean;
+  zones?: string[];
 }
 
 export function updateCamera(input: UpdateCameraInput): CameraRow | null {
@@ -653,6 +683,7 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
     emoji: input.emoji,
     stream_url: input.stream_url,
     enabled: input.enabled ? 1 : 0,
+    zones: JSON.stringify(input.zones ?? []),
   });
   return getCameraById(input.id);
 }

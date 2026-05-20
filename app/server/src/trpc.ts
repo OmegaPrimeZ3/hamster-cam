@@ -229,6 +229,8 @@ const cameraSchema = z.object({
   position: z.number().int(),
   enabled: z.boolean(),
   created_at: z.number().int(),
+  /** Operator-configured zone keywords for this camera (narrator vocabulary). */
+  zones: z.array(z.string()),
   /** ms since epoch of Frigate's most recent frame; null = unknown. */
   last_frame_at: z.number().int().nullable(),
 });
@@ -306,6 +308,7 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
     position: row.position,
     enabled: row.enabled === 1,
     created_at: row.created_at,
+    zones: row.zones,
     last_frame_at: lastFrameAt,
   };
 }
@@ -481,6 +484,7 @@ const camerasRouter = router({
       emoji: z.string().max(8).default('📷'),
       stream_url: z.string().min(1),
       enabled: z.boolean().default(true),
+      zones: z.array(z.string()).default([]),
     }))
     .output(cameraSchema)
     .mutation(({ input }) => {
@@ -489,6 +493,7 @@ const camerasRouter = router({
         emoji: input.emoji,
         stream_url: input.stream_url,
         enabled: input.enabled,
+        zones: input.zones,
       });
       return cameraToDTO(row, null);
     }),
@@ -515,6 +520,7 @@ const camerasRouter = router({
       emoji: z.string().max(8),
       stream_url: z.string().min(1),
       enabled: z.boolean(),
+      zones: z.array(z.string()).default([]),
     }))
     .output(cameraSchema)
     .mutation(({ ctx, input }) => {
@@ -646,39 +652,81 @@ const activityRouter = router({
 // stats.*
 // ---------------------------------------------------------------------------
 
+const statsZoneSchema = z.object({
+  /** The narrator activity key (wheel, food, water, bathroom, resting, tunnel, hiding, exploring). */
+  activity: diaryActivitySchema,
+  count: z.number().int().nonnegative(),
+  total_ms: z.number().int().nonnegative(),
+});
+
 const statsRouter = router({
+  /**
+   * Returns one tile per zone that the operator has wired up on any enabled
+   * camera (union across cameras). If nothing is configured yet, falls back
+   * to whatever activities the day's events show, so the scoreboard isn't
+   * empty during initial onboarding before any zones have been pinned to a
+   * camera in Settings → Cameras.
+   */
   today: protectedProcedure
     .input(z.void())
     .output(z.object({
-      wheel_ms: z.number().int().nonnegative(),
-      snack_visits: z.number().int().nonnegative(),
-      restful_ratio: z.number().min(0).max(1),
+      zones: z.array(statsZoneSchema),
     }))
     .query(() => {
       const start = startOfLocalDay(new Date());
       const end = start + 24 * 60 * 60 * 1000;
       const entries = db.listDiaryEntriesBetween(start, end);
-      let wheelMs = 0;
-      let snackVisits = 0;
-      let restfulMs = 0;
-      let activeMs = 0;
-      for (const e of entries) {
-        const dur = e.duration_ms ?? 0;
-        if (e.activity === 'wheel') wheelMs += dur;
-        if (e.activity === 'food') snackVisits += 1;
-        if (e.activity === 'resting') restfulMs += dur;
-        if (e.activity && e.activity !== 'snapshot' && e.activity !== 'timelapse') {
-          activeMs += dur;
+
+      // Union of configured zones across enabled cameras.
+      const configured = new Set<db.DiaryActivity>();
+      for (const cam of db.listCameras(false)) {
+        for (const z of cam.zones) {
+          if (isStatsActivity(z)) configured.add(z);
         }
       }
-      const restfulRatio = activeMs > 0 ? Math.min(1, restfulMs / activeMs) : 0;
-      return {
-        wheel_ms: wheelMs,
-        snack_visits: snackVisits,
-        restful_ratio: restfulRatio,
-      };
+
+      // Onboarding fallback: with no configured zones, show whatever the day
+      // produced so the operator sees something real before they configure.
+      if (configured.size === 0) {
+        for (const e of entries) {
+          if (e.activity && isStatsActivity(e.activity)) configured.add(e.activity);
+        }
+      }
+
+      const buckets = new Map<db.DiaryActivity, { count: number; total_ms: number }>();
+      for (const e of entries) {
+        if (!e.activity || !configured.has(e.activity)) continue;
+        const cur = buckets.get(e.activity) ?? { count: 0, total_ms: 0 };
+        cur.count += 1;
+        cur.total_ms += e.duration_ms ?? 0;
+        buckets.set(e.activity, cur);
+      }
+
+      // Stable ordering — alphabetical so tile positions don't shuffle.
+      const zones = Array.from(configured)
+        .sort()
+        .map((activity) => ({
+          activity,
+          count: buckets.get(activity)?.count ?? 0,
+          total_ms: buckets.get(activity)?.total_ms ?? 0,
+        }));
+      return { zones };
     }),
 });
+
+/** Activities that make sense as a scoreboard tile (excludes snapshot/timelapse/transition). */
+function isStatsActivity(value: string): value is db.DiaryActivity {
+  return (
+    value === 'wheel' ||
+    value === 'food' ||
+    value === 'water' ||
+    value === 'bathroom' ||
+    value === 'resting' ||
+    value === 'tunnel' ||
+    value === 'exploring' ||
+    value === 'hiding'
+  );
+}
 
 // ---------------------------------------------------------------------------
 // badges.*

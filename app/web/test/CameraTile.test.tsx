@@ -20,6 +20,7 @@ function makeCamera(lastFrameAt: number | null): CameraDTO {
     position: 0,
     enabled: true,
     created_at: 0,
+    zones: [],
     last_frame_at: lastFrameAt,
   };
 }

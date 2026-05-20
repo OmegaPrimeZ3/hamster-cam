@@ -8,6 +8,7 @@ import { useState } from 'react';
 import { ChevronUp, ChevronDown, Pencil, Trash2, Plus } from 'lucide-react';
 import { trpc, RouterOutputs } from '../trpc';
 import { AddCameraForm } from './AddCameraForm';
+import { activityStyle, isZoneActivity, zoneLabel } from '../lib/activity-style';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 
@@ -113,6 +114,51 @@ export function CameraSettings(): JSX.Element {
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 600 }}>{cam.name}</div>
                   <small style={{ color: 'var(--text-muted)', wordBreak: 'break-all' }}>{cam.stream_url}</small>
+                  <div
+                    style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}
+                    aria-label="Configured zones"
+                  >
+                    {cam.zones.filter(isZoneActivity).length === 0 ? (
+                      <span
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          padding: '4px 8px',
+                          borderRadius: 999,
+                          border: '1px dashed var(--border)',
+                          color: 'var(--text-muted)',
+                          fontSize: 12,
+                          lineHeight: 1.2,
+                          fontStyle: 'italic',
+                        }}
+                      >
+                        no zones configured
+                      </span>
+                    ) : (
+                      cam.zones.filter(isZoneActivity).map((z) => {
+                        const { accent, badgeEmoji } = activityStyle(z);
+                        return (
+                          <span
+                            key={z}
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 4,
+                              padding: '4px 8px',
+                              borderRadius: 999,
+                              background: `color-mix(in srgb, ${accent} 18%, transparent)`,
+                              border: `1px solid color-mix(in srgb, ${accent} 30%, transparent)`,
+                              color: 'var(--text)',
+                              fontSize: 12,
+                              lineHeight: 1.2,
+                            }}
+                          >
+                            <span aria-hidden>{badgeEmoji}</span> {zoneLabel(z)}
+                          </span>
+                        );
+                      })
+                    )}
+                  </div>
                 </div>
                 <span
                   className={`hc-status-pip ${

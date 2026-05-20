@@ -5,6 +5,7 @@
 
 import { useEffect, useState } from 'react';
 import { trpc, RouterOutputs } from '../trpc';
+import { ZONE_ACTIVITIES, activityStyle, zoneLabel } from '../lib/activity-style';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 
@@ -40,7 +41,12 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
   const [emoji, setEmoji] = useState(existing?.emoji ?? '📷');
   const [url, setUrl] = useState(existing?.stream_url ?? '');
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
+  const [zones, setZones] = useState<string[]>(existing?.zones ?? []);
   const [showPreview, setShowPreview] = useState(false);
+
+  function toggleZone(z: string): void {
+    setZones((prev) => (prev.includes(z) ? prev.filter((x) => x !== z) : [...prev, z]));
+  }
 
   useEffect(() => {
     setShowPreview(false);
@@ -59,6 +65,7 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
         emoji,
         stream_url: url.trim(),
         enabled,
+        zones,
       });
     } else {
       create.mutate({
@@ -66,6 +73,7 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
         emoji,
         stream_url: url.trim(),
         enabled,
+        zones,
       });
     }
   }
@@ -121,6 +129,45 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
         <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
         Enabled
       </label>
+
+      <div>
+        <span className="hc-label">Zones</span>
+        <p style={{ margin: '0 0 8px', color: 'var(--text-muted)', fontSize: 12 }}>
+          Tick the zones you&rsquo;ve drawn for this camera in Frigate. They power the diary and scoreboard.
+        </p>
+        <div role="group" aria-label="Zones" style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {ZONE_ACTIVITIES.map((z) => {
+            const selected = zones.includes(z);
+            const { accent, badgeEmoji } = activityStyle(z);
+            return (
+              <button
+                key={z}
+                type="button"
+                aria-pressed={selected}
+                onClick={() => toggleZone(z)}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  minHeight: 36,
+                  padding: '4px 12px',
+                  borderRadius: 999,
+                  border: '1px solid',
+                  borderColor: selected ? 'transparent' : 'var(--border)',
+                  background: selected ? accent : 'var(--surface)',
+                  color: selected ? '#fff' : 'var(--text)',
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: 'pointer',
+                  lineHeight: 1.2,
+                }}
+              >
+                <span aria-hidden>{badgeEmoji}</span> {zoneLabel(z)}
+              </button>
+            );
+          })}
+        </div>
+      </div>
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
         <button type="submit" className="hc-btn hc-btn-primary" disabled={!formOk || submitting}>

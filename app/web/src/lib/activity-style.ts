@@ -62,3 +62,51 @@ export function activityStyle(activity: DiaryActivity | null): ActivityStyle {
     bgTint: tint(entry.accent, TINT_ALPHA),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Zone vocabulary — the subset of activities operators wire up on a camera.
+// `snapshot` / `timelapse` are app-generated; `transition` is computed
+// across cameras. None of those are valid zone keywords, so the camera
+// settings form and the scoreboard both exclude them.
+// ---------------------------------------------------------------------------
+
+export type ZoneActivity =
+  | 'wheel' | 'food' | 'water' | 'bathroom'
+  | 'resting' | 'tunnel' | 'exploring' | 'hiding';
+
+export const ZONE_ACTIVITIES: readonly ZoneActivity[] = [
+  'wheel', 'food', 'water', 'bathroom',
+  'resting', 'tunnel', 'exploring', 'hiding',
+];
+
+export function isZoneActivity(value: string): value is ZoneActivity {
+  return (ZONE_ACTIVITIES as readonly string[]).includes(value);
+}
+
+interface ZoneVocab {
+  /** Display label for the camera pill (Title Case). */
+  label: string;
+  /** Scoreboard primary metric — counts visits vs sums durations. */
+  primaryMetric: 'count' | 'duration';
+  /** Scoreboard label under the big number ("MIN ON WHEEL", "SNACKS", etc). */
+  unitLabel: string;
+}
+
+const ZONE_VOCAB: Record<ZoneActivity, ZoneVocab> = {
+  wheel:     { label: 'Wheel',    primaryMetric: 'duration', unitLabel: 'MIN ON WHEEL' },
+  food:      { label: 'Food',     primaryMetric: 'count',    unitLabel: 'SNACKS' },
+  water:     { label: 'Water',    primaryMetric: 'count',    unitLabel: 'SIPS' },
+  bathroom:  { label: 'Bathroom', primaryMetric: 'count',    unitLabel: 'POTTY BREAKS' },
+  resting:   { label: 'Resting',  primaryMetric: 'duration', unitLabel: 'MIN RESTING' },
+  tunnel:    { label: 'Tunnel',   primaryMetric: 'count',    unitLabel: 'TUNNEL TRIPS' },
+  exploring: { label: 'Explore',  primaryMetric: 'count',    unitLabel: 'EXPLORES' },
+  hiding:    { label: 'Hideout',  primaryMetric: 'count',    unitLabel: 'HIDE-AND-SEEKS' },
+};
+
+export function zoneLabel(activity: ZoneActivity): string {
+  return ZONE_VOCAB[activity].label;
+}
+
+export function zoneMetric(activity: ZoneActivity): ZoneVocab {
+  return ZONE_VOCAB[activity];
+}
