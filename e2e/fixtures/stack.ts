@@ -367,6 +367,10 @@ async function startFrontend(opts: { getBackendPort: () => number }): Promise<Fr
   return {
     port,
     close: async () => {
+      // Force-close any in-flight upstream connections; otherwise the SW's
+      // long-running fetch listeners can keep the server alive past Playwright's
+      // afterEach timeout.
+      server.closeAllConnections?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
