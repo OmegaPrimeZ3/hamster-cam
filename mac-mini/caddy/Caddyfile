@@ -17,6 +17,22 @@
 	# auto-redirect shim has nothing to bind. Skip it entirely.
 	auto_https disable_redirects
 
+	# Trust Cloudflare's edge so {client_ip}, request logs, and the
+	# rate-limit / fail2ban paths see the *real* visitor IP, not the
+	# Anycast edge. The `cloudflare` ip_sources provider comes from
+	# the WeidiDeng/caddy-cloudflare-ip xcaddy plugin baked into the
+	# image; it refreshes the upstream CIDR list every 12h.
+	# CF-Connecting-IP is the Cloudflare-injected header carrying the
+	# real client; X-Forwarded-For is the fallback for any direct LAN
+	# tests bypassing Cloudflare.
+	servers {
+		trusted_proxies cloudflare {
+			interval 12h
+			timeout 15s
+		}
+		client_ip_headers CF-Connecting-IP X-Forwarded-For
+	}
+
 	# Strong defaults for log volume — JSON access logs roll out below.
 	log {
 		format json
@@ -70,13 +86,14 @@
 
 	# Throttle brute-force attempts on /auth/* paths. Zyphr does its own
 	# 429 rate-limiting (PLAN §7.6.5); this is the edge belt-and-braces.
-	# The caddy-ratelimit plugin's `zone` is keyed on remote_host; 20
-	# events / 1 min / IP is generous enough not to false-positive a
-	# household but tight enough to defeat a credential-stuffing run.
+	# Keyed on {client_ip} — resolved via the global trusted_proxies
+	# block above — so the bucket is per real visitor, not per Cloudflare
+	# edge. 20 events / 1 min / IP is generous enough not to false-positive
+	# a household but tight enough to defeat a credential-stuffing run.
 	@auth_paths path /auth/*
 	rate_limit @auth_paths {
 		zone auth {
-			key {remote_host}
+			key {client_ip}
 			events 20
 			window 1m
 		}
@@ -84,12 +101,12 @@
 
 	# Reverse-proxy to the host-side Fastify app. The compose service
 	# injects `host.docker.internal:host-gateway` so this resolves on
-	# Linux as well as macOS Docker Desktop. Pass real IP through.
-	# Caddy already forwards X-Forwarded-For / X-Forwarded-Proto / Host
-	# by default, so we only need to override X-Real-IP (which Caddy
-	# doesn't set automatically).
+	# Linux as well as macOS Docker Desktop. Caddy already forwards
+	# X-Forwarded-For / X-Forwarded-Proto / Host by default; we override
+	# X-Real-IP with {client_ip} so Fastify sees the real visitor
+	# (resolved via trusted_proxies cloudflare above).
 	reverse_proxy host.docker.internal:3000 {
-		header_up X-Real-IP {remote_host}
+		header_up X-Real-IP {client_ip}
 	}
 }
 
