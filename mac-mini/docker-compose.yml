@@ -116,7 +116,6 @@ services:
       # sudo chown 1000:1000 /var/log/caddy` once on the Mac Mini.
       - /var/log/caddy:/var/log/caddy
     environment:
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
       - CADDY_EMAIL=${CADDY_EMAIL}
       - CADDY_HOSTNAME=${CADDY_HOSTNAME}
       - CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT:-2053}
@@ -127,35 +126,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
-
-  cloudflare-ddns:
-    # favonia/cloudflare-ddns is the maintained successor to the dead
-    # oznu/cloudflare-ddns. Same scoped-token model; no shell in the image
-    # (distroless), so it's small and hard to pop.
-    #
-    # Runs on the default compose bridge network — no `network_mode: host`
-    # needed because IP4_PROVIDER=cloudflare.trace discovers the public
-    # IP via an outbound HTTPS call (works on any bridge) and IP6_PROVIDER
-    # is disabled. Keeping the container in its own netns preserves
-    # Docker's namespace isolation; defense-in-depth alongside the
-    # distroless image, cap_drop ALL, read_only, and no-new-privileges
-    # already in this service definition.
-    image: favonia/cloudflare-ddns:1.16.2
-    container_name: hamster-cloudflare-ddns
-    restart: unless-stopped
-    environment:
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-      - DOMAINS=${CLOUDFLARE_SUBDOMAIN}.${CLOUDFLARE_ZONE}
-      - PROXIED=true
-      - IP4_PROVIDER=cloudflare.trace
-      - IP6_PROVIDER=none
-      - UPDATE_CRON=@every 5m
-      - TZ=${TZ:-Etc/UTC}
-    cap_drop:
-      - ALL
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
 
 volumes:
   mosquitto_data:
