@@ -40,6 +40,13 @@ export interface AppContext {
   /** Fastify request — kept for handlers that need headers / IP. */
   req: CreateFastifyContextOptions['req'];
   res: CreateFastifyContextOptions['res'];
+  /**
+   * Per-request scratchpad. adminProcedure handlers that need a before-state
+   * snapshot for audit-log details write it here (typically under key
+   * `'before'`) and the audit resolver in `detailsFrom` reads it after the
+   * mutation completes. Empty object on every request; never persists.
+   */
+  audit: Record<string, unknown>;
 }
 
 export function createContext(opts: CreateFastifyContextOptions): AppContext {
@@ -49,6 +56,7 @@ export function createContext(opts: CreateFastifyContextOptions): AppContext {
     sessionId: opts.req.sessionId ?? null,
     req: opts.req,
     res: opts.res,
+    audit: {},
   };
 }
 
@@ -76,16 +84,68 @@ export const protectedProcedure = t.procedure.use(({ ctx, next }) => {
  *
  * Read-only admin procedures opt out by setting `meta({ audit: false })`.
  */
+/**
+ * Per-procedure audit-write configuration. Security-Review Finding 4
+ * remediation: instead of always writing `target_id = null, details = null`,
+ * we let each adminProcedure declare resolvers that read the affected row id
+ * (and an optional details payload) from the procedure's input / result.
+ *
+ * Shapes the resolvers see:
+ *   targetIdFrom(input, ctx)            — for "act on existing row" shapes
+ *                                         where the id lives in the request.
+ *   targetIdFromResult(result, ctx)     — for create-shaped procedures where
+ *                                         the id only exists after `next()`.
+ *   detailsFrom(input, result, ctx)     — arbitrary structured payload that
+ *                                         gets JSON.stringify'd into the
+ *                                         `details` audit-log column.
+ *
+ * The middleware calls these AFTER the inner procedure resolves (so create
+ * resolvers see the new row, update resolvers see both the input and the
+ * post-update result). Any resolver throwing → audit row is written with
+ * whatever it produced before the throw (defensive: we never let an audit
+ * resolver block the mutation it's auditing).
+ */
+interface AuditMetaConfig {
+  /**
+   * String overrides the default action label (which is the procedure path).
+   * `false` disables audit-writing entirely — used by read-only admin routes.
+   */
+  action?: string | undefined;
+  targetType?: string | undefined;
+  targetIdFrom?: ((input: unknown, ctx: AppContext) => string | number | null | undefined) | undefined;
+  targetIdFromResult?: ((
+    result: unknown,
+    input: unknown,
+    ctx: AppContext,
+  ) => string | number | null | undefined) | undefined;
+  detailsFrom?: ((input: unknown, result: unknown, ctx: AppContext) => unknown) | undefined;
+}
+
 interface ProcedureMeta {
-  /** Action label to record in audit_log. Defaults to the procedure path. */
-  audit?: false | string;
-  /** target_type column for the audit row. */
+  /**
+   * Audit configuration. `false` opts out entirely (read-only admin routes).
+   * A bare string is the legacy shorthand for `{ action: '<string>' }` —
+   * preserved so the broad migration to AuditMetaConfig doesn't churn every
+   * existing call site at once.
+   *
+   * NEW shape (Finding 4): `{ action, targetType, targetIdFrom, ... }` so the
+   * audit row carries the affected target_id and a JSON details payload.
+   */
+  audit?: false | string | AuditMetaConfig;
+  /** Legacy: target_type column when `audit` is bare-string shorthand. */
   targetType?: string;
 }
 
 const tAdmin = initTRPC.context<AppContext>().meta<ProcedureMeta>().create();
 
-export const adminProcedure = tAdmin.procedure.use(async ({ ctx, next, path, type, meta }) => {
+export const adminProcedure = tAdmin.procedure.use(async ({
+  ctx,
+  next,
+  path,
+  type,
+  meta,
+  rawInput,
+}) => {
   if (!ctx.user) {
     throw new TRPCError({ code: 'UNAUTHORIZED', message: 'unauthenticated' });
   }
@@ -93,18 +153,54 @@ export const adminProcedure = tAdmin.procedure.use(async ({ ctx, next, path, typ
     throw new TRPCError({ code: 'FORBIDDEN', message: 'forbidden' });
   }
 
-  const result = await next({ ctx: { ...ctx, user: ctx.user } });
+  const nextCtx = { ...ctx, user: ctx.user };
+  const result = await next({ ctx: nextCtx });
 
   // Only audit successful mutations, and only when not explicitly opted out.
-  if (type === 'mutation' && result.ok && meta?.audit !== false) {
-    db.insertAudit({
-      actor_user_id: ctx.user.id,
-      action: typeof meta?.audit === 'string' ? meta.audit : path,
-      target_type: meta?.targetType ?? null,
-      target_id: null,
-      details: null,
-    });
+  if (type !== 'mutation' || !result.ok || meta?.audit === false) {
+    return result;
   }
+
+  // Resolve audit row fields out of either the legacy bare-string meta or the
+  // new AuditMetaConfig object.
+  const cfg: AuditMetaConfig = typeof meta?.audit === 'object' && meta.audit !== null
+    ? meta.audit
+    : {
+        action: typeof meta?.audit === 'string' ? meta.audit : undefined,
+        targetType: meta?.targetType,
+      };
+
+  // Resolvers are best-effort: a thrown resolver MUST NOT break the mutation
+  // it's auditing. We just log nothing for that field.
+  let targetId: string | null = null;
+  try {
+    if (cfg.targetIdFromResult) {
+      const id = cfg.targetIdFromResult(result.data, rawInput, nextCtx);
+      if (id !== null && id !== undefined) targetId = String(id);
+    } else if (cfg.targetIdFrom) {
+      const id = cfg.targetIdFrom(rawInput, nextCtx);
+      if (id !== null && id !== undefined) targetId = String(id);
+    }
+  } catch {
+    targetId = null;
+  }
+
+  let details: unknown = null;
+  try {
+    if (cfg.detailsFrom) {
+      details = cfg.detailsFrom(rawInput, result.data, nextCtx);
+    }
+  } catch {
+    details = null;
+  }
+
+  db.insertAudit({
+    actor_user_id: ctx.user.id,
+    action: cfg.action ?? path,
+    target_type: cfg.targetType ?? null,
+    target_id: targetId,
+    details,
+  });
 
   return result;
 });
@@ -298,10 +394,32 @@ const settingsRouter = router({
 
   // settings.update — admin only; written one key at a time
   update: adminProcedure
-    .meta({ audit: 'settings.update', targetType: 'settings' })
+    .meta({
+      audit: {
+        action: 'settings.update',
+        targetType: 'settings',
+        // Settings is a singleton — there's no row id, but we record a stable
+        // marker so audit consumers don't have to special-case null target_id.
+        targetIdFrom: () => 'settings',
+        // Build a before/after diff against the snapshot the mutation
+        // captured into ctx.audit.before before calling setSettings.
+        detailsFrom: (_input, result, ctx) => {
+          const before = ctx.audit['before'];
+          return diffObjects(
+            isRecord(before) ? before : {},
+            isRecord(result) ? result : {},
+          );
+        },
+      },
+    })
     .input(settingsUpdateSchema)
     .output(settingsSchema)
-    .mutation(({ input }) => {
+    .mutation(({ ctx, input }) => {
+      // Capture the pre-update snapshot so the audit-detail resolver can build
+      // the diff. Read from db.getSettings() not from `input` — input is a
+      // partial; the snapshot needs the full state of every column the diff
+      // might mention.
+      ctx.audit['before'] = parseSettingsKV(db.getSettings());
       const kv: db.SettingsKV = {};
       for (const [key, value] of Object.entries(input)) {
         if (value === undefined) continue;
@@ -340,7 +458,24 @@ const camerasRouter = router({
     }),
 
   create: adminProcedure
-    .meta({ audit: 'cameras.create', targetType: 'camera' })
+    .meta({
+      audit: {
+        action: 'cameras.create',
+        targetType: 'camera',
+        // Newly-created row id only exists post-mutation, so read from result.
+        targetIdFromResult: (result) =>
+          isRecord(result) && typeof result['id'] === 'number' ? result['id'] : null,
+        detailsFrom: (input) => {
+          if (!isRecord(input)) return null;
+          return {
+            name: input['name'],
+            emoji: input['emoji'],
+            stream_url: input['stream_url'],
+            enabled: input['enabled'],
+          };
+        },
+      },
+    })
     .input(z.object({
       name: z.string().min(1).max(60),
       emoji: z.string().max(8).default('📷'),
@@ -359,7 +494,21 @@ const camerasRouter = router({
     }),
 
   update: adminProcedure
-    .meta({ audit: 'cameras.update', targetType: 'camera' })
+    .meta({
+      audit: {
+        action: 'cameras.update',
+        targetType: 'camera',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['id'] === 'number' ? input['id'] : null,
+        detailsFrom: (_input, result, ctx) => {
+          const before = ctx.audit['before'];
+          return diffObjects(
+            isRecord(before) ? before : {},
+            isRecord(result) ? result : {},
+          );
+        },
+      },
+    })
     .input(z.object({
       id: z.number().int(),
       name: z.string().min(1).max(60),
@@ -368,23 +517,53 @@ const camerasRouter = router({
       enabled: z.boolean(),
     }))
     .output(cameraSchema)
-    .mutation(({ input }) => {
+    .mutation(({ ctx, input }) => {
+      const before = db.getCameraById(input.id);
+      if (before) ctx.audit['before'] = cameraToDTO(before, null);
       const row = db.updateCamera(input);
       if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'camera not found' });
       return cameraToDTO(row, null);
     }),
 
   delete: adminProcedure
-    .meta({ audit: 'cameras.delete', targetType: 'camera' })
+    .meta({
+      audit: {
+        action: 'cameras.delete',
+        targetType: 'camera',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['id'] === 'number' ? input['id'] : null,
+        // Capture the deleted row's identity so the audit reviewer can see
+        // what was removed (the row itself is gone by the time they look).
+        detailsFrom: (_input, _result, ctx) => {
+          const before = ctx.audit['before'];
+          if (!isRecord(before)) return null;
+          return { name: before['name'], stream_url: before['stream_url'] };
+        },
+      },
+    })
     .input(z.object({ id: z.number().int() }))
     .output(z.object({ ok: z.literal(true) }))
-    .mutation(({ input }) => {
+    .mutation(({ ctx, input }) => {
+      const before = db.getCameraById(input.id);
+      if (before) ctx.audit['before'] = cameraToDTO(before, null);
       db.deleteCamera(input.id);
       return { ok: true } as const;
     }),
 
   reorder: adminProcedure
-    .meta({ audit: 'cameras.reorder', targetType: 'camera' })
+    .meta({
+      audit: {
+        action: 'cameras.reorder',
+        targetType: 'camera',
+        // Reorder hits every row — no single target_id is meaningful, so we
+        // surface the ordered list as the audit-detail payload instead.
+        detailsFrom: (input) => {
+          if (!isRecord(input)) return null;
+          const ids = input['ordered_ids'];
+          return Array.isArray(ids) ? { ordered_ids: ids } : null;
+        },
+      },
+    })
     .input(z.object({ ordered_ids: z.array(z.number().int()).min(1) }))
     .output(z.array(cameraSchema))
     .mutation(({ input }) => {
@@ -524,7 +703,25 @@ const usersRouter = router({
     .query(() => db.listUsers().map((u) => db.toPublicUser(u))),
 
   create: adminProcedure
-    .meta({ audit: 'users.create', targetType: 'user' })
+    .meta({
+      audit: {
+        action: 'users.create',
+        targetType: 'user',
+        // New user's id is the row we just inserted — only known post-mutation.
+        targetIdFromResult: (result) =>
+          isRecord(result) && typeof result['id'] === 'number' ? result['id'] : null,
+        // Record the new user's email + display_name + role (NOT password, which
+        // never reaches the audit table either way — it's not in the result).
+        detailsFrom: (input) => {
+          if (!isRecord(input)) return null;
+          return {
+            email: input['email'],
+            display_name: input['display_name'],
+            role: input['role'],
+          };
+        },
+      },
+    })
     .input(z.object({
       email: z.string().email(),
       display_name: z.string().min(1).max(40),
@@ -556,14 +753,28 @@ const usersRouter = router({
     }),
 
   update: adminProcedure
-    .meta({ audit: 'users.update', targetType: 'user' })
+    .meta({
+      audit: {
+        action: 'users.update',
+        targetType: 'user',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['id'] === 'number' ? input['id'] : null,
+        detailsFrom: (_input, result, ctx) => {
+          const before = ctx.audit['before'];
+          return diffObjects(
+            isRecord(before) ? before : {},
+            isRecord(result) ? result : {},
+          );
+        },
+      },
+    })
     .input(z.object({
       id: z.number().int(),
       display_name: z.string().min(1).max(40),
       role: roleSchema,
     }))
     .output(publicUserSchema)
-    .mutation(({ input }) => {
+    .mutation(({ ctx, input }) => {
       const target = db.getUserById(input.id);
       if (!target) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
@@ -577,13 +788,33 @@ const usersRouter = router({
           });
         }
       }
+      // Snapshot the pre-update public projection for the audit diff.
+      ctx.audit['before'] = db.toPublicUser(target);
       const row = db.updateUser(input);
       if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
       return db.toPublicUser(row);
     }),
 
   delete: adminProcedure
-    .meta({ audit: 'users.delete', targetType: 'user' })
+    .meta({
+      audit: {
+        action: 'users.delete',
+        targetType: 'user',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['id'] === 'number' ? input['id'] : null,
+        // Audit reviewer needs the deleted user's email/display_name — the
+        // row itself is gone by the time they read the log.
+        detailsFrom: (_input, _result, ctx) => {
+          const before = ctx.audit['before'];
+          if (!isRecord(before)) return null;
+          return {
+            email: before['email'],
+            display_name: before['display_name'],
+            role: before['role'],
+          };
+        },
+      },
+    })
     .input(z.object({ id: z.number().int() }))
     .output(z.object({ ok: z.literal(true) }))
     .mutation(({ ctx, input }) => {
@@ -603,12 +834,20 @@ const usersRouter = router({
           message: 'cannot delete your own account from this UI; sign in as another admin first',
         });
       }
+      ctx.audit['before'] = db.toPublicUser(target);
       db.deleteUser(input.id);
       return { ok: true } as const;
     }),
 
   resetPassword: adminProcedure
-    .meta({ audit: 'users.resetPassword', targetType: 'user' })
+    .meta({
+      audit: {
+        action: 'users.resetPassword',
+        targetType: 'user',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['id'] === 'number' ? input['id'] : null,
+      },
+    })
     .input(z.object({ id: z.number().int() }))
     .output(z.object({ ok: z.literal(true) }))
     .mutation(async ({ input }) => {
@@ -674,7 +913,18 @@ const recipientsRouter = router({
     .query(() => db.listShareRecipients()),
 
   create: adminProcedure
-    .meta({ audit: 'recipients.create', targetType: 'recipient' })
+    .meta({
+      audit: {
+        action: 'recipients.create',
+        targetType: 'recipient',
+        targetIdFromResult: (result) =>
+          isRecord(result) && typeof result['id'] === 'number' ? result['id'] : null,
+        detailsFrom: (input) => {
+          if (!isRecord(input)) return null;
+          return { display_name: input['display_name'], email: input['email'] };
+        },
+      },
+    })
     .input(z.object({
       display_name: z.string().min(1).max(40),
       email: z.string().email(),
@@ -687,24 +937,54 @@ const recipientsRouter = router({
     })),
 
   update: adminProcedure
-    .meta({ audit: 'recipients.update', targetType: 'recipient' })
+    .meta({
+      audit: {
+        action: 'recipients.update',
+        targetType: 'recipient',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['id'] === 'number' ? input['id'] : null,
+        detailsFrom: (_input, result, ctx) => {
+          const before = ctx.audit['before'];
+          return diffObjects(
+            isRecord(before) ? before : {},
+            isRecord(result) ? result : {},
+          );
+        },
+      },
+    })
     .input(z.object({
       id: z.number().int(),
       display_name: z.string().min(1).max(40),
       email: z.string().email(),
     }))
     .output(recipientSchema)
-    .mutation(({ input }) => {
+    .mutation(({ ctx, input }) => {
+      const before = db.getShareRecipientById(input.id);
+      if (before) ctx.audit['before'] = before;
       const row = db.updateShareRecipient(input);
       if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'recipient not found' });
       return row;
     }),
 
   delete: adminProcedure
-    .meta({ audit: 'recipients.delete', targetType: 'recipient' })
+    .meta({
+      audit: {
+        action: 'recipients.delete',
+        targetType: 'recipient',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['id'] === 'number' ? input['id'] : null,
+        detailsFrom: (_input, _result, ctx) => {
+          const before = ctx.audit['before'];
+          if (!isRecord(before)) return null;
+          return { display_name: before['display_name'], email: before['email'] };
+        },
+      },
+    })
     .input(z.object({ id: z.number().int() }))
     .output(z.object({ ok: z.literal(true) }))
-    .mutation(({ input }) => {
+    .mutation(({ ctx, input }) => {
+      const before = db.getShareRecipientById(input.id);
+      if (before) ctx.audit['before'] = before;
       db.deleteShareRecipient(input.id);
       return { ok: true } as const;
     }),
@@ -756,7 +1036,16 @@ const shareRouter = router({
 
 const adminRouter = router({
   rebuildTimelapse: adminProcedure
-    .meta({ audit: 'admin.rebuildTimelapse', targetType: 'job' })
+    .meta({
+      audit: {
+        action: 'admin.rebuildTimelapse',
+        targetType: 'job',
+        // Date string is the natural target — there's no row id for "the job".
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['date'] === 'string' ? input['date'] : null,
+        detailsFrom: (_input, result) => (isRecord(result) ? result : null),
+      },
+    })
     .input(z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }))
     .output(z.object({
       date: z.string(),
@@ -767,7 +1056,13 @@ const adminRouter = router({
     .mutation(({ input }) => runTimelapseJob(new Date(`${input.date}T12:00:00`))),
 
   runRetention: adminProcedure
-    .meta({ audit: 'admin.runRetention', targetType: 'job' })
+    .meta({
+      audit: {
+        action: 'admin.runRetention',
+        targetType: 'job',
+        detailsFrom: (_input, result) => (isRecord(result) ? result : null),
+      },
+    })
     .input(z.void())
     .output(z.object({
       snapshots_deleted: z.number().int().nonnegative(),
@@ -777,7 +1072,13 @@ const adminRouter = router({
     .mutation(() => runRetentionJob()),
 
   runDiskWatch: adminProcedure
-    .meta({ audit: 'admin.runDiskWatch', targetType: 'job' })
+    .meta({
+      audit: {
+        action: 'admin.runDiskWatch',
+        targetType: 'job',
+        detailsFrom: (_input, result) => (isRecord(result) ? result : null),
+      },
+    })
     .input(z.void())
     .output(z.object({
       severity: z.enum(['ok', 'warn', 'critical']),
@@ -815,4 +1116,37 @@ function startOfLocalDay(d: Date): number {
   const copy = new Date(d);
   copy.setHours(0, 0, 0, 0);
   return copy.getTime();
+}
+
+/** Narrow `unknown` to a plain object so audit resolvers can read fields safely. */
+function isRecord(x: unknown): x is Record<string, unknown> {
+  return typeof x === 'object' && x !== null && !Array.isArray(x);
+}
+
+/**
+ * Shallow before/after diff for update-shape audit details. Returns
+ *   { changed: { key: { before, after }, … } }
+ * containing only the keys whose values differ (compared via JSON.stringify
+ * so nested objects + arrays compare structurally). Keys present in one
+ * object but not the other are also reported.
+ *
+ * The audit-log `details` column is meant for humans skimming a forensic
+ * trail — concise is more valuable than exhaustive.
+ */
+function diffObjects(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+): { changed: Record<string, { before: unknown; after: unknown }> } {
+  const changed: Record<string, { before: unknown; after: unknown }> = {};
+  const keys = new Set<string>([...Object.keys(before), ...Object.keys(after)]);
+  for (const k of keys) {
+    const a = before[k];
+    const b = after[k];
+    // Structural compare via JSON; both sides are plain JSON-shaped already
+    // (DTOs / settings KV / public users).
+    if (JSON.stringify(a) !== JSON.stringify(b)) {
+      changed[k] = { before: a, after: b };
+    }
+  }
+  return { changed };
 }

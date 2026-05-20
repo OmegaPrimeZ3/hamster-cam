@@ -82,6 +82,7 @@ async function makeAdminCtx() {
     sessionId: 'fake',
     req: {} as never,
     res: {} as never,
+    audit: {} as Record<string, unknown>,
   };
 }
 
