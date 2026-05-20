@@ -26,6 +26,7 @@ import { dirname, join, normalize } from 'node:path';
 
 import { createTestDb, type TestDbHandle, type SeedUserInput } from './db-factory.js';
 import { startFrigateMock, type FrigateMock, type FrigateMockCamera } from './frigate-mock.js';
+import { startMqttBroker, type MqttBroker } from './mqtt-broker.js';
 import { startZyphrMock, type ZyphrMock, type ZyphrUserSeed } from './msw-zyphr.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -43,6 +44,8 @@ export interface StackHandle {
   zyphr: ZyphrMock;
   /** Frigate mock — null when `frigate` not requested. */
   frigate: FrigateMock | null;
+  /** MQTT broker — null when `mqtt: false` (default). */
+  mqtt: MqttBroker | null;
   db: TestDbHandle;
   close: () => Promise<void>;
   /** Kill the backend mid-spec (used by the PWA offline-shell test). */
@@ -69,6 +72,11 @@ export interface StackOptions {
    * also adjust the list at runtime via `stack.frigate.setCameras([...])`.
    */
   frigate?: FrigateMockCamera[];
+  /**
+   * Start an in-process MQTT broker (aedes) and point the backend at it.
+   * Required for any spec that exercises the narrator end-to-end.
+   */
+  mqtt?: boolean;
 }
 
 interface BackendHandle {
@@ -148,12 +156,21 @@ export async function startStack(opts: StackOptions = {}): Promise<StackHandle> 
     frigateBaseUrl = frigate.baseUrl;
   }
 
+  // 2c) Optional MQTT broker for narrator-driven flows.
+  let mqttBroker: MqttBroker | null = null;
+  let mqttUrl: string | undefined;
+  if (opts.mqtt) {
+    mqttBroker = await startMqttBroker();
+    mqttUrl = mqttBroker.url;
+  }
+
   // 3) Backend child process.
   const backend = await startBackendChild({
     dbPath: db.path,
     storagePath: dirname(db.path),
     zyphrBaseUrl: zyphr.baseUrl,
     frigateBaseUrl,
+    mqttUrl,
     logLevel: opts.logLevel ?? 'silent',
   });
 
@@ -170,12 +187,14 @@ export async function startStack(opts: StackOptions = {}): Promise<StackHandle> 
     dbPath: db.path,
     zyphr,
     frigate,
+    mqtt: mqttBroker,
     db,
     close: async () => {
       await front.close();
       await backend.close();
       await zyphr.close();
       if (frigate) await frigate.close();
+      if (mqttBroker) await mqttBroker.close();
       await db.cleanup();
     },
     killBackend: async () => {
@@ -187,6 +206,7 @@ export async function startStack(opts: StackOptions = {}): Promise<StackHandle> 
         storagePath: dirname(db.path),
         zyphrBaseUrl: zyphr.baseUrl,
         frigateBaseUrl,
+        mqttUrl,
         logLevel: opts.logLevel ?? 'silent',
       });
       backend.port = restarted.port;
@@ -201,6 +221,7 @@ interface BackendChildOpts {
   storagePath: string;
   zyphrBaseUrl: string;
   frigateBaseUrl: string | undefined;
+  mqttUrl: string | undefined;
   logLevel: string;
 }
 
@@ -220,6 +241,7 @@ async function startBackendChild(opts: BackendChildOpts): Promise<BackendHandle>
     LOG_LEVEL: opts.logLevel,
     PORT: '0',
     ...(opts.frigateBaseUrl ? { FRIGATE_URL: opts.frigateBaseUrl } : {}),
+    ...(opts.mqttUrl ? { MQTT_URL: opts.mqttUrl } : {}),
   };
 
   const child = spawn(TSX_BIN, [SERVER_BOOT_HELPER], {
@@ -230,15 +252,27 @@ async function startBackendChild(opts: BackendChildOpts): Promise<BackendHandle>
   let stderrBuf = '';
   child.stderr?.on('data', (chunk: Buffer) => {
     stderrBuf += chunk.toString();
+    if (opts.logLevel !== 'silent') {
+      process.stderr.write(`[backend ${child.pid}] ${chunk}`);
+    }
   });
 
   const port = await new Promise<number>((resolve, reject) => {
     let stdoutBuf = '';
     const onData = (chunk: Buffer): void => {
       stdoutBuf += chunk.toString();
+      if (opts.logLevel !== 'silent') {
+        process.stdout.write(`[backend ${child.pid}] ${chunk}`);
+      }
       const m = /^READY (\d+)/m.exec(stdoutBuf);
       if (m) {
         child.stdout?.off('data', onData);
+        if (opts.logLevel !== 'silent') {
+          // Keep tailing for visibility after READY.
+          child.stdout?.on('data', (b: Buffer) => {
+            process.stdout.write(`[backend ${child.pid}] ${b}`);
+          });
+        }
         resolve(Number(m[1]));
       }
     };

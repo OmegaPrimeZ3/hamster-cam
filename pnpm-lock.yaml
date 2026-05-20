@@ -183,9 +183,15 @@ importers:
       '@playwright/test':
         specifier: 1.48.0
         version: 1.48.0
+      aedes:
+        specifier: 0.51.3
+        version: 0.51.3
       better-sqlite3:
         specifier: 11.3.0
         version: 11.3.0
+      mqtt:
+        specifier: 5.10.1
+        version: 5.10.1
       msw:
         specifier: 2.4.9
         version: 2.4.9(typescript@5.6.2)

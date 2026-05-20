@@ -8,6 +8,7 @@ export { startStack } from './stack.js';
 export type { StackHandle, StackOptions } from './stack.js';
 export type { TestDbHandle, SeededUser, SeededCamera, SeededRecipient } from './db-factory.js';
 export type { ZyphrMock, ZyphrUserSeed } from './msw-zyphr.js';
+export type { MqttBroker } from './mqtt-broker.js';
 
 /** Common admin credentials used across most specs. */
 export const defaultAdmin = {

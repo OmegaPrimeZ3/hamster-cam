@@ -18,7 +18,9 @@
     "@hamster-cam/server": "workspace:*",
     "@hamster-cam/web": "workspace:*",
     "@playwright/test": "1.48.0",
+    "aedes": "0.51.3",
     "better-sqlite3": "11.3.0",
+    "mqtt": "5.10.1",
     "msw": "2.4.9",
     "tsx": "4.19.1"
   },

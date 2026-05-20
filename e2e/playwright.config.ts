@@ -53,6 +53,13 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         viewport: { width: 1366, height: 900 },
+        launchOptions: {
+          // The stack fixture serves https with a self-signed cert; Chromium's
+          // ServiceWorker registration path fetches /sw.js outside of the
+          // context's ignoreHTTPSErrors gate, so we need a launch-level flag
+          // too. --allow-insecure-localhost would also work but is broader.
+          args: ['--ignore-certificate-errors'],
+        },
       },
     },
     {

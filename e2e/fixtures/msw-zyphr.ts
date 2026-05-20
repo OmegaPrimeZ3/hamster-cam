@@ -200,7 +200,7 @@ export async function startZyphrMock(opts?: {
       writeOk(res, { success: true });
       return;
     }
-    if (req.method === 'POST' && path === '/emails/send') {
+    if (req.method === 'POST' && path === '/emails') {
       writeOk(res, { id: `email_${Date.now()}`, status: 'queued' });
       return;
     }
