@@ -112,6 +112,8 @@ cameras:
         coordinates: 0.55,0.10,0.95,0.10,0.95,0.55,0.55,0.55
       water:
         coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
+      bathroom:
+        coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
 
   hamster_cam_2:
     ffmpeg:
@@ -140,33 +142,7 @@ cameras:
         coordinates: 0.55,0.10,0.95,0.10,0.95,0.55,0.55,0.55
       water:
         coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
-
-  hamster_cam_3:
-    ffmpeg:
-      inputs:
-        - path: rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-3.local:8554/camera
-          roles:
-            - detect
-            - record
-    detect:
-      width: 1280
-      height: 720
-      fps: 5
-    objects:
-      track:
-        - mouse
-        - cat
-      filters:
-        mouse:
-          min_score: 0.30
-        cat:
-          min_score: 0.30
-    zones:
-      wheel:
-        coordinates: 0.05,0.10,0.45,0.10,0.45,0.55,0.05,0.55
-      food:
-        coordinates: 0.55,0.10,0.95,0.10,0.95,0.55,0.55,0.55
-      water:
+      bathroom:
         coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
 
 go2rtc:
@@ -175,8 +151,6 @@ go2rtc:
       - "rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera"
     hamster_cam_2:
       - "rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera"
-    hamster_cam_3:
-      - "rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-3.local:8554/camera"
 
 logger:
   default: info
