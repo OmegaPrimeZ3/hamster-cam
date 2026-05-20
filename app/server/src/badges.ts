@@ -10,7 +10,10 @@ export type BadgeId =
   | 'early_bird'
   | 'first_day'
   | 'memory_keeper'
-  | 'hat_trick';
+  | 'hat_trick'
+  | 'mile_high'
+  | 'marathon_club'
+  | 'ultra';
 
 export interface BadgeDefinition {
   id: BadgeId;
@@ -28,6 +31,9 @@ export const BADGES: Readonly<Record<BadgeId, BadgeDefinition>> = Object.freeze(
   first_day:     { id: 'first_day',     label: '🎉 First Day',       description: 'Onboarded successfully' },
   memory_keeper: { id: 'memory_keeper', label: '📸 Memory Keeper',   description: 'Saved 5 snapshots' },
   hat_trick:     { id: 'hat_trick',     label: '🏆 Hat Trick',       description: '3 different activities in an hour' },
+  mile_high:     { id: 'mile_high',     label: '🗺️ Mile High',        description: 'Ran 1 mile (1.609 km) total on the wheel' },
+  marathon_club: { id: 'marathon_club', label: '🏅 Marathon Club',   description: 'Ran a marathon (42.195 km) total on the wheel' },
+  ultra:         { id: 'ultra',         label: '⚡ Ultra',            description: 'Ran 100 miles total on the wheel' },
 });
 
 const MARATHON_MS = 60 * 60 * 1000;       // 1 hour wheel time
@@ -37,6 +43,10 @@ const EARLY_BIRD_HOUR = 6;                // active <  06:00
 const MEMORY_KEEPER_SNAPSHOTS = 5;        // 5 saved snapshots
 const HAT_TRICK_WINDOW_MS = 60 * 60 * 1000; // 3 distinct activities within 1h
 const HAT_TRICK_DISTINCT = 3;
+// Cumulative wheel-odometer thresholds (metres).
+const MILE_HIGH_METRES = 1609.34;         // 1 mile
+const MARATHON_CLUB_METRES = 42195;       // 42.195 km (marathon)
+const ULTRA_METRES = 160934;              // 100 miles
 
 export interface BadgeEvaluationOptions {
   /** Override "now" — primarily for tests; defaults to Date.now(). */
@@ -92,6 +102,12 @@ export async function evaluateBadges(
 
   // hat_trick — 3 distinct activities within any 1-hour window today.
   if (hasHatTrick(entries)) tryEarn('hat_trick', now);
+
+  // Wheel odometer distance badges — evaluated across all time, not just today.
+  const totalMetres = db.sumAllWheelMeters();
+  if (totalMetres >= MILE_HIGH_METRES) tryEarn('mile_high', now);
+  if (totalMetres >= MARATHON_CLUB_METRES) tryEarn('marathon_club', now);
+  if (totalMetres >= ULTRA_METRES) tryEarn('ultra', now);
 
   return earned;
 }

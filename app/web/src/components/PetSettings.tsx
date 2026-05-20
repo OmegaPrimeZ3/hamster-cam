@@ -8,6 +8,9 @@ import { PALETTES, PaletteName, ThemeModeSetting } from '../theme';
 import { useAuth } from '../hooks/useAuth';
 import { ChangePasswordForm } from './ChangePasswordForm';
 import { writeCachedBrand } from './Login';
+import { useTTSEnabled } from '../hooks/useTTSEnabled';
+import { isTTSAvailable } from '../lib/tts';
+import { getDistanceUnit, type DistanceUnit } from '../lib/trpc-extensions';
 
 const PET_EMOJIS = ['🐹', '🐰', '🐶', '🐱', '🐦', '🦔', '🦎', '🐠', '🐢', '🐍', '🐾'];
 
@@ -21,6 +24,9 @@ export function PetSettings(): JSX.Element {
       writeCachedBrand({ petName: next.pet_name, petEmoji: next.pet_emoji });
     },
   });
+
+  const { ttsEnabled, setTTSEnabled } = useTTSEnabled();
+  const ttsSupported = isTTSAvailable();
 
   const [name, setName] = useState('');
   const [restartConfirm, setRestartConfirm] = useState(false);
@@ -131,11 +137,48 @@ export function PetSettings(): JSX.Element {
         </div>
       </Field>
 
+      {/* Distance unit picker — bound to settings.distance_unit.
+          Gracefully defaults to 'mi' while the backend adds the field. */}
+      <Field label="Distance unit">
+        <div role="radiogroup" aria-label="Distance unit" style={{ display: 'flex', gap: 8 }}>
+          {(['mi', 'km'] as DistanceUnit[]).map((u) => {
+            const current = getDistanceUnit(s as Record<string, unknown>);
+            return (
+              <button
+                key={u}
+                type="button"
+                role="radio"
+                aria-checked={current === u}
+                onClick={() =>
+                  (update.mutate as (input: unknown) => void)({ distance_unit: u })
+                }
+                className="hc-btn"
+                style={{
+                  background: current === u ? 'var(--accent)' : 'var(--surface)',
+                  color: current === u ? 'var(--accent-text)' : 'var(--text)',
+                  minWidth: 80,
+                }}
+              >
+                {u === 'mi' ? 'Miles' : 'Kilometers'}
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+
       <Toggle
         label="Read aloud new diary entries"
         checked={s.read_aloud}
         onChange={(v) => update.mutate({ read_aloud: v })}
       />
+
+      {ttsSupported && (
+        <Toggle
+          label="Read diary aloud (per-card button)"
+          checked={ttsEnabled}
+          onChange={setTTSEnabled}
+        />
+      )}
 
       <Toggle
         label="Auto-rotate cameras every 10s"

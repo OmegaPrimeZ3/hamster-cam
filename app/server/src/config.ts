@@ -35,6 +35,9 @@ const envSchema = z.object({
   MQTT_USERNAME: z.string().optional(),
   MQTT_PASSWORD: z.string().optional(),
   FRIGATE_URL: z.string().url().optional(),
+  // Gemini recap job — both optional; job skips cleanly if key is unset.
+  GEMINI_API_KEY: z.string().optional(),
+  GEMINI_MODEL: z.string().optional().default('gemini-2.0-flash'),
   NODE_ENV: z
     .enum(['development', 'production', 'test'])
     .optional()

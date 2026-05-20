@@ -17,10 +17,11 @@
 //   5. Close DB
 
 import { fileURLToPath } from 'node:url';
-import { access } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { access, stat } from 'node:fs/promises';
+import { constants as fsConstants, createReadStream } from 'node:fs';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
+import { extname, resolve as pathResolve, sep as pathSep } from 'node:path';
 
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
@@ -38,11 +39,14 @@ import {
 import { getConfig } from './config.js';
 import { getDb, purgeExpiredSessions } from './db.js';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
+import { runRecapJob } from './jobs/recap.js';
 import { runRetentionJob } from './jobs/retention.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
 import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
+import { initVapidKeys } from './push.js';
+import { resolveSession } from './session.js';
 import { appRouter, createContext } from './trpc.js';
 
 const execFile = promisify(execFileCb);
@@ -71,6 +75,7 @@ export async function buildServer(): Promise<AppServer> {
   getDb(cfg.DATABASE_PATH);
   purgeExpiredSessions();
   refreshNarratorTunings();
+  initVapidKeys();
 
   const app = buildFastify();
 
@@ -94,6 +99,14 @@ export async function buildServer(): Promise<AppServer> {
   app.get('/auth/me', me);
   app.post('/auth/password/forgot', forgotPassword);
   app.post('/auth/password/reset', resetPassword);
+
+  // Private media: snapshot thumbnails written by `activity.snapshot` land at
+  // `STORAGE_PATH/snapshots/<cam>-<ts>.jpg`. The diary entry stores a relative
+  // path (`snapshots/...`) and the Vite proxy + Caddyfile both forward
+  // `/snapshots/*` here — without this route, every "📸 You saved a memory"
+  // card renders a broken-image placeholder. Gated on `requireAuth` because
+  // these are household-private pet photos.
+  registerPrivateMedia(app, 'snapshots', new Set(['.jpg', '.jpeg', '.png', '.webp']));
 
   // REST: /health is reachable on the LAN for docker healthchecks; Caddy
   // returns 404 to external requests via an internal-IP allowlist (see the
@@ -137,6 +150,63 @@ export async function buildServer(): Promise<AppServer> {
   return app;
 }
 
+// Stream `STORAGE_PATH/<subdir>/<file>` for any `GET /<subdir>/*` after a
+// session check. Rejects path traversal both by string-matching `..` and by
+// re-resolving the joined path and confirming it still lives under the base
+// directory. Extension allowlist keeps the route from doubling as an arbitrary
+// file server.
+function registerPrivateMedia(
+  app: AppServer,
+  subdir: 'snapshots',
+  allowedExts: ReadonlySet<string>,
+): void {
+  const cfg = getConfig();
+  const baseDir = pathResolve(cfg.STORAGE_PATH, subdir);
+
+  const CONTENT_TYPES: Record<string, string> = {
+    '.jpg':  'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png':  'image/png',
+    '.webp': 'image/webp',
+  };
+
+  app.get(`/${subdir}/*`, async (req, reply) => {
+    // Inline auth check (matches the pattern in auth.ts) — keeps the route
+    // off the `preHandler` typing path that Fastify 5 / strict TS rejects.
+    if (!resolveSession(req)) {
+      return reply.code(401).send({ error: 'unauthenticated' });
+    }
+    const params = req.params as { '*'?: string };
+    const rel = params['*'] ?? '';
+    if (!rel || rel.includes('..') || rel.includes('\0') || rel.startsWith('/')) {
+      return reply.code(400).send({ error: 'bad path' });
+    }
+    const ext = extname(rel).toLowerCase();
+    if (!allowedExts.has(ext)) {
+      return reply.code(404).send({ error: 'not found' });
+    }
+    const abs = pathResolve(baseDir, rel);
+    if (abs !== baseDir && !abs.startsWith(baseDir + pathSep)) {
+      return reply.code(400).send({ error: 'bad path' });
+    }
+    let st;
+    try {
+      st = await stat(abs);
+    } catch {
+      return reply.code(404).send({ error: 'not found' });
+    }
+    if (!st.isFile() || st.size === 0) {
+      // Zero-byte placeholders are written when Frigate was unreachable at
+      // capture time; treat them as missing so the client renders the empty
+      // tile instead of a broken-image glyph.
+      return reply.code(404).send({ error: 'not found' });
+    }
+    reply.header('Cache-Control', 'private, max-age=604800, immutable');
+    reply.type(CONTENT_TYPES[ext] ?? 'application/octet-stream');
+    return reply.send(createReadStream(abs));
+  });
+}
+
 interface RuntimeHandles {
   app: AppServer;
   mqtt: MqttSubscriber;
@@ -166,6 +236,7 @@ export async function startRuntime(): Promise<RuntimeHandles> {
 function scheduleCronJobs(app: AppServer): ScheduledTask[] {
   const jobs: Array<{ name: string; spec: string; run: () => Promise<unknown> }> = [
     { name: 'timelapse',  spec: '55 23 * * *', run: () => runTimelapseJob() },
+    { name: 'recap',      spec: '58 23 * * *', run: () => runRecapJob() },
     { name: 'retention',  spec: '0 2 * * *',  run: () => runRetentionJob() },
     { name: 'disk-watch', spec: '0 3 * * *',  run: () => runDiskWatchJob() },
   ];

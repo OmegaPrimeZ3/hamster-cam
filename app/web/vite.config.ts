@@ -40,6 +40,9 @@ export default defineConfig({
         ],
         // Don't try to precache the dynamically-served manifest — backend owns it.
         globIgnores: ['**/manifest.json', '**/manifest.webmanifest'],
+        // Inject push + notificationclick handlers via a hand-rolled companion
+        // script. importScripts executes in the SW scope at install time.
+        importScripts: ['/sw-push.js'],
         // App shell SPA fallback so the PWA boots offline on any deep link.
         navigateFallback: '/index.html',
         // ALWAYS bypass the SW for these — they must hit the live backend.

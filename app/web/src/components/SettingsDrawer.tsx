@@ -1,6 +1,6 @@
 // app/web/src/components/SettingsDrawer.tsx
 //
-// Admin-only drawer with five tabs. The gear icon in Header only renders for
+// Admin-only drawer with six tabs. The gear icon in Header only renders for
 // admins, but we also bail at render-time if `useAuth().isAdmin` is false —
 // double-checked defense.
 
@@ -13,6 +13,7 @@ import { CameraSettings } from './CameraSettings';
 import { UserSettings } from './UserSettings';
 import { AuditSettings } from './AuditSettings';
 import { ShareSettings } from './ShareSettings';
+import { NotificationSettings } from './NotificationSettings';
 
 export interface SettingsDrawerProps {
   open: boolean;
@@ -20,7 +21,7 @@ export interface SettingsDrawerProps {
   initialTab?: SettingsTabId;
 }
 
-export type SettingsTabId = 'pet' | 'cameras' | 'users' | 'audit' | 'sharing';
+export type SettingsTabId = 'pet' | 'cameras' | 'users' | 'audit' | 'sharing' | 'notifications';
 
 const TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: 'pet', label: 'Pet' },
@@ -28,6 +29,7 @@ const TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: 'users', label: 'Users' },
   { id: 'audit', label: 'Audit' },
   { id: 'sharing', label: 'Sharing' },
+  { id: 'notifications', label: 'Notifications' },
 ];
 
 export function SettingsDrawer({ open, onOpenChange, initialTab = 'pet' }: SettingsDrawerProps): JSX.Element | null {
@@ -103,6 +105,7 @@ export function SettingsDrawer({ open, onOpenChange, initialTab = 'pet' }: Setti
                     fontWeight: 500,
                     cursor: 'pointer',
                     minHeight: 40,
+                    whiteSpace: 'nowrap',
                   }}
                   className="hc-tab-trigger"
                 >
@@ -117,6 +120,7 @@ export function SettingsDrawer({ open, onOpenChange, initialTab = 'pet' }: Setti
               <Tabs.Content value="users"><UserSettings /></Tabs.Content>
               <Tabs.Content value="audit"><AuditSettings /></Tabs.Content>
               <Tabs.Content value="sharing"><ShareSettings /></Tabs.Content>
+              <Tabs.Content value="notifications"><NotificationSettings /></Tabs.Content>
             </div>
           </Tabs.Root>
         </Dialog.Content>

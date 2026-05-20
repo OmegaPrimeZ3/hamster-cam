@@ -1,6 +1,7 @@
 // app/web/test/DiaryEntry.test.tsx
 //
 // Renders the three variants and verifies the right DOM lands for each.
+// Also covers the TTS button visibility and the recap activity variant.
 
 import { describe, expect, it } from 'vitest';
 import { screen } from '@testing-library/react';
@@ -24,6 +25,8 @@ function makeEntry(overrides: Partial<Entry>): Entry {
     duration_ms: 8 * 60 * 1000,
     snapshot_id: null,
     media_path: null,
+    ai_model: null,
+    details: null,
     ...overrides,
   };
 }
@@ -62,5 +65,34 @@ describe('DiaryEntry', () => {
     expect(video).not.toBeNull();
     expect(video?.getAttribute('playsinline') ?? video?.getAttribute('playsInline')).not.toBeNull();
     expect(video?.getAttribute('preload')).toBe('metadata');
+  });
+
+  it('shows the Read aloud button when ttsEnabled is true and TTS is available', () => {
+    const entry = makeEntry({ kind: 'narrative' });
+    renderWithProviders(<DiaryEntry entry={entry} ttsEnabled={true} />);
+    // setup.ts stubs speechSynthesis so isTTSAvailable() returns true in tests.
+    expect(screen.getByRole('button', { name: /read aloud/i })).toBeInTheDocument();
+  });
+
+  it('hides the Read aloud button when ttsEnabled is false', () => {
+    const entry = makeEntry({ kind: 'narrative' });
+    renderWithProviders(<DiaryEntry entry={entry} ttsEnabled={false} />);
+    expect(screen.queryByRole('button', { name: /read aloud/i })).toBeNull();
+  });
+
+  it('recap activity variant renders narrative in larger type (data-activity=recap)', () => {
+    const entry = makeEntry({
+      activity: 'recap',
+      narrative: '📖 Here is your hamster recap for today!',
+    });
+    const { container } = renderWithProviders(
+      <DiaryEntry entry={entry} now={entry.occurred_at + 60_000} />,
+    );
+    const article = container.querySelector('[data-activity="recap"]');
+    expect(article).not.toBeNull();
+    const p = article?.querySelector('p');
+    expect(p).not.toBeNull();
+    // 18px for recap, per spec.
+    expect(p?.style.fontSize).toBe('18px');
   });
 });

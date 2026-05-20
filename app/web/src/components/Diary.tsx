@@ -1,22 +1,54 @@
 // app/web/src/components/Diary.tsx
 //
-// Scrolling list of DiaryEntry. Loads `activity.today`, sorts newest-first.
+// Scrolling list of DiaryEntry. Loads `activity.today`, sorts newest-first
+// with recap cards pinned to the top of the day, then timelapse, then all
+// other entries by time descending.
+//
 // Optionally reads new entries aloud via Web Speech API when the user has
 // turned on `read_aloud` in settings.
 
 import { useEffect, useRef } from 'react';
 import { trpc } from '../trpc';
+import type { RouterOutputs } from '../trpc';
 import { DiaryEntry } from './DiaryEntry';
+import { useTTSEnabled } from '../hooks/useTTSEnabled';
+import { getDistanceUnit } from '../lib/trpc-extensions';
 
 export interface DiaryProps {
   readAloud: boolean;
   petName: string;
 }
 
+type Entry = RouterOutputs['activity']['today'][number];
+
+// Sort order weight for pinning special entry types to the top of the day.
+// Lower number = closer to top.
+function sortWeight(entry: Entry): number {
+  if (entry.activity === 'recap' || entry.kind === 'recap') return 0;
+  if (entry.kind === 'timelapse' || entry.activity === 'timelapse') return 1;
+  return 2;
+}
+
+function sortEntries(entries: Entry[]): Entry[] {
+  return entries.slice().sort((a, b) => {
+    const wa = sortWeight(a);
+    const wb = sortWeight(b);
+    // First by weight (recap → timelapse → everything else).
+    if (wa !== wb) return wa - wb;
+    // Then by time descending (newest first) within each group.
+    return b.occurred_at - a.occurred_at;
+  });
+}
+
 export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
+  const { ttsEnabled } = useTTSEnabled();
   const today = trpc.activity.today.useQuery(undefined, {
     refetchInterval: 30_000,
   });
+  const settings = trpc.settings.get.useQuery();
+  const distanceUnit = getDistanceUnit(
+    settings.data as Record<string, unknown> | undefined,
+  );
   const seenIdsRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
@@ -64,12 +96,14 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
       )}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {(today.data ?? [])
-          .slice()
-          .sort((a, b) => b.occurred_at - a.occurred_at)
-          .map((entry) => (
-            <DiaryEntry key={entry.id} entry={entry} />
-          ))}
+        {sortEntries(today.data ?? []).map((entry) => (
+          <DiaryEntry
+            key={entry.id}
+            entry={entry}
+            ttsEnabled={ttsEnabled}
+            distanceUnit={distanceUnit}
+          />
+        ))}
       </div>
     </section>
   );

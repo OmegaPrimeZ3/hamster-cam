@@ -5,25 +5,37 @@
 //   - snapshot:   same as narrative but tap expands to fullscreen snapshot
 //   - timelapse:  large 16:9 card with inline <video playsinline preload="metadata">
 //
+// Additional variant: activity === 'recap' — text-only, larger type (18px),
+// distinct warm-gold accent. Sorted to top of the day in Diary.tsx.
+//
 // Whimsy pass: each card gets a deterministic micro-rotation (seeded by
 // entry.id so it doesn't dance on re-render), a 4px left stripe and a soft
 // emoji badge keyed to entry.activity, plus a near-invisible watercolour
 // tint layered over var(--surface). Hover lift via framer-motion; rotation
 // and lift are both gated on prefers-reduced-motion.
+//
+// TTS button: when isTTSAvailable() and ttsEnabled prop is true, shows a
+// Volume2 / Square icon button that speaks the narrative aloud.
 
 import { useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { Share2, Play } from 'lucide-react';
+import { Share2, Play, Volume2, Square } from 'lucide-react';
 import type { RouterOutputs } from '../trpc';
 import { relativeTime, formatDuration } from '../lib/time';
 import { activityStyle } from '../lib/activity-style';
 import { ShareDialog } from './ShareDialog';
+import { isTTSAvailable, speak } from '../lib/tts';
+import { parseWheelMeters } from '../lib/trpc-extensions';
+import { formatMeters } from '../lib/distance';
 
 type Entry = RouterOutputs['activity']['today'][number];
 
 export interface DiaryEntryProps {
   entry: Entry;
   now?: number;
+  ttsEnabled?: boolean;
+  /** From settings.distance_unit — defaults to 'mi' until the backend ships. */
+  distanceUnit?: 'mi' | 'km';
 }
 
 // Stable ±1deg jitter from entry.id so the list looks hand-pinned but never
@@ -35,20 +47,46 @@ function rotationForId(id: number): number {
   return frac * 2 - 1; // [-1, 1] degrees
 }
 
-export function DiaryEntry({ entry, now }: DiaryEntryProps): JSX.Element {
+export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' }: DiaryEntryProps): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
   const reduced = useReducedMotion();
 
   const relative = relativeTime(entry.occurred_at, now);
   const duration = entry.duration_ms != null ? formatDuration(entry.duration_ms) : null;
   const style = activityStyle(entry.activity ?? null);
   const rotation = reduced ? 0 : rotationForId(entry.id);
+  const isRecap = entry.activity === 'recap';
+
+  // Wheel distance suffix — parsed defensively from entry.details (JSON string).
+  // Only shown for wheel entries where wheel_meters is a positive number.
+  const wheelMeters =
+    entry.activity === 'wheel'
+      ? parseWheelMeters(entry as Entry & { details?: string | null })
+      : null;
+  const distanceSuffix =
+    wheelMeters !== null ? ` · ${formatMeters(wheelMeters, distanceUnit)}` : null;
+
+  const showTTS = ttsEnabled && isTTSAvailable();
+
+  function handleTTS(): void {
+    if (speaking) {
+      window.speechSynthesis.cancel();
+      setSpeaking(false);
+      return;
+    }
+    setSpeaking(true);
+    speak(entry.narrative, {
+      onEnd: () => setSpeaking(false),
+    });
+  }
 
   return (
     <motion.article
       className="hc-card"
       data-kind={entry.kind}
+      data-activity={entry.activity ?? undefined}
       initial={false}
       animate={{ rotate: rotation }}
       whileHover={reduced ? undefined : { y: -2 }}
@@ -60,13 +98,10 @@ export function DiaryEntry({ entry, now }: DiaryEntryProps): JSX.Element {
         flexDirection: entry.kind === 'timelapse' ? 'column' : 'row',
         gap: 12,
         alignItems: entry.kind === 'timelapse' ? 'stretch' : 'flex-start',
-        // Stripe + watercolour wash layered atop var(--surface).
-        // box-shadow inset draws the stripe inside the 20px radius cleanly.
         borderRadius: 20,
-        // Stack: tint gradient → base surface. Keeps theme tokens flowing.
         backgroundImage: `linear-gradient(${style.bgTint}, ${style.bgTint})`,
         boxShadow: `inset 4px 0 0 0 ${style.accent}, 0 6px 16px rgba(0, 0, 0, 0.06)`,
-        paddingLeft: 20, // make room for the inset stripe so content doesn't crowd it
+        paddingLeft: 20,
       }}
     >
       {/* Activity badge — top-right, soft circle in the accent at low alpha. */}
@@ -85,7 +120,6 @@ export function DiaryEntry({ entry, now }: DiaryEntryProps): JSX.Element {
           fontSize: 18,
           lineHeight: 1,
           background: `color-mix(in srgb, ${style.accent} 18%, transparent)`,
-          // Subtle ring picks the badge out without shouting.
           boxShadow: `inset 0 0 0 1px color-mix(in srgb, ${style.accent} 35%, transparent)`,
           pointerEvents: 'none',
         }}
@@ -108,11 +142,18 @@ export function DiaryEntry({ entry, now }: DiaryEntryProps): JSX.Element {
           flexDirection: 'column',
           gap: 6,
           minWidth: 0,
-          // Pad the right edge so long narrative text never slips under the badge.
           paddingRight: 40,
         }}
       >
-        <p style={{ margin: 0, fontSize: 16, lineHeight: 1.4, wordBreak: 'break-word' }}>
+        <p
+          style={{
+            margin: 0,
+            fontSize: isRecap ? 18 : 16,
+            lineHeight: 1.4,
+            wordBreak: 'break-word',
+            fontWeight: isRecap ? 600 : 400,
+          }}
+        >
           {entry.narrative}
         </p>
         {/* Dashed "notebook line" separator above the timestamp / share row. */}
@@ -135,6 +176,7 @@ export function DiaryEntry({ entry, now }: DiaryEntryProps): JSX.Element {
           >
             {relative}
             {duration ? ` · ${duration}` : ''}
+            {distanceSuffix}
           </small>
           <div style={{ display: 'flex', gap: 8 }}>
             <button
@@ -146,6 +188,32 @@ export function DiaryEntry({ entry, now }: DiaryEntryProps): JSX.Element {
               <Share2 aria-hidden size={16} />
               Send a clip
             </button>
+            {showTTS && (
+              <button
+                type="button"
+                className="hc-btn"
+                onClick={handleTTS}
+                aria-label={speaking ? 'Stop reading' : 'Read aloud'}
+                style={{
+                  background: speaking
+                    ? `color-mix(in srgb, ${style.accent} 20%, var(--surface))`
+                    : undefined,
+                  borderColor: speaking ? style.accent : undefined,
+                }}
+              >
+                {speaking ? (
+                  <>
+                    <Square aria-hidden size={16} />
+                    Stop
+                  </>
+                ) : (
+                  <>
+                    <Volume2 aria-hidden size={16} />
+                    Read aloud
+                  </>
+                )}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -175,7 +243,13 @@ function SnapshotBody({
   expanded: boolean;
   onToggle: () => void;
 }): JSX.Element {
-  if (!entry.media_path) {
+  // The diary entry always carries a media_path (the snapshot mutation writes
+  // a placeholder file even when Frigate is unreachable), so the 404 /
+  // empty-body case only surfaces at <img> load time. Swap to the colored
+  // placeholder on error so the user never sees the broken-image glyph.
+  const [failed, setFailed] = useState(false);
+  const src = entry.media_path;
+  if (!src || failed) {
     return (
       <div
         style={{
@@ -204,8 +278,9 @@ function SnapshotBody({
       }}
     >
       <img
-        src={entry.media_path}
+        src={src}
         alt={entry.narrative}
+        onError={() => setFailed(true)}
         style={{
           width: expanded ? 'min(100%, 360px)' : 120,
           height: expanded ? 'auto' : 80,

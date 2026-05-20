@@ -22,6 +22,11 @@ import { z } from 'zod';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRetentionJob } from './jobs/retention.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
+import {
+  getVapidPublicKey,
+  sendPushToUser,
+} from './push.js';
+import { testWheelDetection } from './wheel-odometer.js';
 
 import * as db from './db.js';
 import { resolveSession } from './session.js';
@@ -233,13 +238,23 @@ const cameraSchema = z.object({
   zones: z.array(z.string()),
   /** ms since epoch of Frigate's most recent frame; null = unknown. */
   last_frame_at: z.number().int().nullable(),
+  /** Wheel odometer — whether optical mark detection is active. */
+  wheel_mark_enabled: z.boolean(),
+  /** Physical wheel diameter in millimetres. */
+  wheel_diameter_mm: z.number(),
+  /** Centre of the sampling band as % of frame height (0–100). */
+  wheel_band_y_pct: z.number(),
+  /** Sampling band height as % of frame height (0–100). */
+  wheel_band_height_pct: z.number(),
+  /** Dark-pixel intensity cutoff as % (0–100). */
+  wheel_threshold_pct: z.number(),
 });
 export type CameraDTO = z.infer<typeof cameraSchema>;
 
-const diaryKindSchema = z.enum(['narrative', 'snapshot', 'timelapse']);
+const diaryKindSchema = z.enum(['narrative', 'snapshot', 'timelapse', 'recap']);
 const diaryActivitySchema = z.enum([
   'wheel', 'food', 'water', 'bathroom', 'resting', 'tunnel', 'exploring', 'hiding',
-  'transition', 'snapshot', 'timelapse',
+  'transition', 'snapshot', 'timelapse', 'recap',
 ]);
 
 const diaryEntrySchema = z.object({
@@ -255,6 +270,8 @@ const diaryEntrySchema = z.object({
   duration_ms: z.number().int().nullable(),
   snapshot_id: z.number().int().nullable(),
   media_path: z.string().nullable(),
+  ai_model: z.string().nullable(),
+  details: z.string().nullable(),
 });
 export type DiaryEntryDTO = z.infer<typeof diaryEntrySchema>;
 
@@ -310,6 +327,11 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
     created_at: row.created_at,
     zones: row.zones,
     last_frame_at: lastFrameAt,
+    wheel_mark_enabled: row.wheel_mark_enabled === 1,
+    wheel_diameter_mm: row.wheel_diameter_mm,
+    wheel_band_y_pct: row.wheel_band_y_pct,
+    wheel_band_height_pct: row.wheel_band_height_pct,
+    wheel_threshold_pct: row.wheel_threshold_pct,
   };
 }
 
@@ -327,6 +349,8 @@ function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
     duration_ms: row.duration_ms,
     snapshot_id: row.snapshot_id,
     media_path: row.media_path,
+    ai_model: row.ai_model ?? null,
+    details: row.details ?? null,
   };
 }
 
@@ -350,6 +374,8 @@ const settingsSchema = z.object({
   transition_window_ms: z.number().int().nonnegative(),
   min_dwell_ms: z.number().int().nonnegative(),
   share_rate_limit_per_hour: z.number().int().nonnegative(),
+  /** Distance unit for wheel odometer display. */
+  distance_unit: z.enum(['mi', 'km']),
 });
 export type SettingsDTO = z.infer<typeof settingsSchema>;
 
@@ -369,6 +395,7 @@ function parseSettingsKV(kv: db.SettingsKV): SettingsDTO {
     return raw === 'true' || raw === '1';
   };
   const mode = get('theme_mode', 'auto');
+  const rawDistUnit = get('distance_unit', 'mi');
   return {
     pet_name: get('pet_name', ''),
     pet_emoji: get('pet_emoji', '🐾'),
@@ -385,6 +412,7 @@ function parseSettingsKV(kv: db.SettingsKV): SettingsDTO {
     transition_window_ms: num('transition_window_ms', 8000),
     min_dwell_ms: num('min_dwell_ms', 2000),
     share_rate_limit_per_hour: num('share_rate_limit_per_hour', 10),
+    distance_unit: rawDistUnit === 'km' ? 'km' : 'mi',
   };
 }
 
@@ -521,12 +549,30 @@ const camerasRouter = router({
       stream_url: z.string().min(1),
       enabled: z.boolean(),
       zones: z.array(z.string()).default([]),
+      // Wheel odometer — optional; existing values are preserved when omitted.
+      wheel_mark_enabled: z.boolean().optional(),
+      wheel_diameter_mm: z.number().positive().optional(),
+      wheel_band_y_pct: z.number().min(0).max(100).optional(),
+      wheel_band_height_pct: z.number().min(0.1).max(100).optional(),
+      wheel_threshold_pct: z.number().min(0).max(100).optional(),
     }))
     .output(cameraSchema)
     .mutation(({ ctx, input }) => {
       const before = db.getCameraById(input.id);
       if (before) ctx.audit['before'] = cameraToDTO(before, null);
-      const row = db.updateCamera(input);
+      const row = db.updateCamera({
+        id: input.id,
+        name: input.name,
+        emoji: input.emoji,
+        stream_url: input.stream_url,
+        enabled: input.enabled,
+        zones: input.zones,
+        ...(input.wheel_mark_enabled !== undefined && { wheel_mark_enabled: input.wheel_mark_enabled }),
+        ...(input.wheel_diameter_mm !== undefined && { wheel_diameter_mm: input.wheel_diameter_mm }),
+        ...(input.wheel_band_y_pct !== undefined && { wheel_band_y_pct: input.wheel_band_y_pct }),
+        ...(input.wheel_band_height_pct !== undefined && { wheel_band_height_pct: input.wheel_band_height_pct }),
+        ...(input.wheel_threshold_pct !== undefined && { wheel_threshold_pct: input.wheel_threshold_pct }),
+      });
       if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'camera not found' });
       return cameraToDTO(row, null);
     }),
@@ -592,6 +638,29 @@ const camerasRouter = router({
     .input(z.object({ stream_url: z.string().min(1) }))
     .output(z.object({ ok: z.boolean(), status: z.number().int().nullable() }))
     .mutation(({ input }) => frigate.testStream(input.stream_url)),
+
+  /**
+   * Grab one frame from the camera RTSP stream, crop to the configured band,
+   * and return a base64 PNG of the cropped band plus the computed dark-pixel
+   * ratio. Used by Settings → Cameras → Wheel Odometer to tune the band/threshold
+   * visually before enabling the feature. Read-only — no state changes.
+   */
+  testWheelDetection: adminProcedure
+    .meta({ audit: false })
+    .input(z.object({ cameraId: z.number().int() }))
+    .output(z.object({
+      croppedPngBase64: z.string(),
+      darkPixelRatio: z.number(),
+      thresholdPct: z.number(),
+      error: z.string().nullable(),
+    }))
+    .mutation(async ({ input }) => {
+      const result = await testWheelDetection(input.cameraId);
+      if ('error' in result) {
+        return { croppedPngBase64: '', darkPixelRatio: 0, thresholdPct: 0, error: result.error };
+      }
+      return { ...result, error: null };
+    }),
 });
 
 // ---------------------------------------------------------------------------
@@ -606,6 +675,16 @@ const activityRouter = router({
       const start = startOfLocalDay(new Date());
       const end = start + 24 * 60 * 60 * 1000;
       return db.listDiaryEntriesBetween(start, end).map(diaryToDTO);
+    }),
+
+  range: protectedProcedure
+    .input(z.object({
+      from: z.number().int().nonnegative(),
+      to: z.number().int().positive(),
+    }))
+    .output(z.array(diaryEntrySchema))
+    .query(({ input }) => {
+      return db.listDiaryEntriesBetween(input.from, input.to).map(diaryToDTO);
     }),
 
   // Manual "Take a photo!" from the maximized view. Returns the diary entry
@@ -1147,6 +1226,116 @@ const adminRouter = router({
 });
 
 // ---------------------------------------------------------------------------
+// notifications.*
+// ---------------------------------------------------------------------------
+
+// Activities the user can subscribe to for push notifications — matches the
+// set a narrator entry can have (excludes timelapse/recap/transition/snapshot
+// which are never surfaced as push triggers).
+const pushActivitySchema = z.enum([
+  'wheel', 'food', 'water', 'bathroom', 'resting', 'tunnel', 'exploring', 'hiding',
+]);
+
+const notifPrefsSchema = z.object({
+  enabled: z.boolean(),
+  activities: z.array(pushActivitySchema),
+  quiet_start_minute: z.number().int().min(0).max(1439),
+  quiet_end_minute: z.number().int().min(0).max(1439),
+  rare_only: z.boolean(),
+});
+
+function notifPrefsToDTO(row: db.NotificationPreferencesRow) {
+  let activities: string[];
+  try {
+    const parsed = JSON.parse(row.activities) as unknown;
+    activities = Array.isArray(parsed)
+      ? parsed.filter((a): a is string => typeof a === 'string')
+      : [];
+  } catch {
+    activities = [];
+  }
+  return {
+    enabled: row.enabled === 1,
+    activities: activities as z.infer<typeof pushActivitySchema>[],
+    quiet_start_minute: row.quiet_start_minute,
+    quiet_end_minute: row.quiet_end_minute,
+    rare_only: row.rare_only === 1,
+  };
+}
+
+const notifPreferencesRouter = router({
+  get: protectedProcedure
+    .input(z.void())
+    .output(notifPrefsSchema)
+    .query(({ ctx }) => notifPrefsToDTO(db.getNotificationPreferences(ctx.user.id))),
+
+  set: protectedProcedure
+    .input(notifPrefsSchema)
+    .output(notifPrefsSchema)
+    .mutation(({ ctx, input }) => {
+      const row = db.upsertNotificationPreferences({
+        user_id: ctx.user.id,
+        enabled: input.enabled ? 1 : 0,
+        activities: JSON.stringify(input.activities),
+        quiet_start_minute: input.quiet_start_minute,
+        quiet_end_minute: input.quiet_end_minute,
+        rare_only: input.rare_only ? 1 : 0,
+      });
+      return notifPrefsToDTO(row);
+    }),
+});
+
+const notificationsRouter = router({
+  publicKey: protectedProcedure
+    .input(z.void())
+    .output(z.object({ vapidPublicKey: z.string().nullable() }))
+    .query(() => ({ vapidPublicKey: getVapidPublicKey() })),
+
+  subscribe: protectedProcedure
+    .input(z.object({
+      endpoint: z.string().url(),
+      p256dh: z.string().min(1),
+      auth: z.string().min(1),
+      userAgent: z.string().optional(),
+    }))
+    .output(z.object({ id: z.number().int() }))
+    .mutation(({ ctx, input }) => {
+      const row = db.upsertPushSubscription({
+        user_id: ctx.user.id,
+        endpoint: input.endpoint,
+        p256dh: input.p256dh,
+        auth: input.auth,
+        user_agent: input.userAgent ?? null,
+      });
+      return { id: row.id };
+    }),
+
+  unsubscribe: protectedProcedure
+    .input(z.object({ endpoint: z.string().url() }))
+    .output(z.object({ removed: z.number().int() }))
+    .mutation(({ ctx, input }) => {
+      const removed = db.deletePushSubscription(input.endpoint, ctx.user.id);
+      return { removed };
+    }),
+
+  preferences: notifPreferencesRouter,
+
+  test: protectedProcedure
+    .input(z.void())
+    .output(z.object({ ok: z.literal(true) }))
+    .mutation(async ({ ctx }) => {
+      const petName = db.getSetting('pet_name') ?? 'Remy';
+      await sendPushToUser(ctx.user.id, {
+        title: `${petName} says hi!`,
+        body: 'Test push from Remy 🐹',
+        url: '/',
+        tag: 'test',
+      });
+      return { ok: true } as const;
+    }),
+});
+
+// ---------------------------------------------------------------------------
 // App router — frozen surface
 // ---------------------------------------------------------------------------
 
@@ -1161,6 +1350,7 @@ export const appRouter = router({
   recipients: recipientsRouter,
   share: shareRouter,
   admin: adminRouter,
+  notifications: notificationsRouter,
 });
 
 export type AppRouter = typeof appRouter;

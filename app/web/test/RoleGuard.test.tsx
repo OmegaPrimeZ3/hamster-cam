@@ -39,6 +39,7 @@ beforeEach(() => {
     transition_window_ms: 8000,
     min_dwell_ms: 2000,
     share_rate_limit_per_hour: 10,
+    distance_unit: 'mi' as const,
   }));
   mockQuery('cameras.list', () => []);
 });

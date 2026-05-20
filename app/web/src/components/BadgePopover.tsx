@@ -18,6 +18,10 @@ const BADGE_META: Record<string, { emoji: string; label: string }> = {
   first_day: { emoji: '🎉', label: 'First Day' },
   memory_keeper: { emoji: '📸', label: 'Memory Keeper' },
   hat_trick: { emoji: '🏆', label: 'Hat Trick' },
+  // Wheel odometer milestones
+  mile_high: { emoji: '⛰️', label: 'Mile High' },
+  marathon_club: { emoji: '🏅', label: 'Marathon Club' },
+  ultra: { emoji: '🌟', label: 'Ultra Runner' },
 };
 
 function metaFor(id: string): { emoji: string; label: string } {

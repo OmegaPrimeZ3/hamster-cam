@@ -48,18 +48,41 @@ if (typeof globalThis.requestAnimationFrame !== 'function') {
   (globalThis as unknown as { cancelAnimationFrame: (id: number) => void }).cancelAnimationFrame = (id) => clearTimeout(id);
 }
 
-// Stub speechSynthesis so Diary's read-aloud test doesn't blow up
-if (typeof window !== 'undefined' && !('speechSynthesis' in window)) {
-  Object.defineProperty(window, 'speechSynthesis', {
-    writable: true,
-    value: { speak: vi.fn(), cancel: vi.fn(), pause: vi.fn(), resume: vi.fn() },
-  });
-  (window as unknown as { SpeechSynthesisUtterance: new (text: string) => unknown }).SpeechSynthesisUtterance = class {
-    text: string;
-    rate = 1;
-    pitch = 1;
-    constructor(text: string) {
-      this.text = text;
-    }
+// Stub speechSynthesis so Diary's read-aloud and tts.ts tests don't blow up.
+// jsdom may or may not have a partial speechSynthesis — ensure our full stub
+// is present including getVoices() which tts.ts calls for voice selection.
+if (typeof window !== 'undefined') {
+  const synthStub = {
+    speak: vi.fn(),
+    cancel: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
+    getVoices: vi.fn(() => [] as SpeechSynthesisVoice[]),
   };
+  if (!('speechSynthesis' in window)) {
+    Object.defineProperty(window, 'speechSynthesis', {
+      configurable: true,
+      writable: true,
+      value: synthStub,
+    });
+  } else {
+    // Patch a missing getVoices onto an existing (possibly partial) stub.
+    const existing = window.speechSynthesis as unknown as Record<string, unknown>;
+    if (typeof existing['getVoices'] !== 'function') {
+      existing['getVoices'] = vi.fn(() => [] as SpeechSynthesisVoice[]);
+    }
+  }
+
+  // SpeechSynthesisUtterance stub — includes onend so tts.ts can set the callback.
+  if (!('SpeechSynthesisUtterance' in window)) {
+    (window as unknown as { SpeechSynthesisUtterance: new (text: string) => unknown }).SpeechSynthesisUtterance = class {
+      text: string;
+      rate = 1;
+      pitch = 1;
+      onend: ((ev: Event) => void) | null = null;
+      constructor(text: string) {
+        this.text = text;
+      }
+    };
+  }
 }

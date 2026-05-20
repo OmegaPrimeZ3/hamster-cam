@@ -21,6 +21,11 @@ function makeCamera(lastFrameAt: number | null): CameraDTO {
     enabled: true,
     created_at: 0,
     zones: [],
+    wheel_mark_enabled: false,
+    wheel_diameter_mm: 152,
+    wheel_band_y_pct: 50,
+    wheel_band_height_pct: 10,
+    wheel_threshold_pct: 50,
     last_frame_at: lastFrameAt,
   };
 }

@@ -56,6 +56,16 @@ export interface CameraRow {
   created_at: number;
   /** Operator-configured zone keywords for this camera (matches narrator vocabulary). */
   zones: string[];
+  /** Whether optical-mark wheel odometry is active for this camera. */
+  wheel_mark_enabled: 0 | 1;
+  /** Physical wheel diameter in millimetres — used to convert rotations → metres. */
+  wheel_diameter_mm: number;
+  /** Centre of the sampling band as a percentage of frame height (0–100). */
+  wheel_band_y_pct: number;
+  /** Sampling band height as a percentage of frame height (0–100). */
+  wheel_band_height_pct: number;
+  /** Pixels with mean intensity below `255 * (1 − threshold_pct/100)` are "dark" (0–100). */
+  wheel_threshold_pct: number;
 }
 
 export interface SnapshotRow {
@@ -65,7 +75,7 @@ export interface SnapshotRow {
   path: string;
 }
 
-export type DiaryKind = 'narrative' | 'snapshot' | 'timelapse';
+export type DiaryKind = 'narrative' | 'snapshot' | 'timelapse' | 'recap';
 export type DiaryActivity =
   | 'wheel'
   | 'food'
@@ -77,7 +87,8 @@ export type DiaryActivity =
   | 'hiding'
   | 'transition'
   | 'snapshot'
-  | 'timelapse';
+  | 'timelapse'
+  | 'recap';
 
 export interface DiaryEntryRow {
   id: number;
@@ -93,6 +104,26 @@ export interface DiaryEntryRow {
   snapshot_id: number | null;
   media_path: string | null;
   details: string | null;
+  ai_model: string | null;
+}
+
+export interface PushSubscriptionRow {
+  id: number;
+  user_id: number;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  user_agent: string | null;
+  created_at: number;
+}
+
+export interface NotificationPreferencesRow {
+  user_id: number;
+  enabled: 0 | 1;
+  activities: string;
+  quiet_start_minute: number;
+  quiet_end_minute: number;
+  rare_only: 0 | 1;
 }
 
 export interface BadgeRow {
@@ -205,6 +236,7 @@ interface Statements {
   diaryListBetween: Database.Statement;
   diaryListByKindBetween: Database.Statement;
   diaryUpsertTimelapseForDate: Database.Statement;
+  diaryUpsertRecapForDate: Database.Statement;
   diaryDeleteOlderThan: Database.Statement;
   diaryClearMediaOlderThan: Database.Statement;
   // badges
@@ -227,6 +259,16 @@ interface Statements {
   shareUpdateStatus: Database.Statement;
   shareCountSinceForUser: Database.Statement;
   shareListForUser: Database.Statement;
+  // wheel odometer — aggregate for badge evaluation
+  diaryWheelEntriesAll: Database.Statement;
+  // push subscriptions
+  pushSubUpsert: Database.Statement;
+  pushSubDeleteByEndpointForUser: Database.Statement;
+  pushSubDeleteByEndpoint: Database.Statement;
+  pushSubListForUser: Database.Statement;
+  // notification preferences
+  notifPrefsGet: Database.Statement;
+  notifPrefsUpsert: Database.Statement;
 }
 
 let statementsCache: { db: Database.Database; s: Statements } | null = null;
@@ -291,16 +333,29 @@ function statements(): Statements {
       'SELECT * FROM cameras WHERE enabled = 1 ORDER BY position ASC, id ASC',
     ),
     cameraInsert: db.prepare(`
-      INSERT INTO cameras (name, emoji, stream_url, position, enabled, created_at, zones)
-      VALUES (@name, @emoji, @stream_url, @position, @enabled, @created_at, @zones)
+      INSERT INTO cameras (
+        name, emoji, stream_url, position, enabled, created_at, zones,
+        wheel_mark_enabled, wheel_diameter_mm,
+        wheel_band_y_pct, wheel_band_height_pct, wheel_threshold_pct
+      )
+      VALUES (
+        @name, @emoji, @stream_url, @position, @enabled, @created_at, @zones,
+        @wheel_mark_enabled, @wheel_diameter_mm,
+        @wheel_band_y_pct, @wheel_band_height_pct, @wheel_threshold_pct
+      )
     `),
     cameraUpdate: db.prepare(`
       UPDATE cameras
-         SET name       = @name,
-             emoji      = @emoji,
-             stream_url = @stream_url,
-             enabled    = @enabled,
-             zones      = @zones
+         SET name                = @name,
+             emoji               = @emoji,
+             stream_url          = @stream_url,
+             enabled             = @enabled,
+             zones               = @zones,
+             wheel_mark_enabled  = @wheel_mark_enabled,
+             wheel_diameter_mm   = @wheel_diameter_mm,
+             wheel_band_y_pct    = @wheel_band_y_pct,
+             wheel_band_height_pct = @wheel_band_height_pct,
+             wheel_threshold_pct = @wheel_threshold_pct
        WHERE id = @id
     `),
     cameraDelete: db.prepare('DELETE FROM cameras WHERE id = ?'),
@@ -332,11 +387,11 @@ function statements(): Statements {
       INSERT INTO diary_entries (
         occurred_at, kind, activity, narrative, pet_name,
         camera_id, from_camera_id, to_camera_id,
-        duration_ms, snapshot_id, media_path, details
+        duration_ms, snapshot_id, media_path, details, ai_model
       ) VALUES (
         @occurred_at, @kind, @activity, @narrative, @pet_name,
         @camera_id, @from_camera_id, @to_camera_id,
-        @duration_ms, @snapshot_id, @media_path, @details
+        @duration_ms, @snapshot_id, @media_path, @details, @ai_model
       )
     `),
     diaryById: db.prepare('SELECT * FROM diary_entries WHERE id = ?'),
@@ -354,6 +409,12 @@ function statements(): Statements {
     diaryUpsertTimelapseForDate: db.prepare(`
       DELETE FROM diary_entries
        WHERE kind = 'timelapse'
+         AND occurred_at >= ? AND occurred_at < ?
+    `),
+    // Used by jobs/recap.ts to idempotently replace today's recap.
+    diaryUpsertRecapForDate: db.prepare(`
+      DELETE FROM diary_entries
+       WHERE kind = 'recap'
          AND occurred_at >= ? AND occurred_at < ?
     `),
     diaryDeleteOlderThan: db.prepare(
@@ -431,6 +492,50 @@ function statements(): Statements {
        WHERE user_id = ?
        ORDER BY created_at DESC
        LIMIT ?
+    `),
+
+    // wheel odometer ---------------------------------------------------
+    diaryWheelEntriesAll: db.prepare(`
+      SELECT details FROM diary_entries
+       WHERE activity = 'wheel' AND details IS NOT NULL
+    `),
+
+    // push subscriptions -----------------------------------------------
+    pushSubUpsert: db.prepare(`
+      INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent, created_at)
+      VALUES (@user_id, @endpoint, @p256dh, @auth, @user_agent, @created_at)
+      ON CONFLICT(endpoint) DO UPDATE SET
+        user_id    = excluded.user_id,
+        p256dh     = excluded.p256dh,
+        auth       = excluded.auth,
+        user_agent = excluded.user_agent,
+        created_at = excluded.created_at
+    `),
+    pushSubDeleteByEndpointForUser: db.prepare(
+      'DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?',
+    ),
+    pushSubDeleteByEndpoint: db.prepare(
+      'DELETE FROM push_subscriptions WHERE endpoint = ?',
+    ),
+    pushSubListForUser: db.prepare(
+      'SELECT * FROM push_subscriptions WHERE user_id = ? ORDER BY created_at DESC',
+    ),
+
+    // notification preferences -----------------------------------------
+    notifPrefsGet: db.prepare(
+      'SELECT * FROM notification_preferences WHERE user_id = ?',
+    ),
+    notifPrefsUpsert: db.prepare(`
+      INSERT INTO notification_preferences
+        (user_id, enabled, activities, quiet_start_minute, quiet_end_minute, rare_only)
+      VALUES
+        (@user_id, @enabled, @activities, @quiet_start_minute, @quiet_end_minute, @rare_only)
+      ON CONFLICT(user_id) DO UPDATE SET
+        enabled            = excluded.enabled,
+        activities         = excluded.activities,
+        quiet_start_minute = excluded.quiet_start_minute,
+        quiet_end_minute   = excluded.quiet_end_minute,
+        rare_only          = excluded.rare_only
     `),
   };
 
@@ -610,7 +715,9 @@ export function purgeExpiredSessions(now: number = Date.now()): void {
 /**
  * The raw SQLite row stores `zones` as a JSON-encoded TEXT column. Every
  * camera row leaving the DB layer goes through this so callers see the
- * typed `string[]` they expect.
+ * typed `string[]` they expect. Wheel-odometer columns are numeric and
+ * have DB-layer defaults so they're always present; we still clamp them
+ * defensively to avoid surprises from schema migrations on live DBs.
  */
 function decodeCameraRow(raw: unknown): CameraRow {
   const r = raw as Omit<CameraRow, 'zones'> & { zones: string | null };
@@ -626,7 +733,15 @@ function decodeCameraRow(raw: unknown): CameraRow {
       // see "no zones" in the UI and can re-save).
     }
   }
-  return { ...r, zones };
+  return {
+    ...r,
+    zones,
+    wheel_mark_enabled: r.wheel_mark_enabled === 1 ? 1 : 0,
+    wheel_diameter_mm: typeof r.wheel_diameter_mm === 'number' ? r.wheel_diameter_mm : 152.0,
+    wheel_band_y_pct: typeof r.wheel_band_y_pct === 'number' ? r.wheel_band_y_pct : 50.0,
+    wheel_band_height_pct: typeof r.wheel_band_height_pct === 'number' ? r.wheel_band_height_pct : 10.0,
+    wheel_threshold_pct: typeof r.wheel_threshold_pct === 'number' ? r.wheel_threshold_pct : 50.0,
+  };
 }
 
 export function getCameraById(id: number): CameraRow | null {
@@ -647,6 +762,11 @@ export interface CreateCameraInput {
   stream_url: string;
   enabled: boolean;
   zones?: string[];
+  wheel_mark_enabled?: boolean;
+  wheel_diameter_mm?: number;
+  wheel_band_y_pct?: number;
+  wheel_band_height_pct?: number;
+  wheel_threshold_pct?: number;
 }
 
 export function createCamera(input: CreateCameraInput): CameraRow {
@@ -660,6 +780,11 @@ export function createCamera(input: CreateCameraInput): CameraRow {
     enabled: input.enabled ? 1 : 0,
     created_at: Date.now(),
     zones: JSON.stringify(input.zones ?? []),
+    wheel_mark_enabled: input.wheel_mark_enabled ? 1 : 0,
+    wheel_diameter_mm: input.wheel_diameter_mm ?? 152.0,
+    wheel_band_y_pct: input.wheel_band_y_pct ?? 50.0,
+    wheel_band_height_pct: input.wheel_band_height_pct ?? 10.0,
+    wheel_threshold_pct: input.wheel_threshold_pct ?? 50.0,
   });
   const id = Number(result.lastInsertRowid);
   const row = getCameraById(id);
@@ -674,9 +799,18 @@ export interface UpdateCameraInput {
   stream_url: string;
   enabled: boolean;
   zones?: string[];
+  wheel_mark_enabled?: boolean;
+  wheel_diameter_mm?: number;
+  wheel_band_y_pct?: number;
+  wheel_band_height_pct?: number;
+  wheel_threshold_pct?: number;
 }
 
 export function updateCamera(input: UpdateCameraInput): CameraRow | null {
+  // For the five wheel columns, only update when the caller provides a value.
+  // This requires reading the existing row so we don't lose settings that a
+  // caller omitted from the partial update.
+  const existing = getCameraById(input.id);
   statements().cameraUpdate.run({
     id: input.id,
     name: input.name,
@@ -684,6 +818,13 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
     stream_url: input.stream_url,
     enabled: input.enabled ? 1 : 0,
     zones: JSON.stringify(input.zones ?? []),
+    wheel_mark_enabled: input.wheel_mark_enabled !== undefined
+      ? (input.wheel_mark_enabled ? 1 : 0)
+      : (existing?.wheel_mark_enabled ?? 0),
+    wheel_diameter_mm: input.wheel_diameter_mm ?? existing?.wheel_diameter_mm ?? 152.0,
+    wheel_band_y_pct: input.wheel_band_y_pct ?? existing?.wheel_band_y_pct ?? 50.0,
+    wheel_band_height_pct: input.wheel_band_height_pct ?? existing?.wheel_band_height_pct ?? 10.0,
+    wheel_threshold_pct: input.wheel_threshold_pct ?? existing?.wheel_threshold_pct ?? 50.0,
   });
   return getCameraById(input.id);
 }
@@ -759,10 +900,14 @@ export interface CreateDiaryEntryInput {
   snapshot_id: number | null;
   media_path: string | null;
   details: string | null;
+  ai_model?: string | null;
 }
 
 export function createDiaryEntry(input: CreateDiaryEntryInput): DiaryEntryRow {
-  const result = statements().diaryInsert.run(input);
+  const result = statements().diaryInsert.run({
+    ...input,
+    ai_model: input.ai_model ?? null,
+  });
   const id = Number(result.lastInsertRowid);
   const row = statements().diaryById.get(id) as DiaryEntryRow | undefined;
   if (!row) throw new Error(`createDiaryEntry: row ${id} not found immediately after insert`);
@@ -799,6 +944,20 @@ export function replaceTimelapseEntry(
   return tx();
 }
 
+/** Idempotent replace: delete any recap rows in [from, to), insert a new one. */
+export function replaceRecapEntry(
+  dayStartMs: number,
+  dayEndMs: number,
+  entry: CreateDiaryEntryInput,
+): DiaryEntryRow {
+  const db = getDb();
+  const tx = db.transaction(() => {
+    statements().diaryUpsertRecapForDate.run(dayStartMs, dayEndMs);
+    return createDiaryEntry(entry);
+  });
+  return tx();
+}
+
 export function deleteOldSnapshotDiaryEntries(cutoffMs: number): number {
   const info = statements().diaryDeleteOlderThan.run(cutoffMs);
   return info.changes;
@@ -807,6 +966,30 @@ export function deleteOldSnapshotDiaryEntries(cutoffMs: number): number {
 export function clearOldTimelapseMedia(cutoffMs: number): number {
   const info = statements().diaryClearMediaOlderThan.run(cutoffMs);
   return info.changes;
+}
+
+/**
+ * Sum all wheel_meters values stored in diary_entries.details across all time.
+ * Used by the odometer badge rules. Details is a JSON object; we parse each
+ * row and extract the numeric `wheel_meters` field.
+ */
+export function sumAllWheelMeters(): number {
+  const rows = statements().diaryWheelEntriesAll.all() as Array<{ details: string }>;
+  let total = 0;
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.details) as unknown;
+      if (typeof parsed === 'object' && parsed !== null && 'wheel_meters' in parsed) {
+        const m = (parsed as Record<string, unknown>)['wheel_meters'];
+        if (typeof m === 'number' && Number.isFinite(m)) {
+          total += m;
+        }
+      }
+    } catch {
+      // Malformed details — skip.
+    }
+  }
+  return total;
 }
 
 // ---------------------------------------------------------------------------
@@ -975,4 +1158,80 @@ export function countShareLogSinceForUser(userId: number, sinceMs: number): numb
 
 export function listShareLogForUser(userId: number, limit: number = 50): ShareLogRow[] {
   return statements().shareListForUser.all(userId, limit) as ShareLogRow[];
+}
+
+// ---------------------------------------------------------------------------
+// Push subscriptions
+// ---------------------------------------------------------------------------
+
+export interface UpsertPushSubscriptionInput {
+  user_id: number;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  user_agent: string | null;
+}
+
+export function upsertPushSubscription(input: UpsertPushSubscriptionInput): PushSubscriptionRow {
+  const now = Date.now();
+  statements().pushSubUpsert.run({ ...input, created_at: now });
+  const row = statements().pushSubListForUser.all(input.user_id).find(
+    (r) => (r as PushSubscriptionRow).endpoint === input.endpoint,
+  ) as PushSubscriptionRow | undefined;
+  if (!row) throw new Error('upsertPushSubscription: row not found after upsert');
+  return row;
+}
+
+export function deletePushSubscription(endpoint: string, userId: number): number {
+  const info = statements().pushSubDeleteByEndpointForUser.run(endpoint, userId);
+  return info.changes;
+}
+
+export function deletePushSubscriptionByEndpoint(endpoint: string): number {
+  const info = statements().pushSubDeleteByEndpoint.run(endpoint);
+  return info.changes;
+}
+
+export function listPushSubscriptionsForUser(userId: number): PushSubscriptionRow[] {
+  return statements().pushSubListForUser.all(userId) as PushSubscriptionRow[];
+}
+
+// ---------------------------------------------------------------------------
+// Notification preferences
+// ---------------------------------------------------------------------------
+
+const DEFAULT_NOTIF_PREFS: Omit<NotificationPreferencesRow, 'user_id'> = {
+  enabled: 1,
+  activities: '["wheel","food","water","resting","hiding"]',
+  quiet_start_minute: 1260,
+  quiet_end_minute: 420,
+  rare_only: 1,
+};
+
+export function getNotificationPreferences(userId: number): NotificationPreferencesRow {
+  const row = statements().notifPrefsGet.get(userId) as NotificationPreferencesRow | undefined;
+  if (row) return row;
+  // Create with defaults on first access.
+  upsertNotificationPreferences({ ...DEFAULT_NOTIF_PREFS, user_id: userId });
+  const created = statements().notifPrefsGet.get(userId) as NotificationPreferencesRow | undefined;
+  if (!created) throw new Error(`getNotificationPreferences: row for user ${userId} not found`);
+  return created;
+}
+
+export interface UpsertNotificationPreferencesInput {
+  user_id: number;
+  enabled: 0 | 1;
+  activities: string;
+  quiet_start_minute: number;
+  quiet_end_minute: number;
+  rare_only: 0 | 1;
+}
+
+export function upsertNotificationPreferences(
+  input: UpsertNotificationPreferencesInput,
+): NotificationPreferencesRow {
+  statements().notifPrefsUpsert.run(input);
+  const row = statements().notifPrefsGet.get(input.user_id) as NotificationPreferencesRow | undefined;
+  if (!row) throw new Error(`upsertNotificationPreferences: row for user ${input.user_id} not found`);
+  return row;
 }

@@ -1,0 +1,432 @@
+// app/server/src/wheel-odometer.ts
+// Optical-mark wheel odometry — Approach B.
+//
+// The operator sticks a piece of black tape on the wheel rim. We spawn an
+// ffmpeg child process that reads the camera RTSP stream at 10 fps, crops the
+// frame to a configurable horizontal band, and emits raw grayscale PGM frames
+// on stdout. A finite-state machine (LIGHT → DARK → LIGHT = one rotation)
+// counts rotations with an 80 ms debounce (3 frames at 10 fps). On session
+// end the rotation count is converted to metres:
+//   metres = rotations × π × diameter_mm / 1000
+
+import { spawn, type ChildProcess } from 'node:child_process';
+import type { Readable } from 'node:stream';
+
+import * as db from './db.js';
+import { childLogger } from './logger.js';
+
+const log = childLogger('wheel-odometer');
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Sampling rate passed to ffmpeg (-r). */
+const SAMPLE_FPS = 10;
+/** Minimum consecutive frames a state must hold before it's counted (debounce). */
+const DEBOUNCE_FRAMES = 3;
+/** Safety cut-off — auto-kill a session after 2 hours. */
+const MAX_SESSION_MS = 2 * 60 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// PGM streaming parser
+// ---------------------------------------------------------------------------
+
+type PgmCallback = (meanIntensity: number, frameMs: number) => void;
+
+/**
+ * Stateful PGM stream parser. Feeds raw bytes from ffmpeg stdout; invokes
+ * `onFrame` with the mean pixel intensity (0–255) of each complete frame and
+ * the wall-clock ms at which the frame was received.
+ *
+ * PGM binary format (P5):
+ *   P5\n<width> <height>\n255\n<width*height bytes>
+ */
+export class PgmParser {
+  private buf = Buffer.alloc(0);
+  private frameBytes: number | null = null;
+  private headerDone = false;
+
+  constructor(private readonly onFrame: PgmCallback) {}
+
+  feed(chunk: Buffer): void {
+    this.buf = Buffer.concat([this.buf, chunk]);
+    this.drain();
+  }
+
+  private drain(): void {
+    while (true) {
+      if (!this.headerDone) {
+        // Look for the end of the PGM header — three newline-terminated fields.
+        const headerEnd = this.findHeaderEnd();
+        if (headerEnd === -1) return; // Need more data.
+        const header = this.buf.slice(0, headerEnd).toString('ascii');
+        const dims = this.parsePgmHeader(header);
+        if (!dims) {
+          // Corrupt header — drop buffer up to and including this position and try again.
+          this.buf = this.buf.slice(headerEnd);
+          return;
+        }
+        this.frameBytes = dims.width * dims.height;
+        this.buf = this.buf.slice(headerEnd);
+        this.headerDone = true;
+      }
+
+      // headerDone = true, frameBytes is set.
+      const need = this.frameBytes ?? 0;
+      if (this.buf.length < need) return;
+
+      const frameData = this.buf.slice(0, need);
+      this.buf = this.buf.slice(need);
+      this.headerDone = false;
+      this.frameBytes = null;
+
+      // Compute mean intensity.
+      let sum = 0;
+      for (let i = 0; i < frameData.length; i += 1) {
+        sum += frameData[i] ?? 0;
+      }
+      const mean = frameData.length > 0 ? sum / frameData.length : 128;
+      this.onFrame(mean, Date.now());
+    }
+  }
+
+  /**
+   * Finds the index of the first byte after the PGM header (past the third
+   * newline of "P5\n<w> <h>\n255\n"). Returns -1 when not enough data yet.
+   */
+  private findHeaderEnd(): number {
+    let newlines = 0;
+    for (let i = 0; i < this.buf.length; i += 1) {
+      if (this.buf[i] === 0x0a) {
+        newlines += 1;
+        if (newlines === 3) return i + 1;
+      }
+    }
+    return -1;
+  }
+
+  private parsePgmHeader(header: string): { width: number; height: number } | null {
+    // Expected: "P5\n<width> <height>\n255"
+    const lines = header.split('\n').filter((l) => l.length > 0 && !l.startsWith('#'));
+    if (lines[0] !== 'P5') return null;
+    const dims = lines[1]?.split(/\s+/);
+    if (!dims || dims.length < 2) return null;
+    const width = Number.parseInt(dims[0] ?? '', 10);
+    const height = Number.parseInt(dims[1] ?? '', 10);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return null;
+    }
+    return { width, height };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rotation counter — finite-state machine with debounce
+// ---------------------------------------------------------------------------
+
+type MarkState = 'light' | 'dark';
+
+/**
+ * Stateful FSM that converts a stream of per-frame mean-intensity values into
+ * a rotation count. "Dark" means the tape mark is in the band.
+ *
+ * State transitions:
+ *   LIGHT → DARK: falling edge — tape entered the band.
+ *   DARK  → LIGHT: rising edge — tape left the band. One rotation counted.
+ *
+ * Debounce: a state change is only committed after DEBOUNCE_FRAMES consecutive
+ * frames agree on the new state.
+ */
+export class RotationCounter {
+  private state: MarkState = 'light';
+  private candidateState: MarkState = 'light';
+  private candidateCount = 0;
+  private rotations = 0;
+
+  constructor(private readonly thresholdPct: number) {}
+
+  /** Feed one frame's mean intensity. Returns the updated total rotation count. */
+  feed(meanIntensity: number): number {
+    // "Dark" pixel: intensity below 255 * (1 − threshold/100).
+    const cutoff = 255 * (1 - this.thresholdPct / 100);
+    const newState: MarkState = meanIntensity < cutoff ? 'dark' : 'light';
+
+    if (newState === this.candidateState) {
+      this.candidateCount += 1;
+    } else {
+      this.candidateState = newState;
+      this.candidateCount = 1;
+    }
+
+    if (this.candidateCount >= DEBOUNCE_FRAMES && newState !== this.state) {
+      const prev = this.state;
+      this.state = newState;
+      // Count one rotation on the DARK → LIGHT transition (rising edge).
+      if (prev === 'dark' && newState === 'light') {
+        this.rotations += 1;
+      }
+    }
+
+    return this.rotations;
+  }
+
+  getRotations(): number {
+    return this.rotations;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session handle
+// ---------------------------------------------------------------------------
+
+interface SessionHandle {
+  cameraId: number;
+  startedAt: number;
+  counter: RotationCounter;
+  parser: PgmParser;
+  proc: ChildProcess & { stdout: Readable; stderr: Readable };
+  safetyTimer: NodeJS.Timeout;
+  diameterMm: number;
+}
+
+const activeSessions = new Map<number, SessionHandle>();
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Start watching a wheel session for the given camera. Idempotent — if a
+ * session is already running for that camera id, this is a no-op. Auto-stops
+ * after 2 hours as a safety net. If wheel_mark_enabled = 0 for the camera,
+ * this is a no-op.
+ */
+export function startWheelSession(cameraId: number, startedAt: number): void {
+  if (activeSessions.has(cameraId)) return;
+
+  const camera = db.getCameraById(cameraId);
+  if (!camera) {
+    log.warn({ cameraId }, 'wheel-odometer: camera not found, skipping session start');
+    return;
+  }
+  if (camera.wheel_mark_enabled !== 1) return;
+
+  const {
+    stream_url,
+    wheel_diameter_mm: diameterMm,
+    wheel_band_y_pct: bandY,
+    wheel_band_height_pct: bandH,
+    wheel_threshold_pct: thresholdPct,
+  } = camera;
+
+  const counter = new RotationCounter(thresholdPct);
+  const parser = new PgmParser((mean) => {
+    counter.feed(mean);
+  });
+
+  // ffmpeg crops to the band and emits grayscale PGM frames on stdout.
+  // We use `ih*bandH/100` arithmetic inside the crop filter expression.
+  // `-vsync vfr` avoids duplicate frames on slow streams.
+  //
+  // We cast the result to our SessionHandle proc type because TypeScript's
+  // overload resolution for spawn() with stdio-tuple literals produces
+  // ChildProcessByStdio<null, Readable, Readable>; the cast is safe since
+  // stdout and stderr are Readable instances in all cases.
+  const rawProc = spawn('ffmpeg', [
+    '-rtsp_transport', 'tcp',
+    '-i', stream_url,
+    '-vf', `crop=iw:ih*${bandH}/100:0:ih*${bandY}/100,format=gray`,
+    '-vsync', 'vfr',
+    '-r', String(SAMPLE_FPS),
+    '-f', 'image2pipe',
+    '-vcodec', 'pgm',
+    '-',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = rawProc as SessionHandle['proc'];
+
+  proc.stdout.on('data', (chunk: Buffer) => {
+    parser.feed(chunk);
+  });
+
+  proc.stderr.on('data', () => {
+    // Swallow ffmpeg's progress output; errors surface via 'close'.
+  });
+
+  proc.on('error', (err) => {
+    log.warn({ cameraId, err: err.message }, 'wheel-odometer: ffmpeg spawn error');
+    cleanupSession(cameraId);
+  });
+
+  proc.on('close', (code) => {
+    if (activeSessions.has(cameraId)) {
+      // Unexpected exit — log and clean up, but do NOT throw. The partial
+      // count is preserved in the counter and endWheelSession will read it.
+      log.warn({ cameraId, code }, 'wheel-odometer: ffmpeg exited unexpectedly');
+      cleanupSession(cameraId);
+    }
+  });
+
+  const safetyTimer = setTimeout(() => {
+    log.warn({ cameraId }, 'wheel-odometer: safety cut-off after 2 hours');
+    cleanupSession(cameraId);
+  }, MAX_SESSION_MS);
+  safetyTimer.unref?.();
+
+  activeSessions.set(cameraId, {
+    cameraId,
+    startedAt,
+    counter,
+    parser,
+    proc,
+    safetyTimer,
+    diameterMm,
+  });
+
+  log.info({ cameraId, stream_url, bandY, bandH, thresholdPct }, 'wheel session started');
+}
+
+/**
+ * Stop the wheel session for this camera and return the computed metres.
+ * Returns null if no session was active or if odometry is disabled.
+ * metres = rotations × π × diameter_mm / 1000
+ */
+export function endWheelSession(cameraId: number): number | null {
+  const session = activeSessions.get(cameraId);
+  if (!session) return null;
+
+  const rotations = session.counter.getRotations();
+  cleanupSession(cameraId);
+
+  const metres = rotations * Math.PI * session.diameterMm / 1000;
+  log.info({ cameraId, rotations, metres }, 'wheel session ended');
+  return metres;
+}
+
+/**
+ * One-off helper used by `cameras.testWheelDetection`: grab a single frame
+ * from the camera, crop it to the configured band, compute the dark-pixel
+ * ratio, and return a base64 PNG of the cropped band plus the ratio.
+ */
+export async function testWheelDetection(cameraId: number): Promise<
+  | { croppedPngBase64: string; darkPixelRatio: number; thresholdPct: number }
+  | { error: string }
+> {
+  const camera = db.getCameraById(cameraId);
+  if (!camera) return { error: `camera ${cameraId} not found` };
+
+  const { stream_url, wheel_band_y_pct: bandY, wheel_band_height_pct: bandH, wheel_threshold_pct: thresholdPct } = camera;
+
+  return new Promise((resolve) => {
+    // Capture exactly one frame as grayscale PGM, then convert to PNG via a
+    // second ffmpeg pass. We chain them with pipe to avoid writing temp files.
+    //
+    // Step 1: grab one PGM frame from the stream.
+    const grabProc = spawn('ffmpeg', [
+      '-rtsp_transport', 'tcp',
+      '-i', stream_url,
+      '-vf', `crop=iw:ih*${bandH}/100:0:ih*${bandY}/100,format=gray`,
+      '-vframes', '1',
+      '-f', 'image2pipe',
+      '-vcodec', 'pgm',
+      '-',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const pgmChunks: Buffer[] = [];
+    grabProc.stdout.on('data', (c: Buffer) => pgmChunks.push(c));
+
+    grabProc.on('error', (err) => resolve({ error: `ffmpeg error: ${err.message}` }));
+
+    grabProc.on('close', (code) => {
+      if (code !== 0) {
+        resolve({ error: `ffmpeg exited with code ${code}` });
+        return;
+      }
+      const pgmBuf = Buffer.concat(pgmChunks);
+      if (pgmBuf.length === 0) {
+        resolve({ error: 'ffmpeg produced no output' });
+        return;
+      }
+
+      // Step 2: convert the PGM to PNG via ffmpeg piped stdin → stdout.
+      const convProc = spawn('ffmpeg', [
+        '-f', 'pgm_pipe',
+        '-i', 'pipe:0',
+        '-f', 'apng',
+        'pipe:1',
+      ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+      const pngChunks: Buffer[] = [];
+      convProc.stdout.on('data', (c: Buffer) => pngChunks.push(c));
+      convProc.on('error', (err) => resolve({ error: `png-convert error: ${err.message}` }));
+      convProc.on('close', (convCode) => {
+        if (convCode !== 0) {
+          resolve({ error: `png convert exited with code ${convCode}` });
+          return;
+        }
+        const pngBuf = Buffer.concat(pngChunks);
+
+        // Also compute the dark-pixel ratio from the raw PGM bytes.
+        const darkRatio = computeDarkPixelRatio(pgmBuf, thresholdPct);
+
+        resolve({
+          croppedPngBase64: pngBuf.toString('base64'),
+          darkPixelRatio: darkRatio,
+          thresholdPct,
+        });
+      });
+
+      convProc.stdin.write(pgmBuf);
+      convProc.stdin.end();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+function cleanupSession(cameraId: number): void {
+  const session = activeSessions.get(cameraId);
+  if (!session) return;
+  clearTimeout(session.safetyTimer);
+  try {
+    session.proc.kill('SIGTERM');
+  } catch {
+    // Process may already be dead.
+  }
+  activeSessions.delete(cameraId);
+}
+
+/**
+ * Parse the PGM header from a buffer and compute the ratio of dark pixels.
+ * "Dark" = mean intensity below `255 * (1 − thresholdPct/100)`.
+ * Returns 0 on parse failure.
+ */
+function computeDarkPixelRatio(pgmBuf: Buffer, thresholdPct: number): number {
+  // Find the end of the three-line header.
+  let newlines = 0;
+  let headerEnd = -1;
+  for (let i = 0; i < pgmBuf.length; i += 1) {
+    if (pgmBuf[i] === 0x0a) {
+      newlines += 1;
+      if (newlines === 3) {
+        headerEnd = i + 1;
+        break;
+      }
+    }
+  }
+  if (headerEnd === -1) return 0;
+  const pixels = pgmBuf.slice(headerEnd);
+  if (pixels.length === 0) return 0;
+
+  const cutoff = 255 * (1 - thresholdPct / 100);
+  let dark = 0;
+  for (let i = 0; i < pixels.length; i += 1) {
+    if ((pixels[i] ?? 255) < cutoff) dark += 1;
+  }
+  return dark / pixels.length;
+}
+
+// Exported for tests.
+export { activeSessions as _activeSessions };

@@ -14,6 +14,8 @@
 
 import type { RouterOutputs } from '../trpc';
 
+// DiaryActivity is derived from the server contract — includes all known
+// activity values including 'recap' (the daily summary entry type).
 export type DiaryActivity = NonNullable<RouterOutputs['activity']['today'][number]['activity']>;
 
 export interface ActivityStyle {
@@ -33,6 +35,9 @@ function tint(hex: string, alpha: number): string {
 
 const TINT_ALPHA = 0.06;
 
+// Warm amber/gold for recap cards — visually distinct, inviting, not alarming.
+const RECAP_ACCENT = '#E8A020';
+
 const PALETTE: Record<DiaryActivity, { accent: string; badgeEmoji: string }> = {
   wheel:      { accent: '#FF7AAF', badgeEmoji: '🎡' },
   food:       { accent: '#FFA94D', badgeEmoji: '🥕' },
@@ -45,6 +50,7 @@ const PALETTE: Record<DiaryActivity, { accent: string; badgeEmoji: string }> = {
   transition: { accent: '#E89BB5', badgeEmoji: '🚶' },
   snapshot:   { accent: '#F7CB36', badgeEmoji: '📸' },
   timelapse:  { accent: '#E07F8E', badgeEmoji: '📽️' },
+  recap:      { accent: RECAP_ACCENT, badgeEmoji: '📖' },
 };
 
 export function activityStyle(activity: DiaryActivity | null): ActivityStyle {

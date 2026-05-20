@@ -147,4 +147,147 @@ describe('badges', () => {
     const second = await evaluateBadges();
     expect(second).not.toContain('first_day');
   });
+
+  // ---------------------------------------------------------------------------
+  // Wheel odometer distance badges
+  // ---------------------------------------------------------------------------
+
+  it('mile_high — earns when cumulative wheel_meters >= 1609.34', async () => {
+    const db = await import('../src/db.js');
+    const { evaluateBadges } = await import('../src/badges.js');
+    const now = Date.now();
+    const start = startOfLocalDay(new Date(now));
+    // Write a wheel diary entry with wheel_meters = 1700 in details.
+    db.createDiaryEntry({
+      occurred_at: start + 1,
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'wheel sentence',
+      pet_name: 'Peanut',
+      camera_id: null,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 60_000,
+      snapshot_id: null,
+      media_path: null,
+      details: JSON.stringify({ wheel_meters: 1700 }),
+    });
+    const earned = await evaluateBadges({ now });
+    expect(earned).toContain('mile_high');
+    expect(earned).not.toContain('marathon_club');
+    expect(earned).not.toContain('ultra');
+  });
+
+  it('marathon_club — earns when cumulative wheel_meters >= 42195', async () => {
+    const db = await import('../src/db.js');
+    const { evaluateBadges } = await import('../src/badges.js');
+    const now = Date.now();
+    const start = startOfLocalDay(new Date(now));
+    db.createDiaryEntry({
+      occurred_at: start + 1,
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'wheel sentence',
+      pet_name: 'Peanut',
+      camera_id: null,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 3_600_000,
+      snapshot_id: null,
+      media_path: null,
+      details: JSON.stringify({ wheel_meters: 42200 }),
+    });
+    const earned = await evaluateBadges({ now });
+    expect(earned).toContain('mile_high');
+    expect(earned).toContain('marathon_club');
+    expect(earned).not.toContain('ultra');
+  });
+
+  it('ultra — earns when cumulative wheel_meters >= 160934', async () => {
+    const db = await import('../src/db.js');
+    const { evaluateBadges } = await import('../src/badges.js');
+    const now = Date.now();
+    const start = startOfLocalDay(new Date(now));
+    db.createDiaryEntry({
+      occurred_at: start + 1,
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'wheel sentence',
+      pet_name: 'Peanut',
+      camera_id: null,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 7_200_000,
+      snapshot_id: null,
+      media_path: null,
+      details: JSON.stringify({ wheel_meters: 161000 }),
+    });
+    const earned = await evaluateBadges({ now });
+    expect(earned).toContain('mile_high');
+    expect(earned).toContain('marathon_club');
+    expect(earned).toContain('ultra');
+  });
+
+  it('distance badges are cumulative across multiple diary entries', async () => {
+    const db = await import('../src/db.js');
+    const { evaluateBadges } = await import('../src/badges.js');
+    const now = Date.now();
+    const start = startOfLocalDay(new Date(now));
+    // Two entries summing to 1700 metres — should earn mile_high.
+    db.createDiaryEntry({
+      occurred_at: start + 1,
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'wheel sentence',
+      pet_name: 'Peanut',
+      camera_id: null,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 60_000,
+      snapshot_id: null,
+      media_path: null,
+      details: JSON.stringify({ wheel_meters: 900 }),
+    });
+    db.createDiaryEntry({
+      occurred_at: start + 2,
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'wheel sentence',
+      pet_name: 'Peanut',
+      camera_id: null,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 60_000,
+      snapshot_id: null,
+      media_path: null,
+      details: JSON.stringify({ wheel_meters: 800 }),
+    });
+    const earned = await evaluateBadges({ now });
+    expect(earned).toContain('mile_high');
+  });
+
+  it('distance badges not earned below threshold', async () => {
+    const db = await import('../src/db.js');
+    const { evaluateBadges } = await import('../src/badges.js');
+    const now = Date.now();
+    const start = startOfLocalDay(new Date(now));
+    db.createDiaryEntry({
+      occurred_at: start + 1,
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'wheel sentence',
+      pet_name: 'Peanut',
+      camera_id: null,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 30_000,
+      snapshot_id: null,
+      media_path: null,
+      details: JSON.stringify({ wheel_meters: 500 }),
+    });
+    const earned = await evaluateBadges({ now });
+    expect(earned).not.toContain('mile_high');
+    expect(earned).not.toContain('marathon_club');
+    expect(earned).not.toContain('ultra');
+  });
 });

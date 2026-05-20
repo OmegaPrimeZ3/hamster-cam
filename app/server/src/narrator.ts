@@ -17,6 +17,8 @@
 import * as db from './db.js';
 import { evaluateBadges, type BadgeId } from './badges.js';
 import { pickTemplate, render } from './narratives.js';
+import { evaluatePushForEntry } from './push.js';
+import { startWheelSession, endWheelSession } from './wheel-odometer.js';
 
 // ---------------------------------------------------------------------------
 // Tunables — read once at startup, refresh on demand (e.g. after a settings
@@ -188,8 +190,9 @@ interface NarratorDeps {
 const defaultDeps: Required<NarratorDeps> = {
   now: () => Date.now(),
   rng: () => Math.random(),
-  onEntryWritten: async (_entry) => {
+  onEntryWritten: async (entry) => {
     await evaluateBadges();
+    await evaluatePushForEntry(entry);
   },
 };
 
@@ -239,12 +242,26 @@ function writeEntry(params: WriteParams): db.DiaryEntryRow {
     narrative = render(pickTemplate('snapshot', params.rng), { pet });
   } else if (params.activity === 'timelapse') {
     narrative = render(pickTemplate('timelapse', params.rng), { pet, date: '' });
-  } else {
+  } else if (
+    params.activity === 'wheel' ||
+    params.activity === 'food' ||
+    params.activity === 'water' ||
+    params.activity === 'bathroom' ||
+    params.activity === 'resting' ||
+    params.activity === 'tunnel' ||
+    params.activity === 'exploring' ||
+    params.activity === 'hiding'
+  ) {
     const tpl = pickTemplate(params.activity, params.rng);
     narrative = render(tpl, {
       pet,
       duration: params.durationMs != null ? formatDuration(params.durationMs) : '',
     });
+  } else {
+    // 'recap' and any future activity variants not handled above — the
+    // narrator does not write these; they come from dedicated jobs that
+    // call db.createDiaryEntry directly with a pre-formed narrative.
+    narrative = '';
   }
 
   return db.createDiaryEntry({
@@ -286,6 +303,27 @@ async function flushPending(
     // Fly-through — discard.
     return null;
   }
+
+  // Collect wheel odometry before writing the entry so metres land in details.
+  const details: Record<string, unknown> = {
+    type: pending.event.type,
+    camera: pending.event.before.camera,
+  };
+  if (pending.activity === 'wheel') {
+    const camId = cameraIdByName(pending.event.before.camera);
+    if (camId !== null) {
+      try {
+        const metres = endWheelSession(camId);
+        if (metres !== null) {
+          details['wheel_meters'] = metres;
+        }
+      } catch (err) {
+        // Never block diary writes for odometry failures.
+        void err;
+      }
+    }
+  }
+
   const entry = writeEntry({
     activity: pending.activity,
     occurredAt: pending.at,
@@ -295,7 +333,7 @@ async function flushPending(
     toCameraId: null,
     fromZone: null,
     toZone: null,
-    details: { type: pending.event.type, camera: pending.event.before.camera },
+    details,
     rng: deps.rng,
     pet: petName(),
   });
@@ -373,6 +411,21 @@ export async function handleFrigateEvent(
       }
     }
     petState.lastSeen = { camera: cameraName, zone, at: nowMs };
+
+    // Start wheel odometry when this camera is watching the wheel zone.
+    const activity = classifyActivity(event.after);
+    if (activity === 'wheel') {
+      const camId = cameraIdByName(cameraName);
+      if (camId !== null) {
+        try {
+          startWheelSession(camId, nowMs);
+        } catch (err) {
+          // Never block the narrator path for odometry errors.
+          void err;
+        }
+      }
+    }
+
     return written;
   }
 
