@@ -3,12 +3,12 @@
 
 import { unlink } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
-import pino from 'pino';
 
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
+import { childLogger } from '../logger.js';
 
-const logger = pino({ name: 'retention-job', level: process.env['LOG_LEVEL'] ?? 'info' });
+const logger = childLogger('retention-job');
 
 export interface RetentionRunResult {
   snapshots_deleted: number;

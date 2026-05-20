@@ -26,7 +26,6 @@ import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
 import { fastifyTRPCPlugin } from '@trpc/server/adapters/fastify';
 import cron, { type ScheduledTask } from 'node-cron';
-import pino from 'pino';
 
 import {
   forgotPassword,
@@ -41,12 +40,12 @@ import { getDb, purgeExpiredSessions } from './db.js';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRetentionJob } from './jobs/retention.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
+import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
 import { appRouter, createContext } from './trpc.js';
 
 const execFile = promisify(execFileCb);
-const logger = pino({ name: 'hamster-app', level: process.env['LOG_LEVEL'] ?? 'info' });
 
 export type AppServer = Awaited<ReturnType<typeof buildFastify>>;
 

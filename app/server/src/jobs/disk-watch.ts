@@ -5,15 +5,15 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import pino from 'pino';
 
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
+import { childLogger } from '../logger.js';
 import { getZyphr } from '../zyphr.js';
 
 const execFileP = promisify(execFile);
 
-const logger = pino({ name: 'disk-watch-job', level: process.env['LOG_LEVEL'] ?? 'info' });
+const logger = childLogger('disk-watch-job');
 
 export type DiskWatchSeverity = 'ok' | 'warn' | 'critical';
 
