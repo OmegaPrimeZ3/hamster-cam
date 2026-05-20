@@ -15,12 +15,11 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import {
-  createServer as createHttpServer,
   request as httpRequest,
   type IncomingMessage,
-  type Server,
   type ServerResponse,
 } from 'node:http';
+import { createServer as createHttpsServer, type Server } from 'node:https';
 import { readFile, stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
@@ -33,6 +32,8 @@ const WEB_DIST = join(__dirname, '..', '..', 'app', 'web', 'dist');
 const SERVER_SRC_INDEX = join(__dirname, '..', '..', 'app', 'server', 'src', 'index.ts');
 const SERVER_BOOT_HELPER = join(__dirname, 'server-boot.ts');
 const TSX_BIN = join(__dirname, '..', 'node_modules', '.bin', 'tsx');
+const TLS_CERT_PATH = join(__dirname, 'cert', 'cert.pem');
+const TLS_KEY_PATH = join(__dirname, 'cert', 'key.pem');
 
 export interface StackHandle {
   frontUrl: string;
@@ -137,11 +138,15 @@ export async function startStack(opts: StackOptions = {}): Promise<StackHandle> 
     logLevel: opts.logLevel ?? 'silent',
   });
 
-  // 4) Static + reverse-proxy frontend server.
+  // 4) Static + reverse-proxy frontend server. HTTPS is required because the
+  // backend sets the session cookie with the `__Host-` prefix + Secure flag;
+  // Chromium refuses to store such a cookie on plain `http://127.0.0.1`. Vite
+  // preview / Caddy would also serve HTTPS in production, so this matches
+  // reality. The cert is a self-signed CA we ship in fixtures/cert/.
   const front = await startFrontend({ getBackendPort: () => backend.port });
 
   return {
-    frontUrl: `http://127.0.0.1:${front.port}`,
+    frontUrl: `https://127.0.0.1:${front.port}`,
     apiUrl: `http://127.0.0.1:${backend.port}`,
     dbPath: db.path,
     zyphr,
@@ -283,7 +288,11 @@ interface FrontendHandle {
 }
 
 async function startFrontend(opts: { getBackendPort: () => number }): Promise<FrontendHandle> {
-  const server: Server = createHttpServer((req, res) => {
+  const [cert, key] = await Promise.all([
+    readFile(TLS_CERT_PATH),
+    readFile(TLS_KEY_PATH),
+  ]);
+  const server: Server = createHttpsServer({ cert, key }, (req, res) => {
     void handleRequest(req, res, opts.getBackendPort).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
       if (!res.headersSent) {

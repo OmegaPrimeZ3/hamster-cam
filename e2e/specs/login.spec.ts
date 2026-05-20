@@ -37,7 +37,7 @@ test('unauthenticated visit lands on the app-rendered Login screen, not a Zyphr 
   // page would have a different title. The visible H1 is also our own.
   await expect(page.getByRole('heading', { name: /Cam!/ })).toBeVisible();
   await expect(page.getByLabel('Email')).toBeVisible();
-  await expect(page.getByLabel('Password')).toBeVisible();
+  await expect(page.getByLabel('Password', { exact: true })).toBeVisible();
   // No outbound to Zyphr happens before submit.
   expect(stack.zyphr.calls).toHaveLength(0);
 });
@@ -45,7 +45,7 @@ test('unauthenticated visit lands on the app-rendered Login screen, not a Zyphr 
 test('wrong password shows the friendly inline error with no enumeration leak', async ({ page }) => {
   await page.goto(`${stack.frontUrl}/login`);
   await page.getByLabel('Email').fill(defaultAdmin.email);
-  await page.getByLabel('Password').fill('wrong-password');
+  await page.getByLabel('Password', { exact: true }).fill('wrong-password');
   await page.getByRole('button', { name: /Sign in/i }).click();
 
   const alert = page.getByRole('alert');
@@ -54,7 +54,7 @@ test('wrong password shows the friendly inline error with no enumeration leak', 
   // The same message regardless of which side is wrong — check by also
   // trying a completely unknown email.
   await page.getByLabel('Email').fill('nobody@example.com');
-  await page.getByLabel('Password').fill('also-wrong');
+  await page.getByLabel('Password', { exact: true }).fill('also-wrong');
   await page.getByRole('button', { name: /Sign in/i }).click();
   await expect(alert).toContainText("didn't match");
 });
@@ -62,7 +62,7 @@ test('wrong password shows the friendly inline error with no enumeration leak', 
 test('Zyphr-known but locally-unprovisioned email is rejected with not_provisioned', async ({ page }) => {
   await page.goto(`${stack.frontUrl}/login`);
   await page.getByLabel('Email').fill('orphan@example.com');
-  await page.getByLabel('Password').fill('orphan-pass-123');
+  await page.getByLabel('Password', { exact: true }).fill('orphan-pass-123');
   await page.getByRole('button', { name: /Sign in/i }).click();
 
   const alert = page.getByRole('alert');
@@ -81,7 +81,7 @@ test('rate-limit response from Zyphr surfaces as the friendly throttle message',
 
   await page.goto(`${stack.frontUrl}/login`);
   await page.getByLabel('Email').fill(defaultAdmin.email);
-  await page.getByLabel('Password').fill(defaultAdmin.password);
+  await page.getByLabel('Password', { exact: true }).fill(defaultAdmin.password);
   await page.getByRole('button', { name: /Sign in/i }).click();
 
   const alert = page.getByRole('alert');
@@ -102,7 +102,7 @@ test('right creds with MFA enabled drives the challenge screen, then signs in on
 
   await page.goto(`${stack.frontUrl}/login`);
   await page.getByLabel('Email').fill(defaultAdmin.email);
-  await page.getByLabel('Password').fill(defaultAdmin.password);
+  await page.getByLabel('Password', { exact: true }).fill(defaultAdmin.password);
   await page.getByRole('button', { name: /Sign in/i }).click();
 
   // MFA challenge UI mounts in place of the login form.
@@ -122,7 +122,7 @@ test('right creds with MFA enabled drives the challenge screen, then signs in on
 test('right creds land an admin on the AppShell (camera grid empty-state)', async ({ page }) => {
   await page.goto(`${stack.frontUrl}/login`);
   await page.getByLabel('Email').fill(defaultAdmin.email);
-  await page.getByLabel('Password').fill(defaultAdmin.password);
+  await page.getByLabel('Password', { exact: true }).fill(defaultAdmin.password);
   await page.getByRole('button', { name: /Sign in/i }).click();
 
   // No cameras seeded; the grid shows its "first camera" CTA. The presence of

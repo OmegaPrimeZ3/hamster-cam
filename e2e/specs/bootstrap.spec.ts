@@ -9,7 +9,7 @@
 //     prerequisite for the next acceptance bullet — see `login.spec.ts`).
 
 import { test, expect } from '@playwright/test';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,42 @@ import { startStack, type StackHandle, defaultAdmin } from '../fixtures';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOOTSTRAP_SCRIPT = join(__dirname, '..', '..', 'app', 'server', 'src', 'bootstrap.ts');
 const TSX_BIN = join(__dirname, '..', 'node_modules', '.bin', 'tsx');
+
+interface SpawnResult {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Async spawn wrapper — we cannot use `spawnSync` from inside a spec because
+ * the Zyphr mock server runs in the same Node process; `spawnSync` blocks the
+ * event loop and starves the mock of CPU, causing the CLI to time out.
+ */
+function runBootstrap(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 30_000): Promise<SpawnResult> {
+  return new Promise((resolve) => {
+    const child = spawn(TSX_BIN, [BOOTSTRAP_SCRIPT, ...args], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (b: Buffer) => {
+      stdout += b.toString();
+    });
+    child.stderr?.on('data', (b: Buffer) => {
+      stderr += b.toString();
+    });
+    const t = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, timeoutMs);
+    child.on('exit', (status, signal) => {
+      clearTimeout(t);
+      resolve({ status, signal, stdout, stderr });
+    });
+  });
+}
 
 let stack: StackHandle;
 
@@ -35,25 +71,19 @@ test('bootstrap CLI provisions the first admin at Zyphr and writes the local row
   expect(countUsers(stack.dbPath)).toBe(0);
 
   // Run the bootstrap CLI as documented in PLAN §7.6.6.
-  const result = spawnSync(
-    TSX_BIN,
+  const result = await runBootstrap(
     [
-      BOOTSTRAP_SCRIPT,
       '--email', defaultAdmin.email,
       '--display-name', defaultAdmin.display_name,
       '--password', defaultAdmin.password,
     ],
     {
-      env: {
-        ...process.env,
-        DATABASE_PATH: stack.dbPath,
-        STORAGE_PATH: stack.dbPath.replace(/\/[^/]+$/, ''),
-        ZYPHR_API_KEY: 'test-api-key',
-        ZYPHR_BASE_URL: stack.zyphr.baseUrl,
-        NODE_ENV: 'test',
-      },
-      encoding: 'utf8',
-      timeout: 30_000,
+      ...process.env,
+      DATABASE_PATH: stack.dbPath,
+      STORAGE_PATH: stack.dbPath.replace(/\/[^/]+$/, ''),
+      ZYPHR_API_KEY: 'test-api-key',
+      ZYPHR_BASE_URL: stack.zyphr.baseUrl,
+      NODE_ENV: 'test',
     },
   );
 
@@ -94,25 +124,19 @@ test('bootstrap CLI refuses to run when users table is non-empty', async () => {
   });
   stack.db.close();
 
-  const result = spawnSync(
-    TSX_BIN,
+  const result = await runBootstrap(
     [
-      BOOTSTRAP_SCRIPT,
       '--email', 'second@example.com',
       '--display-name', 'Second',
       '--password', 'something-long-enough',
     ],
     {
-      env: {
-        ...process.env,
-        DATABASE_PATH: stack.dbPath,
-        STORAGE_PATH: stack.dbPath.replace(/\/[^/]+$/, ''),
-        ZYPHR_API_KEY: 'test-api-key',
-        ZYPHR_BASE_URL: stack.zyphr.baseUrl,
-        NODE_ENV: 'test',
-      },
-      encoding: 'utf8',
-      timeout: 30_000,
+      ...process.env,
+      DATABASE_PATH: stack.dbPath,
+      STORAGE_PATH: stack.dbPath.replace(/\/[^/]+$/, ''),
+      ZYPHR_API_KEY: 'test-api-key',
+      ZYPHR_BASE_URL: stack.zyphr.baseUrl,
+      NODE_ENV: 'test',
     },
   );
 
@@ -126,25 +150,19 @@ test('bootstrap CLI refuses to run when users table is non-empty', async () => {
 
 test('after bootstrap, the new admin can sign in via the browser-rendered login form', async ({ page }) => {
   // Bootstrap a real admin via the CLI.
-  const result = spawnSync(
-    TSX_BIN,
+  const result = await runBootstrap(
     [
-      BOOTSTRAP_SCRIPT,
       '--email', defaultAdmin.email,
       '--display-name', defaultAdmin.display_name,
       '--password', defaultAdmin.password,
     ],
     {
-      env: {
-        ...process.env,
-        DATABASE_PATH: stack.dbPath,
-        STORAGE_PATH: stack.dbPath.replace(/\/[^/]+$/, ''),
-        ZYPHR_API_KEY: 'test-api-key',
-        ZYPHR_BASE_URL: stack.zyphr.baseUrl,
-        NODE_ENV: 'test',
-      },
-      encoding: 'utf8',
-      timeout: 30_000,
+      ...process.env,
+      DATABASE_PATH: stack.dbPath,
+      STORAGE_PATH: stack.dbPath.replace(/\/[^/]+$/, ''),
+      ZYPHR_API_KEY: 'test-api-key',
+      ZYPHR_BASE_URL: stack.zyphr.baseUrl,
+      NODE_ENV: 'test',
     },
   );
   expect(result.status, `bootstrap stderr=\n${result.stderr}`).toBe(0);
@@ -154,7 +172,7 @@ test('after bootstrap, the new admin can sign in via the browser-rendered login 
   await expect(page.getByRole('heading', { name: /Pet Cam!|Cam!/ })).toBeVisible();
 
   await page.getByLabel('Email').fill(defaultAdmin.email);
-  await page.getByLabel('Password').fill(defaultAdmin.password);
+  await page.getByLabel('Password', { exact: true }).fill(defaultAdmin.password);
   await page.getByRole('button', { name: /Sign in/i }).click();
 
   // Onboarding wizard renders (admin + onboarding_complete=false). The
