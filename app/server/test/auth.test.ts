@@ -229,6 +229,45 @@ describe('POST /auth/password/forgot', () => {
     });
     expect(res.statusCode).toBe(204);
   });
+
+  // Security-Review Finding 7: previously the handler skipped the Zyphr call
+  // when the email had no local mirror, creating a measurable timing oracle.
+  // The fix makes that call unconditional, so an unknown email STILL hits
+  // Zyphr — verified here by counting msw handler invocations.
+  it('hits Zyphr forgot-password upstream even when the email is unknown locally', async () => {
+    let zyphrCalls = 0;
+    mswServer.use(
+      http.post(`${ZYPHR_BASE}/auth/forgot-password`, async () => {
+        zyphrCalls += 1;
+        return HttpResponse.json({ data: { ok: true } });
+      }),
+    );
+    const res = await app.inject({
+      method: 'POST',
+      url: '/auth/password/forgot',
+      payload: { email: 'never-seen@example.com' },
+    });
+    expect(res.statusCode).toBe(204);
+    expect(zyphrCalls).toBe(1);
+  });
+
+  it('hits Zyphr forgot-password upstream when the email IS known locally', async () => {
+    await seedUser('known@example.com');
+    let zyphrCalls = 0;
+    mswServer.use(
+      http.post(`${ZYPHR_BASE}/auth/forgot-password`, async () => {
+        zyphrCalls += 1;
+        return HttpResponse.json({ data: { ok: true } });
+      }),
+    );
+    const res = await app.inject({
+      method: 'POST',
+      url: '/auth/password/forgot',
+      payload: { email: 'known@example.com' },
+    });
+    expect(res.statusCode).toBe(204);
+    expect(zyphrCalls).toBe(1);
+  });
 });
 
 describe('GET /auth/me', () => {
