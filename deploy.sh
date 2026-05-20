@@ -15,12 +15,42 @@
 #   MAC_MINI_PATH   — remote install root            (default: /opt/hamster-cam)
 #   SSH_OPTS        — extra ssh / rsync -e options   (optional)
 #
+# Flags:
+#   --sync-env, -e  — also push the dev machine's .env to the Mac Mini
+#                     (the remote file is backed up to .env.bak-<ts> first).
+#                     OFF by default — the remote .env is normally
+#                     authoritative and untouched.
+#
 # Examples:
 #   ./deploy.sh
+#   ./deploy.sh --sync-env
 #   MAC_MINI_HOST=192.168.1.50 ./deploy.sh
 #   SSH_OPTS="-i ~/.ssh/hamster_ed25519" ./deploy.sh
 
 set -euo pipefail
+
+# ----------------------------------------------------------------------
+# CLI flags
+# ----------------------------------------------------------------------
+SYNC_ENV=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sync-env|-e)
+            SYNC_ENV=1
+            shift
+            ;;
+        --help|-h)
+            # Print the leading comment block (line 2 → first non-comment line).
+            awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+            exit 0
+            ;;
+        *)
+            echo "deploy.sh: unknown argument: $1" >&2
+            echo "  try: $0 --help" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # Resolve repo root so the script can be invoked from anywhere.
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
@@ -130,7 +160,9 @@ rsync_cmd app/web/dist/ "${REMOTE}:${MAC_MINI_PATH}/app/web/dist/"
 # ----------------------------------------------------------------------
 # 5. Sync Mac-Mini-side infra configs. The remote .env is preserved
 #    deliberately — we never rsync the dev machine's .env over the
-#    Mini's populated one.
+#    Mini's populated one unless the operator passes --sync-env
+#    (handled separately in step 5b so the remote file gets backed up
+#    instead of silently overwritten).
 # ----------------------------------------------------------------------
 log "syncing Mac Mini infra configs"
 rsync_cmd \
@@ -139,6 +171,24 @@ rsync_cmd \
     --exclude='caddy/data/' \
     --exclude='caddy/config/' \
     mac-mini/ "${REMOTE}:${MAC_MINI_PATH}/"
+
+# ----------------------------------------------------------------------
+# 5b. Optional: push the dev machine's .env to the Mac Mini. Only runs
+#     when --sync-env / -e was passed. The remote file is copied to
+#     .env.bak-<UTC ts> first so the previous values are recoverable
+#     for one revert without a re-keying scramble.
+# ----------------------------------------------------------------------
+if [[ "$SYNC_ENV" == "1" ]]; then
+    if [[ ! -f .env ]]; then
+        echo "deploy.sh: --sync-env passed but no .env at repo root." >&2
+        echo "deploy.sh: copy .env.example to .env and populate it first." >&2
+        exit 2
+    fi
+    BACKUP_NAME=".env.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    log "syncing local .env → ${MAC_MINI_PATH}/.env (remote backed up to ${BACKUP_NAME})"
+    ssh_cmd "if [[ -f '${MAC_MINI_PATH}/.env' ]]; then cp -p '${MAC_MINI_PATH}/.env' '${MAC_MINI_PATH}/${BACKUP_NAME}'; fi"
+    rsync_cmd --chmod=F600 .env "${REMOTE}:${MAC_MINI_PATH}/.env"
+fi
 
 # ----------------------------------------------------------------------
 # 6. Stage Pi-Zero artifacts on the Mac Mini for the operator to scp
