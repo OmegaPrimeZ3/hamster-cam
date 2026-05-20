@@ -95,7 +95,11 @@ export async function buildServer(): Promise<AppServer> {
   app.post('/auth/password/forgot', forgotPassword);
   app.post('/auth/password/reset', resetPassword);
 
-  // REST: /health  (no auth — local-only; Caddy rate-limits the path)
+  // REST: /health is reachable on the LAN for docker healthchecks; Caddy
+  // returns 404 to external requests via an internal-IP allowlist (see the
+  // infra-engineer Stage 5 fix for Security-Review Finding 3). Kept
+  // unauthenticated here because docker healthchecks can't carry session
+  // cookies — the Caddy ACL is what keeps the path off the public internet.
   app.get('/health', async () => {
     const result = {
       ok: true,
