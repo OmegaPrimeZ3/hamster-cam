@@ -188,6 +188,54 @@ phases, ~4 hours spread across an evening or two. The TL;DR:
    clean URL with no port suffix.
 7. Open the URL on a tablet, run the onboarding wizard, done
 
+## Run locally for UI/UX review
+
+For poking the UI without provisioning Pis, Frigate, or a real Zyphr tenant.
+Two terminals from the repo root:
+
+```sh
+# Terminal 1 — backend with in-process Zyphr stub, auto-bootstrapped admin,
+# seed cameras + a day of diary entries.
+pnpm install
+pnpm -F server dev
+
+# Terminal 2 — Vite dev server, proxies tRPC/auth/snapshots/stream to the backend.
+pnpm -F web dev
+```
+
+Open <http://localhost:5173> and sign in:
+
+- **Email:** `dev@hamster.local`
+- **Password:** `hunterhunter`
+
+The Today feed lands populated with wheel / food / water / bathroom /
+transition / resting / exploring entries so every diary card variant
+renders on first load.
+
+State persists at `<repo>/.dev/` (SQLite + storage); `rm -rf .dev` resets
+to factory defaults.
+
+**Ports.** Backend defaults to **5273** (deliberately off the crowded 3000
+range so multiple Node projects can run in parallel); web defaults to
+**5173**. Both halves read shared env vars — change them together:
+
+```sh
+HC_BACKEND_PORT=5274 pnpm -F server dev
+HC_BACKEND_PORT=5274 pnpm -F web dev
+# Override the web port too if 5173 is taken:
+HC_WEB_PORT=5174 HC_BACKEND_PORT=5274 pnpm -F web dev
+```
+
+**Other overrides** (all optional): `HC_DEV_EMAIL`, `HC_DEV_PASSWORD`,
+`HC_DEV_DISPLAY_NAME`, `HC_DEV_PET_NAME`, `HC_DEV_SANDBOX`,
+`DATABASE_PATH`, `STORAGE_PATH`.
+
+**What's missing vs. production.** No MQTT (so no live diary updates from
+Frigate events), no real camera streams (the seeded cameras have placeholder
+RTSP URLs), no real Zyphr (the in-process stub accepts the seeded password
+only). For end-to-end auth/network testing against your real Zyphr tenant,
+use `pnpm -F server dev:raw` with your own `.env`.
+
 ## Tech stack
 
 - **Edge:** Raspberry Pi Zero 2 W + go2rtc (RTSP server, WebRTC handoff)

@@ -31,6 +31,9 @@ coverage/
 *.sqlite
 /storage/
 
+# Local dev sandbox produced by `pnpm -F server dev`
+/.dev/
+
 # OS noise
 .DS_Store
 Thumbs.db

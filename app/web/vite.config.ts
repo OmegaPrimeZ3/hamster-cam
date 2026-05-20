@@ -4,8 +4,11 @@
 //
 // - React + JSX runtime
 // - Path alias `@` → `src/`
-// - Dev proxy `/trpc` and `/auth` and `/snapshots` → http://localhost:3000 so
-//   `pnpm dev` works against a running backend.
+// - Dev proxy `/trpc` / `/auth` / `/snapshots` / `/stream` → the local
+//   backend so `pnpm dev` works against a running server. The backend port
+//   defaults to 5273 (deliberately off the crowded 3000 range so multiple
+//   projects can run in parallel) and is overridable via HC_BACKEND_PORT.
+//   The dev launcher in app/server/src/dev.ts reads the same env var.
 // - vite-plugin-pwa configured per PLAN §5.4 Workbox strategies:
 //     * app shell (JS / CSS / fonts / icons): cache-first, precached
 //     * /auth/* and /trpc/*: NetworkOnly (auth + live state never cached)
@@ -94,27 +97,17 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    port: Number.parseInt(process.env['HC_WEB_PORT'] ?? '5173', 10),
     host: true,
-    proxy: {
-      '/trpc': {
-        target: 'http://localhost:3000',
-        changeOrigin: false,
-      },
-      '/auth': {
-        target: 'http://localhost:3000',
-        changeOrigin: false,
-      },
-      '/snapshots': {
-        target: 'http://localhost:3000',
-        changeOrigin: false,
-      },
-      '/stream': {
-        target: 'http://localhost:3000',
-        changeOrigin: false,
-        ws: true,
-      },
-    },
+    proxy: (() => {
+      const backend = `http://localhost:${process.env['HC_BACKEND_PORT'] ?? '5273'}`;
+      return {
+        '/trpc':      { target: backend, changeOrigin: false },
+        '/auth':      { target: backend, changeOrigin: false },
+        '/snapshots': { target: backend, changeOrigin: false },
+        '/stream':    { target: backend, changeOrigin: false, ws: true },
+      };
+    })(),
   },
   build: {
     target: 'es2022',

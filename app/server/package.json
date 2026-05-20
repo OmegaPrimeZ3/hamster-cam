@@ -22,7 +22,8 @@
     "hamster": "dist/bootstrap.js"
   },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch src/dev.ts",
+    "dev:raw": "tsx watch src/index.ts",
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
