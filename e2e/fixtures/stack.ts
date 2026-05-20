@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
 
 import { createTestDb, type TestDbHandle, type SeedUserInput } from './db-factory.js';
+import { startFrigateMock, type FrigateMock, type FrigateMockCamera } from './frigate-mock.js';
 import { startZyphrMock, type ZyphrMock, type ZyphrUserSeed } from './msw-zyphr.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -40,6 +41,8 @@ export interface StackHandle {
   apiUrl: string;
   dbPath: string;
   zyphr: ZyphrMock;
+  /** Frigate mock — null when `frigate` not requested. */
+  frigate: FrigateMock | null;
   db: TestDbHandle;
   close: () => Promise<void>;
   /** Kill the backend mid-spec (used by the PWA offline-shell test). */
@@ -60,6 +63,12 @@ export interface StackOptions {
   noUsers?: boolean;
   /** LOG_LEVEL passed to the backend child process. Defaults to 'silent'. */
   logLevel?: string;
+  /**
+   * Start a mock Frigate server and point the backend at it.
+   * Pre-seed the list of cameras it advertises via `/api/config`. Specs can
+   * also adjust the list at runtime via `stack.frigate.setCameras([...])`.
+   */
+  frigate?: FrigateMockCamera[];
 }
 
 interface BackendHandle {
@@ -130,11 +139,21 @@ export async function startStack(opts: StackOptions = {}): Promise<StackHandle> 
   }
   const zyphr = await startZyphrMock({ users: zyphrUsers });
 
+  // 2b) Optional Frigate mock — only started when the spec asks for it, since
+  // most flows degrade gracefully when FRIGATE_URL is unset.
+  let frigate: FrigateMock | null = null;
+  let frigateBaseUrl: string | undefined;
+  if (opts.frigate !== undefined) {
+    frigate = await startFrigateMock(opts.frigate);
+    frigateBaseUrl = frigate.baseUrl;
+  }
+
   // 3) Backend child process.
   const backend = await startBackendChild({
     dbPath: db.path,
     storagePath: dirname(db.path),
     zyphrBaseUrl: zyphr.baseUrl,
+    frigateBaseUrl,
     logLevel: opts.logLevel ?? 'silent',
   });
 
@@ -150,11 +169,13 @@ export async function startStack(opts: StackOptions = {}): Promise<StackHandle> 
     apiUrl: `http://127.0.0.1:${backend.port}`,
     dbPath: db.path,
     zyphr,
+    frigate,
     db,
     close: async () => {
       await front.close();
       await backend.close();
       await zyphr.close();
+      if (frigate) await frigate.close();
       await db.cleanup();
     },
     killBackend: async () => {
@@ -165,12 +186,9 @@ export async function startStack(opts: StackOptions = {}): Promise<StackHandle> 
         dbPath: db.path,
         storagePath: dirname(db.path),
         zyphrBaseUrl: zyphr.baseUrl,
+        frigateBaseUrl,
         logLevel: opts.logLevel ?? 'silent',
       });
-      // Mutate the closure's `backend` so the proxy starts hitting the new
-      // port. We can't reassign the outer const, but `restartBackend` is only
-      // used by the PWA spec which probes via fetch() after restart — it does
-      // not depend on the proxy picking up the new port immediately.
       backend.port = restarted.port;
       backend.child = restarted.child;
       backend.close = restarted.close;
@@ -182,6 +200,7 @@ interface BackendChildOpts {
   dbPath: string;
   storagePath: string;
   zyphrBaseUrl: string;
+  frigateBaseUrl: string | undefined;
   logLevel: string;
 }
 
@@ -200,6 +219,7 @@ async function startBackendChild(opts: BackendChildOpts): Promise<BackendHandle>
     NODE_ENV: 'test',
     LOG_LEVEL: opts.logLevel,
     PORT: '0',
+    ...(opts.frigateBaseUrl ? { FRIGATE_URL: opts.frigateBaseUrl } : {}),
   };
 
   const child = spawn(TSX_BIN, [SERVER_BOOT_HELPER], {
