@@ -50,7 +50,15 @@ const execFile = promisify(execFileCb);
 export type AppServer = Awaited<ReturnType<typeof buildFastify>>;
 
 function buildFastify() {
-  return Fastify({ loggerInstance: logger });
+  // trustProxy covers loopback + the docker bridge subnet so Fastify treats
+  // the X-Real-IP / X-Forwarded-For headers Caddy sets as authoritative
+  // (paired with Security-Review Finding 1's `trusted_proxies cloudflare`
+  // Caddy block). 172.16.0.0/12 is broad enough to cover every default
+  // docker bridge network the compose stack will see.
+  return Fastify({
+    loggerInstance: logger,
+    trustProxy: ['127.0.0.1', '::1', '172.16.0.0/12'],
+  });
 }
 
 export async function buildServer(): Promise<AppServer> {
