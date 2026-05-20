@@ -98,6 +98,7 @@ variable shows up here it shows up there and vice versa.
 |---|---|---|
 | `ZYPHR_API_KEY` | Authenticates the backend against Zyphr's API | Format: `zy_live_…`. Auth endpoints are open at Zyphr; key is still passed by the SDK. |
 | `ZYPHR_BASE_URL` | Override the Zyphr API host | *Optional.* Defaults to `https://api.zyphr.dev/v1`. |
+| `ZYPHR_FROM_EMAIL` | Sender address for Zyphr-delivered emails | Used by Send-a-Clip and disk-critical alerts. Must be a domain verified in your Zyphr dashboard. |
 | `CLOUDFLARE_API_TOKEN` | Updates the A record on IP change + issues Let's Encrypt certs via DNS-01 | Scoped: `Zone : DNS : Edit` on one zone only. |
 | `CLOUDFLARE_ZONE` | Your apex domain at Cloudflare | e.g. `remy-hamster.com`. |
 | `CLOUDFLARE_SUBDOMAIN` | The subdomain the cam runs at | e.g. `cam` → `cam.remy-hamster.com`. |
