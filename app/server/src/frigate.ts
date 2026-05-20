@@ -138,8 +138,9 @@ export async function getCameraStats(cameraName: string): Promise<CameraStats> {
 // testStream — quick reachability check before saving a camera URL
 // ---------------------------------------------------------------------------
 
-// Override hook so unit tests can stub DNS lookup without monkey-patching the
-// global dns module. Production keeps the real `node:dns/promises` `lookup`.
+// Override hook so unit tests can inject a fake DNS lookup without
+// monkey-patching the global dns module. Production keeps the real
+// `node:dns/promises` `lookup` via the default `lookup` arg.
 export interface TestStreamDeps {
   /** Resolves a hostname to an IP. Default: `dns.lookup`. */
   lookup?: (hostname: string) => Promise<{ address: string; family: 4 | 6 }>;
