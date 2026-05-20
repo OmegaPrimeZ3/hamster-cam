@@ -99,12 +99,31 @@
 		}
 	}
 
-	# Reverse-proxy to the host-side Fastify app. The compose service
-	# injects `host.docker.internal:host-gateway` so this resolves on
-	# Linux as well as macOS Docker Desktop. Caddy already forwards
-	# X-Forwarded-For / X-Forwarded-Proto / Host by default; we override
-	# X-Real-IP with {client_ip} so Fastify sees the real visitor
-	# (resolved via trusted_proxies cloudflare above).
+	# /health is unauthenticated by design (Fastify docker healthcheck
+	# uses it). Restrict at the edge so the disk_free_pct side channel
+	# isn't exposed to the public internet. Loopback + RFC1918 ranges
+	# cover docker-internal healthchecks and any LAN-side probe; every
+	# other source — including Cloudflare-proxied traffic, since
+	# {client_ip} now reflects the real visitor — gets a 404. The
+	# `respond @internal_only` must come BEFORE the catch-all
+	# reverse_proxy so Caddy matches it first in directive order.
+	@internal_only {
+		path /health
+		not remote_ip 127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+	}
+	respond @internal_only 404
+
+	@health {
+		path /health
+	}
+	reverse_proxy @health host.docker.internal:3000
+
+	# Reverse-proxy everything else to the host-side Fastify app. The
+	# compose service injects `host.docker.internal:host-gateway` so
+	# this resolves on Linux as well as macOS Docker Desktop. Caddy
+	# already forwards X-Forwarded-For / X-Forwarded-Proto / Host by
+	# default; we override X-Real-IP with {client_ip} so Fastify sees
+	# the real visitor (resolved via trusted_proxies cloudflare above).
 	reverse_proxy host.docker.internal:3000 {
 		header_up X-Real-IP {client_ip}
 	}
