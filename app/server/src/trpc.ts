@@ -236,7 +236,7 @@ export type CameraDTO = z.infer<typeof cameraSchema>;
 
 const diaryKindSchema = z.enum(['narrative', 'snapshot', 'timelapse']);
 const diaryActivitySchema = z.enum([
-  'wheel', 'food', 'water', 'bathroom', 'resting', 'exploring', 'hiding',
+  'wheel', 'food', 'water', 'bathroom', 'resting', 'tunnel', 'exploring', 'hiding',
   'transition', 'snapshot', 'timelapse',
 ]);
 

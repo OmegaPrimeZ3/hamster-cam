@@ -10,6 +10,7 @@ export type NarrativeKey =
   | 'water'
   | 'bathroom'
   | 'resting'
+  | 'tunnel'
   | 'exploring'
   | 'hiding'
   | 'snapshot'
@@ -44,6 +45,11 @@ export const narratives: Readonly<Record<NarrativeKey, readonly string[]>> = Obj
   resting: [
     '💤 {pet} is napping — shhh!',
     '😴 Cozy snooze time for {pet}.',
+  ],
+  tunnel: [
+    '🕳️ {pet} disappeared into the tunnel!',
+    '🌀 Tunnel time! {pet} is on a mission.',
+    '🚇 {pet} took the underground route — {duration}.',
   ],
   exploring: [
     '🔍 {pet} is exploring the cage!',

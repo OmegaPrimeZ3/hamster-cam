@@ -70,6 +70,7 @@ export type DiaryActivity =
   | 'water'
   | 'bathroom'
   | 'resting'
+  | 'tunnel'
   | 'exploring'
   | 'hiding'
   | 'transition'

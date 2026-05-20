@@ -11,6 +11,25 @@ import { AddCameraForm } from './AddCameraForm';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 
+// Reference list shown to operators in the Cameras tab so they know which
+// Frigate zone names map to which activity. Keep in sync with `matchKeyword`
+// in app/server/src/narrator.ts.
+const SUPPORTED_ZONES: ReadonlyArray<{
+  activity: string;
+  emoji: string;
+  primary: string;
+  aliases: readonly string[];
+  description: string;
+}> = [
+  { activity: 'wheel',    emoji: '🎡', primary: 'wheel',    aliases: [],                              description: 'Running wheel' },
+  { activity: 'food',     emoji: '🥕', primary: 'food',     aliases: ['bowl', 'feed'],                description: 'Food bowl / feeding area' },
+  { activity: 'water',    emoji: '💧', primary: 'water',    aliases: ['drink'],                       description: 'Water bottle / drinking spot' },
+  { activity: 'bathroom', emoji: '🚽', primary: 'bathroom', aliases: ['potty', 'litter', 'toilet'],   description: 'Potty corner' },
+  { activity: 'resting',  emoji: '💤', primary: 'bed',      aliases: ['nest', 'sleep', 'rest'],       description: 'Sleeping nest' },
+  { activity: 'tunnel',   emoji: '🕳️', primary: 'tunnel',   aliases: ['tube', 'pipe'],                description: 'Tube / pipe enrichment' },
+  { activity: 'hiding',   emoji: '🙈', primary: 'hide',     aliases: ['cave', 'burrow'],              description: 'Hideout / burrow' },
+];
+
 export function CameraSettings(): JSX.Element {
   const utils = trpc.useUtils();
   const cameras = trpc.cameras.list.useQuery();
@@ -137,6 +156,44 @@ export function CameraSettings(): JSX.Element {
           </li>
         ))}
       </ul>
+
+      <section className="hc-card" style={{ padding: 12, marginTop: 8 }}>
+        <h4 className="display" style={{ margin: '0 0 4px' }}>Supported zones</h4>
+        <p style={{ margin: '0 0 10px', color: 'var(--text-muted)', fontSize: 13 }}>
+          Name your Frigate zones with one of the keywords below — the narrator
+          will classify motion in that zone as the matching activity. Unmatched
+          zones fall through to <strong>exploring</strong>.
+        </p>
+        <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {SUPPORTED_ZONES.map((z) => (
+            <li
+              key={z.activity}
+              style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0' }}
+            >
+              <span aria-hidden style={{ fontSize: 20, width: 24, textAlign: 'center' }}>{z.emoji}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap' }}>
+                  <code style={{
+                    fontWeight: 600,
+                    background: 'var(--surface-2, rgba(0,0,0,0.06))',
+                    padding: '1px 6px',
+                    borderRadius: 4,
+                  }}>{z.primary}</code>
+                  <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                    → {z.activity}
+                  </span>
+                </div>
+                <small style={{ color: 'var(--text-muted)', display: 'block' }}>
+                  {z.description}
+                  {z.aliases.length > 0 && (
+                    <> · also matches: {z.aliases.map((a) => <code key={a} style={{ marginRight: 4 }}>{a}</code>)}</>
+                  )}
+                </small>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
     </div>
   );
 }

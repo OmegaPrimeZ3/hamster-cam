@@ -76,12 +76,16 @@ export interface FrigateEvent {
 
 type Activity =
   | 'wheel' | 'food' | 'water' | 'bathroom' | 'resting'
-  | 'exploring' | 'hiding';
+  | 'tunnel' | 'exploring' | 'hiding';
 
 /**
  * Heuristic: prefer zone name when present (e.g. `wheel`, `food`, `water`,
  * `bed`/`nest` → resting); fall back to keywords in the camera name. Unknown
  * → 'exploring' so we still emit a friendly entry.
+ *
+ * The keyword list here is the source of truth for the "Supported zones"
+ * reference shown in Settings → Cameras (app/web/src/components/CameraSettings.tsx)
+ * — keep them in sync.
  */
 function classifyActivity(side: FrigateEventPayloadSide): Activity {
   const zones = side.current_zones ?? [];
@@ -100,6 +104,7 @@ function matchKeyword(value: string): Activity | null {
   if (v.includes('water') || v.includes('drink')) return 'water';
   if (v.includes('bathroom') || v.includes('potty') || v.includes('litter') || v.includes('toilet')) return 'bathroom';
   if (v.includes('bed') || v.includes('nest') || v.includes('sleep') || v.includes('rest')) return 'resting';
+  if (v.includes('tunnel') || v.includes('tube') || v.includes('pipe')) return 'tunnel';
   if (v.includes('hide') || v.includes('cave') || v.includes('burrow')) return 'hiding';
   return null;
 }

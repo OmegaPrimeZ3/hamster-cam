@@ -5,8 +5,18 @@
 # — keep secrets out of here and in /opt/hamster-cam/.env.
 #
 # See docs/PLAN.md §4 and docs/SETUP_MAC_MINI.md step 8 for the bring-up
-# procedure (zone editor, model swap, etc.). Zone NAMES below
-# (`wheel`, `food`, `water`) MUST match app/server/src/narratives.ts.
+# procedure (zone editor, model swap, etc.).
+#
+# Zone NAMES below must match the narrator's keyword matcher in
+# app/server/src/narrator.ts (`matchKeyword`). Supported zone keywords:
+#   wheel    — wheel/running activity
+#   food     — food bowl / feeding area (also: bowl, feed)
+#   water    — water bottle / drinking spot (also: drink)
+#   bathroom — potty corner (also: potty, litter, toilet)
+#   bed      — sleeping area → 'resting' (also: nest, sleep, rest)
+#   tunnel   — tube/pipe enrichment (also: tube, pipe)
+#   hide     — hideout / burrow → 'hiding' (also: cave, burrow)
+# Any zone name not matching the above falls through to 'exploring'.
 
 mqtt:
   enabled: true
@@ -107,13 +117,19 @@ cameras:
           min_score: 0.30
     zones:
       wheel:
-        coordinates: 0.05,0.10,0.45,0.10,0.45,0.55,0.05,0.55
+        coordinates: 0.02,0.05,0.48,0.05,0.48,0.35,0.02,0.35
       food:
-        coordinates: 0.55,0.10,0.95,0.10,0.95,0.55,0.55,0.55
+        coordinates: 0.52,0.05,0.98,0.05,0.98,0.35,0.52,0.35
       water:
-        coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
+        coordinates: 0.02,0.40,0.48,0.40,0.48,0.65,0.02,0.65
       bathroom:
-        coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
+        coordinates: 0.52,0.40,0.98,0.40,0.98,0.65,0.52,0.65
+      bed:
+        coordinates: 0.02,0.70,0.34,0.70,0.34,0.98,0.02,0.98
+      tunnel:
+        coordinates: 0.35,0.70,0.65,0.70,0.65,0.98,0.35,0.98
+      hide:
+        coordinates: 0.66,0.70,0.98,0.70,0.98,0.98,0.66,0.98
 
   hamster_cam_2:
     ffmpeg:
@@ -137,13 +153,19 @@ cameras:
           min_score: 0.30
     zones:
       wheel:
-        coordinates: 0.05,0.10,0.45,0.10,0.45,0.55,0.05,0.55
+        coordinates: 0.02,0.05,0.48,0.05,0.48,0.35,0.02,0.35
       food:
-        coordinates: 0.55,0.10,0.95,0.10,0.95,0.55,0.55,0.55
+        coordinates: 0.52,0.05,0.98,0.05,0.98,0.35,0.52,0.35
       water:
-        coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
+        coordinates: 0.02,0.40,0.48,0.40,0.48,0.65,0.02,0.65
       bathroom:
-        coordinates: 0.30,0.60,0.70,0.60,0.70,0.95,0.30,0.95
+        coordinates: 0.52,0.40,0.98,0.40,0.98,0.65,0.52,0.65
+      bed:
+        coordinates: 0.02,0.70,0.34,0.70,0.34,0.98,0.02,0.98
+      tunnel:
+        coordinates: 0.35,0.70,0.65,0.70,0.65,0.98,0.35,0.98
+      hide:
+        coordinates: 0.66,0.70,0.98,0.70,0.98,0.98,0.66,0.98
 
 go2rtc:
   streams:
