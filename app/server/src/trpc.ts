@@ -792,6 +792,15 @@ const usersRouter = router({
       ctx.audit['before'] = db.toPublicUser(target);
       const row = db.updateUser(input);
       if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
+      // Defense-in-depth (Security-Review out-of-band recommendation): when
+      // role changes, kill any active sessions for the affected user so a
+      // promoted child / demoted admin doesn't keep the old in-memory role
+      // until session expiry. requireAdmin re-checks role per-request via
+      // db.getUserById, but rotation closes the window where an existing
+      // session object's cached `user.role` would be stale.
+      if (target.role !== row.role) {
+        db.deleteSessionsForUser(row.id);
+      }
       return db.toPublicUser(row);
     }),
 

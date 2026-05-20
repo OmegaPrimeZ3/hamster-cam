@@ -149,6 +149,74 @@ describe('users.delete', () => {
   });
 });
 
+describe('users.update session rotation', () => {
+  it('invalidates the affected user sessions when role changes', async () => {
+    const { appRouter } = await import('../src/trpc.js');
+    const db = await import('../src/db.js');
+    const ctx = await makeAdminCtx();
+    // Provision a second admin so the demote check doesn't fire when we
+    // promote a child below — well, this test promotes child->admin, but
+    // the second admin is harmless either way.
+    db.createUser({
+      zyphr_user_id: 'zy_second_admin',
+      email: 'second@example.com',
+      display_name: 'Second',
+      role: 'admin',
+      created_by: ctx.user.id,
+    });
+    const child = db.createUser({
+      zyphr_user_id: 'zy_child_rotate',
+      email: 'rotate@example.com',
+      display_name: 'Rotate Me',
+      role: 'child',
+      created_by: ctx.user.id,
+    });
+    db.createSession({
+      id: 'sess_to_rotate_0123',
+      user_id: child.id,
+      zyphr_refresh_token: null,
+      user_agent: 'tablet',
+      ttl_ms: 30 * 24 * 60 * 60 * 1000,
+    });
+    expect(db.getValidSession('sess_to_rotate_0123')).not.toBeNull();
+
+    const caller = appRouter.createCaller(ctx);
+    await caller.users.update({
+      id: child.id,
+      display_name: 'Rotate Me',
+      role: 'admin',
+    });
+    expect(db.getValidSession('sess_to_rotate_0123')).toBeNull();
+  });
+
+  it('retains sessions when role is unchanged (only display_name edited)', async () => {
+    const { appRouter } = await import('../src/trpc.js');
+    const db = await import('../src/db.js');
+    const ctx = await makeAdminCtx();
+    const child = db.createUser({
+      zyphr_user_id: 'zy_child_keep',
+      email: 'keep@example.com',
+      display_name: 'Old',
+      role: 'child',
+      created_by: ctx.user.id,
+    });
+    db.createSession({
+      id: 'sess_to_keep_4567',
+      user_id: child.id,
+      zyphr_refresh_token: null,
+      user_agent: 'tablet',
+      ttl_ms: 30 * 24 * 60 * 60 * 1000,
+    });
+    const caller = appRouter.createCaller(ctx);
+    await caller.users.update({
+      id: child.id,
+      display_name: 'New',
+      role: 'child',
+    });
+    expect(db.getValidSession('sess_to_keep_4567')).not.toBeNull();
+  });
+});
+
 describe('users.resetPassword', () => {
   it('triggers Zyphr forgot-password and audit-logs', async () => {
     let zyphrCalled = false;
