@@ -14,6 +14,7 @@
 // rendered above it (via the `emoji` prop) so families with non-hamster pets
 // still recognize themselves.
 
+import { useEffect, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 
 export type MascotPose = 'idle' | 'running' | 'eating' | 'sleeping' | 'peeking' | 'waving';
@@ -23,13 +24,42 @@ export interface MascotProps {
   pose?: MascotPose;
   size?: number;
   ariaLabel?: string;
+  /**
+   * When true, play a one-shot wave animation on first mount (~1.2 s) before
+   * settling into `pose`. Skipped entirely under prefers-reduced-motion.
+   * Defaults to false so existing callers keep their current behaviour.
+   */
+  waveOnMount?: boolean;
 }
 
-export function Mascot({ emoji = '🐹', pose = 'idle', size = 48, ariaLabel }: MascotProps): JSX.Element {
+const WAVE_DURATION_MS = 1200;
+
+export function Mascot({
+  emoji = '🐹',
+  pose = 'idle',
+  size = 48,
+  ariaLabel,
+  waveOnMount = false,
+}: MascotProps): JSX.Element {
   const reduced = useReducedMotion();
   const label = ariaLabel ?? `${pose === 'sleeping' ? 'Sleeping' : 'Awake'} pet mascot`;
 
-  const animProps = reduced ? {} : poseAnimation(pose);
+  // Skip the wave entirely under reduced-motion, or if the caller didn't ask
+  // for one. `hasWaved` initialises to true in those cases so the regular
+  // pose animation takes over from the first paint.
+  const [hasWaved, setHasWaved] = useState<boolean>(() => !(waveOnMount && !reduced));
+
+  useEffect(() => {
+    if (hasWaved) return undefined;
+    const id = window.setTimeout(() => setHasWaved(true), WAVE_DURATION_MS);
+    return () => window.clearTimeout(id);
+  }, [hasWaved]);
+
+  const animProps = reduced
+    ? {}
+    : hasWaved
+      ? poseAnimation(pose)
+      : waveOnceAnimation();
 
   return (
     <motion.div
@@ -50,6 +80,16 @@ export function Mascot({ emoji = '🐹', pose = 'idle', size = 48, ariaLabel }: 
       <span aria-hidden>{pose === 'sleeping' ? '💤' : emoji}</span>
     </motion.div>
   );
+}
+
+function waveOnceAnimation() {
+  // One-shot, non-repeating wave. No `repeat: Infinity` — runs the keyframe
+  // sequence once, then the effect flips `hasWaved` and the pose animation
+  // takes over on the next render.
+  return {
+    animate: { rotate: [0, 14, -8, 14, -4, 0] },
+    transition: { duration: WAVE_DURATION_MS / 1000, ease: 'easeInOut' as const },
+  };
 }
 
 function poseAnimation(pose: MascotPose) {

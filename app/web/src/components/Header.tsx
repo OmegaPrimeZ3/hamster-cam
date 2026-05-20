@@ -16,6 +16,7 @@ import { RoleGuard } from './RoleGuard';
 import { useAuth } from '../hooks/useAuth';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
+type DiaryEntryDTO = RouterOutputs['activity']['today'][number];
 
 export interface HeaderProps {
   onOpenSettings: () => void;
@@ -24,7 +25,7 @@ export interface HeaderProps {
   activityHint?: MascotPose;
 }
 
-export function Header({ onOpenSettings, onOpenChangePassword, activityHint = 'idle' }: HeaderProps): JSX.Element {
+export function Header({ onOpenSettings, onOpenChangePassword, activityHint }: HeaderProps): JSX.Element {
   const { user } = useAuth();
   const settings = trpc.settings.get.useQuery(undefined, {
     enabled: !!user,
@@ -33,6 +34,10 @@ export function Header({ onOpenSettings, onOpenChangePassword, activityHint = 'i
   const cameras = trpc.cameras.list.useQuery(undefined, {
     enabled: !!user,
     refetchInterval: 15_000,
+  });
+  const activity = trpc.activity.today.useQuery(undefined, {
+    enabled: !!user,
+    refetchInterval: 60_000,
   });
   const [statusOpen, setStatusOpen] = useState(false);
 
@@ -43,6 +48,15 @@ export function Header({ onOpenSettings, onOpenChangePassword, activityHint = 'i
     () => computeStatus(cameras.data ?? []),
     [cameras.data],
   );
+
+  // Prefer an explicit caller-provided hint; otherwise derive from the most
+  // recent entry returned by activity.today. Falls back to 'idle' when nothing
+  // is known yet.
+  const derivedPose: MascotPose = useMemo(
+    () => deriveMascotPose(activity.data),
+    [activity.data],
+  );
+  const pose: MascotPose = activityHint ?? derivedPose;
 
   return (
     <header
@@ -71,7 +85,7 @@ export function Header({ onOpenSettings, onOpenChangePassword, activityHint = 'i
         </h1>
 
         <div aria-hidden style={{ display: 'inline-flex', marginLeft: 4 }}>
-          <Mascot emoji={petEmoji} pose={activityHint} size={28} ariaLabel="Pet mascot" />
+          <Mascot emoji={petEmoji} pose={pose} size={44} waveOnMount ariaLabel="Pet mascot" />
         </div>
 
         <div style={{ flex: 1 }} />
@@ -150,6 +164,28 @@ interface CameraStatusEntry {
   emoji: string;
   severity: Severity;
   label: string;
+}
+
+function deriveMascotPose(entries: DiaryEntryDTO[] | undefined): MascotPose {
+  if (!entries || entries.length === 0) return 'idle';
+  // activity.today is returned in insertion order; the latest entry has the
+  // highest occurred_at. Don't assume ordering — pick the max defensively.
+  let latest: DiaryEntryDTO | undefined;
+  for (const e of entries) {
+    if (!latest || e.occurred_at > latest.occurred_at) latest = e;
+  }
+  switch (latest?.activity) {
+    case 'wheel':
+      return 'running';
+    case 'food':
+      return 'eating';
+    case 'resting':
+      return 'sleeping';
+    case 'hiding':
+      return 'peeking';
+    default:
+      return 'idle';
+  }
 }
 
 function computeStatus(cameras: CameraDTO[]): {

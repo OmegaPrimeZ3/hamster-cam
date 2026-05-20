@@ -132,7 +132,7 @@ img, video, svg { max-width: 100%; display: block; }
 }
 
 .hc-btn:hover { transform: translateY(-1px); }
-.hc-btn:active { transform: translateY(0); }
+.hc-btn:active { transform: scale(0.97); }
 
 .hc-btn-primary {
   background: var(--accent);

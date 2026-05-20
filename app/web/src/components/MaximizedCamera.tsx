@@ -10,6 +10,8 @@
 //   - Auto-rotate every 10s when enabled in settings
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
+import confetti from 'canvas-confetti';
 import { Camera, PictureInPicture2, Maximize, X } from 'lucide-react';
 import type { RouterOutputs } from '../trpc';
 import { trpc } from '../trpc';
@@ -42,15 +44,34 @@ export function MaximizedCamera({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [snapMessage, setSnapMessage] = useState<string | null>(null);
+  const [snapKind, setSnapKind] = useState<'success' | 'error'>('success');
+  const reducedMotion = useReducedMotion();
 
   const utils = trpc.useUtils();
   const snapshotMut = trpc.activity.snapshot.useMutation({
     onSuccess: async () => {
+      const reduced =
+        typeof window !== 'undefined' &&
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (!reduced) {
+        try {
+          confetti({
+            particleCount: 18,
+            spread: 55,
+            origin: { y: 0.55 },
+            scalar: 0.7,
+          });
+        } catch {
+          /* canvas-confetti can throw if a renderer isn't available; harmless */
+        }
+      }
+      setSnapKind('success');
       setSnapMessage('Saved!');
       window.setTimeout(() => setSnapMessage(null), 1800);
       await utils.activity.today.invalidate();
     },
     onError: (err) => {
+      setSnapKind('error');
       setSnapMessage(`Could not save: ${err.message}`);
       window.setTimeout(() => setSnapMessage(null), 2400);
     },
@@ -207,25 +228,71 @@ export function MaximizedCamera({
           <Camera aria-hidden size={22} /> {snapshotMut.isLoading ? 'Saving…' : 'Take a photo!'}
         </button>
 
-        {snapMessage && (
-          <div
-            role="status"
-            aria-live="polite"
-            style={{
-              position: 'absolute',
-              left: '50%',
-              transform: 'translateX(-50%)',
-              bottom: 160,
-              background: 'rgba(0,0,0,0.6)',
-              color: '#fff',
-              padding: '8px 14px',
-              borderRadius: 10,
-              fontWeight: 500,
-            }}
-          >
-            {snapMessage}
-          </div>
-        )}
+        <AnimatePresence>
+          {snapMessage && snapKind === 'success' && (
+            <motion.div
+              key="snap-sticker"
+              role="status"
+              aria-live="polite"
+              initial={
+                reducedMotion
+                  ? { opacity: 0 }
+                  : { rotate: -10, scale: 0.6, opacity: 0 }
+              }
+              animate={
+                reducedMotion
+                  ? { opacity: 1 }
+                  : {
+                      rotate: [-10, 6, -3, 0],
+                      scale: [0.6, 1.1, 0.95, 1],
+                      opacity: 1,
+                    }
+              }
+              exit={{ opacity: 0, scale: 0.9 }}
+              transition={{ duration: reducedMotion ? 0.15 : 0.5 }}
+              style={{
+                position: 'absolute',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                bottom: 160,
+                background: 'var(--success)',
+                color: '#fff',
+                padding: '10px 16px',
+                borderRadius: 14,
+                fontWeight: 700,
+                fontSize: 18,
+                boxShadow: '0 12px 28px rgba(0,0,0,0.22)',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {`📸 ${snapMessage}`}
+            </motion.div>
+          )}
+          {snapMessage && snapKind === 'error' && (
+            <motion.div
+              key="snap-error"
+              role="status"
+              aria-live="polite"
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.18 }}
+              style={{
+                position: 'absolute',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                bottom: 160,
+                background: 'rgba(0,0,0,0.6)',
+                color: '#fff',
+                padding: '8px 14px',
+                borderRadius: 10,
+                fontWeight: 500,
+              }}
+            >
+              {snapMessage}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <div
           style={{
