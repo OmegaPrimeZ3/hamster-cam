@@ -1,0 +1,29 @@
+{
+  "name": "@hamster-cam/e2e",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Playwright acceptance suite for hamster-cam. Stands up backend + frontend + msw-mocked Zyphr, runs the PLAN §5.4 acceptance bullets in real browsers.",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "e2e": "playwright test",
+    "e2e:debug": "PWDEBUG=1 playwright test",
+    "e2e:install": "playwright install --with-deps",
+    "e2e:headed": "playwright test --headed",
+    "e2e:report": "playwright show-report"
+  },
+  "dependencies": {
+    "@hamster-cam/server": "workspace:*",
+    "@hamster-cam/web": "workspace:*",
+    "@playwright/test": "1.48.0",
+    "better-sqlite3": "11.3.0",
+    "msw": "2.4.9",
+    "tsx": "4.19.1"
+  },
+  "devDependencies": {
+    "@types/node": "20.16.10",
+    "typescript": "5.6.2"
+  }
+}

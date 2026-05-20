@@ -1,6 +1,7 @@
 packages:
   - "app/server"
   - "app/web"
+  - "e2e"
 allowBuilds:
   better-sqlite3: set this to true or false
   esbuild: set this to true or false
