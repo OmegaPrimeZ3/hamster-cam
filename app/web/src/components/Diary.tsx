@@ -95,7 +95,8 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
         <p style={{ color: 'var(--text-muted)' }}>Nothing happened yet today — check back soon!</p>
       )}
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {/* gap accommodates the badge that overhangs each card's top-left corner */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
         {sortEntries(today.data ?? []).map((entry) => (
           <DiaryEntry
             key={entry.id}

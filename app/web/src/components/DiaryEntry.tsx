@@ -47,6 +47,15 @@ function rotationForId(id: number): number {
   return frac * 2 - 1; // [-1, 1] degrees
 }
 
+// Narrative templates start with an emoji (e.g. "🥕 {pet} had a snack!"); the
+// circle badge already shows that glyph, so strip it from the visible header
+// to avoid the double-icon. Handles VS16 (U+FE0F) / ZWJ (U+200D) joiners
+// used by composed emoji like 🕳️ and 🗺️.
+const LEADING_EMOJI = /^\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic})*\s*/u;
+function stripLeadingEmoji(text: string): string {
+  return text.replace(LEADING_EMOJI, '');
+}
+
 export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' }: DiaryEntryProps): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -109,23 +118,27 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
         paddingLeft: 20,
       }}
     >
-      {/* Activity badge — top-right, soft circle in the accent at low alpha. */}
+      {/* Activity badge — perched on the top-left corner, overhanging the
+          card slightly so it reads as a pinned sticker. The Diary list
+          adds vertical gap to clear the overhang. */}
       <div
         aria-hidden
         style={{
           position: 'absolute',
-          top: 10,
-          right: 10,
-          width: 32,
-          height: 32,
+          top: -10,
+          left: -18,
+          width: 36,
+          height: 36,
           borderRadius: '50%',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
           fontSize: 18,
           lineHeight: 1,
-          background: `color-mix(in srgb, ${style.accent} 18%, transparent)`,
-          boxShadow: `inset 0 0 0 1px color-mix(in srgb, ${style.accent} 35%, transparent)`,
+          background: `color-mix(in srgb, ${style.accent} 22%, var(--surface))`,
+          boxShadow:
+            `inset 0 0 0 1.5px color-mix(in srgb, ${style.accent} 45%, transparent),` +
+            ` 0 2px 6px rgba(0, 0, 0, 0.12)`,
           pointerEvents: 'none',
         }}
       >
@@ -147,7 +160,6 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
           flexDirection: 'column',
           gap: 6,
           minWidth: 0,
-          paddingRight: 40,
         }}
       >
         <p
@@ -159,7 +171,7 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
             fontWeight: isRecap ? 600 : 400,
           }}
         >
-          {entry.narrative}
+          {stripLeadingEmoji(entry.narrative)}
         </p>
         {/* Dashed "notebook line" separator above the timestamp / share row. */}
         <div
