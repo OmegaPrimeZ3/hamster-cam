@@ -286,57 +286,44 @@ without this step Frigate starts cleanly but shows no video, because
 ffmpeg inside the container can't resolve the camera hostnames. The Pis
 are fine; the name lookup is what fails.
 
-The fix is host-side: have `systemd-resolved` (already running on
-Ubuntu 24.04) answer mDNS, then point the Docker daemon at it so the
-embedded resolver forwards `.local` lookups there. This keeps Docker's
-own service discovery (e.g. `mosquitto`) working — do **not** override a
-container's `dns:` directly, which would break it.
+The simplest, most robust fix is a static map: give each Pi a fixed IP
+and tell the Frigate container how to reach the `.local` names directly.
+No host daemons, survives reboots.
 
-1. Enable mDNS in `/etc/systemd/resolved.conf` and add a stub listener
-   the containers can reach (the `docker0` bridge IP, normally
-   `172.17.0.1` — confirm with `ip -4 addr show docker0`):
-
-   ```ini
-   [Resolve]
-   MulticastDNS=yes
-   DNSStubListenerExtra=172.17.0.1
-   ```
-
-2. Turn on mDNS for your LAN interface and restart resolved
-   (`<iface>` is your wired NIC from `ip -br link`, e.g. `enp0s31f6`):
+1. **Reserve a static IP for each Pi** in your router's DHCP settings
+   (bind to the Pi's MAC address). This keeps the IP from drifting.
+   Find each Pi's current IP and MAC from the router's client list, or
+   on the Mac Mini host (which *can* resolve mDNS):
 
    ```sh
-   sudo resolvectl mdns <iface> yes
-   sudo systemctl restart systemd-resolved
-   resolvectl query hamster-cam-1.local      # host resolves it
+   getent hosts hamster-cam-1.local
+   getent hosts hamster-cam-2.local
    ```
 
-3. Point the Docker daemon's upstream resolver at that listener in
-   `/etc/docker/daemon.json`:
+2. **Map the names to those IPs** in the `frigate` service of
+   `docker-compose.yml` — replace the placeholders:
 
-   ```json
-   { "dns": ["172.17.0.1"] }
+   ```yaml
+   extra_hosts:
+     - "hamster-cam-1.local:192.168.1.51"   # ← your reserved IPs
+     - "hamster-cam-2.local:192.168.1.52"
    ```
+
+3. Recreate the container so the mapping takes effect (a plain
+   `restart` will NOT pick up `extra_hosts` — it must be recreated):
 
    ```sh
-   sudo systemctl restart docker
+   cd /opt/hamster-cam
+   docker compose --env-file .env -f docker-compose.yml up -d frigate
+   docker exec hamster-frigate getent hosts hamster-cam-1.local   # prints the IP
    ```
 
-4. Verify a container can now resolve a camera (do this after 8.3 once
-   Frigate is up, or with any throwaway container):
-
-   ```sh
-   docker exec hamster-frigate getent hosts hamster-cam-1.local
-   ```
-
-   It should print the Pi's live IP. If `172.17.0.1` isn't reachable
-   from the Compose network, bind `DNSStubListenerExtra` to the host's
-   LAN IP instead and use that same IP in `daemon.json`.
-
-> Prefer zero host config? The alternative is static DHCP reservations
-> for each Pi plus an `extra_hosts:` block on the `frigate` service. It
-> works and survives reboots, but you maintain the IP map by hand. The
-> resolved approach above keeps the `.local` names dynamic.
+> Why not make Docker speak mDNS instead? You can (systemd-resolved with
+> `MulticastDNS=yes` + a `DNSStubListenerExtra` the containers reach,
+> then point `/etc/docker/daemon.json` `"dns"` at it) — but it's a
+> daemon-wide change that's fiddly on hosts where the default `docker0`
+> bridge is down and the stack runs on a user-defined network. For a
+> handful of fixed cameras, the static map above is less to go wrong.
 
 ### 8.3 - Start Frigate
 

@@ -59,11 +59,13 @@ services:
     depends_on:
       mosquitto:
         condition: service_healthy
-    # NOTE: the `.local` camera names in frigate-config.yml are mDNS and
-    # Docker's resolver can't resolve them on its own. The fix is host-side
-    # — systemd-resolved does mDNS and the Docker daemon forwards `.local`
-    # to it. See docs/SETUP_MAC_MINI.md "Step 8.0 - Let Docker resolve the
-    # cameras' .local names". No per-container config needed here.
+    # Docker's resolver can't resolve the `.local` mDNS camera names in
+    # frigate-config.yml, even though the host can. Map each Pi to its
+    # static IP here. REQUIRES a DHCP reservation per Pi at the router so
+    # the IP never drifts. See docs/SETUP_MAC_MINI.md step 8.2.
+    extra_hosts:
+      - "hamster-cam-1.local:REPLACE_WITH_PI_1_IP"
+      - "hamster-cam-2.local:REPLACE_WITH_PI_2_IP"
     # iGPU for OpenVINO. /dev/dri must exist on the host (intel-opencl-icd +
     # intel-media-va-driver-non-free, per docs/SETUP_MAC_MINI.md step 3).
     devices:
