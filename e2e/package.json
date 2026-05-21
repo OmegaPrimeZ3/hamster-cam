@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Playwright acceptance suite for hamster-cam. Stands up backend + frontend + msw-mocked Zyphr, runs the PLAN §5.4 acceptance bullets in real browsers.",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0"
   },
   "scripts": {
     "e2e": "playwright test",
@@ -25,7 +25,7 @@
     "tsx": "4.19.1"
   },
   "devDependencies": {
-    "@types/node": "20.16.10",
+    "@types/node": "24.12.4",
     "typescript": "5.6.2"
   }
 }
