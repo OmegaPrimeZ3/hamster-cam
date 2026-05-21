@@ -309,15 +309,6 @@ No host daemons, survives reboots.
      - "hamster-cam-2.local:192.168.1.52"
    ```
 
-3. Recreate the container so the mapping takes effect (a plain
-   `restart` will NOT pick up `extra_hosts` — it must be recreated):
-
-   ```sh
-   cd /opt/hamster-cam
-   docker compose --env-file .env -f docker-compose.yml up -d frigate
-   docker exec hamster-frigate getent hosts hamster-cam-1.local   # prints the IP
-   ```
-
 > Why not make Docker speak mDNS instead? You can (systemd-resolved with
 > `MulticastDNS=yes` + a `DNSStubListenerExtra` the containers reach,
 > then point `/etc/docker/daemon.json` `"dns"` at it) — but it's a
@@ -327,10 +318,32 @@ No host daemons, survives reboots.
 
 ### 8.3 - Start Frigate
 
+The `frigate-config.yml` template references `{FRIGATE_RTSP_PASSWORD}`,
+`{MQTT_USERNAME}`, and `{MQTT_PASSWORD}`. Compose injects those into the
+container by interpolating the matching `${...}` values in
+`docker-compose.yml` — and it only finds them if `.env` is loaded.
+Compose auto-loads `.env` from the **project directory**, so either run
+from `/opt/hamster-cam` or pass `--env-file` explicitly. If the vars are
+missing, compose substitutes an empty string with only a warning,
+Frigate sends a blank RTSP password, every Pi answers `401`, and the
+cameras come up **black with no video** even though startup looks clean.
+
 ```sh
-docker compose up -d frigate
+cd /opt/hamster-cam
+docker compose --env-file .env up -d frigate
 docker compose logs -f frigate
 ```
+
+Before opening the UI, confirm the password actually reached the
+container (this is the single most common cause of black cameras):
+
+```sh
+docker exec hamster-frigate sh -c 'echo "[$FRIGATE_RTSP_PASSWORD]"'
+```
+
+It must print the real password in the brackets. An empty `[]` means
+`.env` wasn't loaded — recreate the container from the command above. (A
+plain `restart` will not re-read the environment; it must be recreated.)
 
 Frigate's web UI is at `http://<mac-mini-ip>:5000`. You should see
 all three cameras live within a minute or two.
