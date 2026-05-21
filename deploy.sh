@@ -16,14 +16,21 @@
 #   SSH_OPTS        — extra ssh / rsync -e options   (optional)
 #
 # Flags:
-#   --sync-env, -e  — also push the dev machine's .env to the Mac Mini
-#                     (the remote file is backed up to .env.bak-<ts> first).
-#                     OFF by default — the remote .env is normally
-#                     authoritative and untouched.
+#   --sync-env, -e        — also push the dev machine's .env to the Mac Mini
+#                           (the remote file is backed up to .env.bak-<ts> first).
+#                           OFF by default — the remote .env is normally
+#                           authoritative and untouched.
+#   --sync-frigate-config — also push mac-mini/frigate-config.yml to the Mini.
+#                           (the remote file is backed up to
+#                           frigate-config.yml.bak-<ts> first).
+#                           OFF by default — the remote copy is host-authoritative:
+#                           Frigate's zone editor writes zone coordinates back into
+#                           it, and it holds the host-specific WebRTC LAN IP.
 #
 # Examples:
 #   ./deploy.sh
 #   ./deploy.sh --sync-env
+#   ./deploy.sh --sync-frigate-config
 #   MAC_MINI_HOST=192.168.1.50 ./deploy.sh
 #   SSH_OPTS="-i ~/.ssh/hamster_ed25519" ./deploy.sh
 
@@ -33,10 +40,15 @@ set -euo pipefail
 # CLI flags
 # ----------------------------------------------------------------------
 SYNC_ENV=0
+SYNC_FRIGATE_CONFIG=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sync-env|-e)
             SYNC_ENV=1
+            shift
+            ;;
+        --sync-frigate-config)
+            SYNC_FRIGATE_CONFIG=1
             shift
             ;;
         --help|-h)
@@ -179,11 +191,15 @@ log "syncing Mac Mini infra configs"
 # deploy and break broker auth stack-wide.
 rsync_nodelete \
     --exclude='.env' \
+    --exclude='frigate-config.yml' \
     --exclude='storage/' \
     --exclude='caddy/data/' \
     --exclude='caddy/config/' \
     --exclude='mosquitto/config/passwd' \
     mac-mini/ "${REMOTE}:${MAC_MINI_PATH}/"
+# frigate-config.yml is excluded above because it is host-authoritative: Frigate's
+# zone editor writes zone coordinates back into the Mini's copy, and it holds the
+# host-specific WebRTC candidate LAN IP. Push it deliberately with --sync-frigate-config.
 
 # ----------------------------------------------------------------------
 # 5b. Optional: push the dev machine's .env to the Mac Mini. Only runs
@@ -201,6 +217,27 @@ if [[ "$SYNC_ENV" == "1" ]]; then
     log "syncing local .env → ${MAC_MINI_PATH}/.env (remote backed up to ${BACKUP_NAME})"
     ssh_cmd "if [[ -f '${MAC_MINI_PATH}/.env' ]]; then cp -p '${MAC_MINI_PATH}/.env' '${MAC_MINI_PATH}/${BACKUP_NAME}'; fi"
     rsync_cmd --chmod=F600 .env "${REMOTE}:${MAC_MINI_PATH}/.env"
+fi
+
+# ----------------------------------------------------------------------
+# 5c. Optional: push the repo's mac-mini/frigate-config.yml to the Mini.
+#     Only runs when --sync-frigate-config was passed. This is opt-in
+#     because the remote copy is host-authoritative — Frigate's zone editor
+#     writes operator-drawn zone coordinates back into it, and it holds the
+#     real WebRTC candidate LAN IP that can't live in the public repo.
+#     A wrong push would silently overwrite live zones; the .bak file makes
+#     it a one-revert recovery rather than a re-draw-from-scratch scramble.
+# ----------------------------------------------------------------------
+if [[ "$SYNC_FRIGATE_CONFIG" == "1" ]]; then
+    FRIGATE_CFG="mac-mini/frigate-config.yml"
+    if [[ ! -f "$FRIGATE_CFG" ]]; then
+        echo "deploy.sh: --sync-frigate-config passed but ${FRIGATE_CFG} not found." >&2
+        exit 2
+    fi
+    BACKUP_NAME="frigate-config.yml.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    log "syncing ${FRIGATE_CFG} → ${MAC_MINI_PATH}/frigate-config.yml (remote backed up to ${BACKUP_NAME})"
+    ssh_cmd "if [[ -f '${MAC_MINI_PATH}/frigate-config.yml' ]]; then cp -p '${MAC_MINI_PATH}/frigate-config.yml' '${MAC_MINI_PATH}/${BACKUP_NAME}'; fi"
+    rsync_cmd "$FRIGATE_CFG" "${REMOTE}:${MAC_MINI_PATH}/frigate-config.yml"
 fi
 
 # ----------------------------------------------------------------------

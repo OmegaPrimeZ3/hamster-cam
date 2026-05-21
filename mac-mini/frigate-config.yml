@@ -88,7 +88,24 @@ objects:
       threshold: 0.50
 
 ffmpeg:
-  hwaccel_args: preset-vaapi
+  # Detect AND record consume the LOCAL go2rtc H264 restream over loopback
+  # (see cameras[].ffmpeg.inputs and the go2rtc block below) — NOT a second
+  # direct MJPEG pull from the Pi. This is the single most important property
+  # of this stack: go2rtc pulls each Pi Zero exactly ONCE over WiFi, and every
+  # downstream consumer (detect, record, MSE/WebRTC live view) fans out from
+  # that one pull on the Mini. A 720p15 MJPEG stream is ~15–25 Mbps; the Pi
+  # Zero 2 W's single radio cannot sustain multiple copies, so a second pull
+  # used to starve the live view into multi-second delay. One pull fixes it.
+  #
+  # Two consequences for this block:
+  #   * NO hwaccel here on purpose. Decode of the loopback H264 for detect runs
+  #     in SOFTWARE (cheap at 720p/5fps). VAAPI is reserved for the H264 ENCODE
+  #     in the go2rtc transcode — we don't fight the UHD 630's flaky decode path
+  #     ("Failed to sync surface / hwdownload -5" crash-loops the pipeline).
+  #   * WiFi-corrupt frames off cam_2 are absorbed by the SOFTWARE MJPEG decode
+  #     *inside* the go2rtc transcode (it drops bad frames and moves on), so the
+  #     H264 reaching detect/record over loopback is already clean — the corrupt
+  #     frames never touch a hardware decoder.
   output_args:
     record: preset-record-generic-audio-copy
 
@@ -101,7 +118,11 @@ cameras:
   hamster_cam_1:
     ffmpeg:
       inputs:
-        - path: rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera
+        # Consume the local go2rtc restream (loopback H264), NOT a 2nd pull from
+        # the Pi. go2rtc owns the single WiFi connection to hamster-cam-1; see
+        # the ffmpeg: comment above and the go2rtc.streams block below.
+        - path: rtsp://127.0.0.1:8554/hamster_cam_1
+          input_args: preset-rtsp-restream
           roles:
             - detect
             - record
@@ -137,7 +158,11 @@ cameras:
   hamster_cam_2:
     ffmpeg:
       inputs:
-        - path: rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera
+        # Consume the local go2rtc restream (loopback H264), NOT a 2nd pull from
+        # the Pi. go2rtc owns the single WiFi connection to hamster-cam-2; see
+        # the ffmpeg: comment above and the go2rtc.streams block below.
+        - path: rtsp://127.0.0.1:8554/hamster_cam_2
+          input_args: preset-rtsp-restream
           roles:
             - detect
             - record
@@ -174,24 +199,65 @@ go2rtc:
   # MJPEG→H264 transcode is REQUIRED for low-latency live view (MSE / WebRTC).
   # Without it Frigate falls back to the jsmpeg player which transcodes
   # server-side and adds noticeable buffering delay in the :5000 web UI.
-  # The Pi Zero cannot realtime-encode H264, so the transcode runs here on
-  # the Mac Mini using the Intel UHD 630 via VAAPI (#hardware). It is not
-  # free — expect ~20–30% iGPU utilisation per stream at 720p/15fps —
-  # but the UHD 630 handles three streams without breaking a sweat.
+  # The Pi Zero cannot realtime-encode H264, so the transcode runs here.
   #
-  # Source format: ffmpeg:<input>#video=h264#hardware
+  # HARDWARE VAAPI ENCODE + SOFTWARE DECODE. The go2rtc `ffmpeg.h264` template is
+  # overridden in the `ffmpeg:` block below to: software-decode the MJPEG (this
+  # tolerates cam_2's corrupt WiFi frames — the SW decoder drops a bad frame and
+  # moves on), then `hwupload` the clean frames to the UHD 630 and encode with
+  # h264_vaapi. Measured against a live corrupt Pi stream: zero "sync surface /
+  # hwdownload -5" errors. CPU dropped from ~130% of a core per stream (libx264
+  # superfast) to ~10–20%. The encode runs on /dev/dri/renderD128 (mapped into
+  # the container; vainfo confirms VAProfileH264High EncSlice).
+  #
+  # Do NOT switch to go2rtc's `#hardware` flag to get VAAPI. That flag ALSO adds
+  # `-hwaccel vaapi -hwaccel_output_format vaapi` on the INPUT — i.e. HARDWARE
+  # MJPEG decode — which is the exact path that crash-loops on corrupt frames.
+  # Encode-only via the template override is the safe split: corrupt frames die
+  # in the software decoder before the iGPU ever sees them.
+  #
+  # Source format: ffmpeg:<input>#video=h264   (the #video=h264 below resolves to
+  # our overridden template, NOT the stock libx264 one)
   # go2rtc passes the resulting H264 stream to the Frigate live-view paths
   # (MSE first, WebRTC fallback), bypassing the jsmpeg transcoder entirely.
+  #
+  # This stream is also the SINGLE upstream for detect+record: those roles read
+  # it back over loopback (rtsp://127.0.0.1:8554/hamster_cam_N) instead of
+  # opening their own connection to the Pi. So each Pi Zero serves exactly ONE
+  # MJPEG stream over WiFi regardless of how many things are watching.
   #
   # NOTE: {FRIGATE_RTSP_PASSWORD} is substituted by Frigate's template engine
   # before the config is passed to the embedded go2rtc instance — do NOT
   # change to ${RTSP_PASSWORD}; that go2rtc-native syntax won't have the
   # value because Frigate's own env mapping runs first.
+  #
+  # LATENCY FIX (brace-free #input= template). ffmpeg's default -analyzeduration
+  # (5s) buffers that much MJPEG input before the first H264 frame → a fixed ~5s
+  # live-view offset. We cut it with go2rtc's #input= per-source template that
+  # lowers -analyzeduration/-probesize to 1,000,000.
+  #
+  # CRITICAL: this template contains NO go2rtc placeholder braces ({input},
+  # {timeout}). Frigate runs its OWN {..} substitution over this block first and
+  # aborts go2rtc entirely ("Invalid substitution found", exit code 1, port 1984
+  # dead, ALL cameras down) on any brace it can't resolve. So -timeout is
+  # hardcoded (5000000, go2rtc's rtsp-template default) and the RTSP URL is
+  # inlined after -i instead of {input}. The only remaining braces are
+  # {FRIGATE_RTSP_PASSWORD} — which Frigate DOES resolve. Do not introduce any
+  # other {token} here. If a cam is slow to lock on cold start, bump the two
+  # 1000000 values to 2000000; never below ~500000 (risks "invalid data found").
+  #
+  # ENCODE TEMPLATE OVERRIDE: redefine go2rtc's stock `h264` template (libx264)
+  # as software-decode → hwupload → h264_vaapi. The #video=h264 in the streams
+  # below resolves to this. `bin` is injected by Frigate (do NOT set it here, and
+  # do NOT add #hardware to the sources — see the encode comment above). The
+  # filter has no spaces so it stays a single token; go2rtc appends -an itself.
+  ffmpeg:
+    h264: "-vaapi_device /dev/dri/renderD128 -vf format=nv12,hwupload -c:v h264_vaapi -g 50 -bf 0 -profile:v high -level:v 4.1 -sei:v 0"
   streams:
     hamster_cam_1:
-      - "ffmpeg:rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera#video=h264#hardware"
+      - "ffmpeg:rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera#video=h264#input=-analyzeduration 1000000 -probesize 1000000 -fflags nobuffer -flags low_delay -timeout 5000000 -user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -i rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera"
     hamster_cam_2:
-      - "ffmpeg:rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera#video=h264#hardware"
+      - "ffmpeg:rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera#video=h264#input=-analyzeduration 1000000 -probesize 1000000 -fflags nobuffer -flags low_delay -timeout 5000000 -user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -i rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera"
 
   # WebRTC candidates — required for the WebRTC live-view path to work over
   # the LAN. go2rtc needs to know the Mac Mini's reachable LAN IP so it can
@@ -209,7 +275,7 @@ go2rtc:
   # NAT traversal and does not need editing.
   webrtc:
     candidates:
-      - 192.168.1.X:8555   # ← REPLACE with Mac Mini's LAN IP (see comment above)
+      - 192.168.1.200:8555   # Mac Mini LAN IP (project-server, DHCP-reserved)
       - stun:8555
 
 logger:
