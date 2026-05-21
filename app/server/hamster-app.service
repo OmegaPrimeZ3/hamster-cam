@@ -6,6 +6,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Default service account. Do NOT hardcode your own user here — override
+# per host with a drop-in instead (never committed, survives deploys):
+#   /etc/systemd/system/hamster-app.service.d/override.conf
+#   [Service]
+#   User=<your-account>
+#   Group=<your-account>
+# See docs/SETUP_MAC_MINI.md step 10.3.
 User=hamster
 Group=hamster
 WorkingDirectory=/opt/hamster-cam/app/server

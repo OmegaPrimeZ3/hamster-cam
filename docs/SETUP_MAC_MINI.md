@@ -143,9 +143,13 @@ the things their patches sometimes need.
 ## Step 4 - Set up the host directories
 
 ```sh
-# On the Mac Mini
-sudo mkdir -p /opt/hamster-cam/{config,storage,db,storage/timelapse}
-sudo chown -R hamster:hamster /opt/hamster-cam
+# On the Mac Mini — chown to the account you SSH in and run deploy.sh as
+# (the deploy user; here `omegaprime`). deploy.sh rsyncs as this user and
+# the systemd unit runs as it, so it MUST own the whole tree. If you chown
+# to a user that doesn't exist the command fails silently-ish and the tree
+# stays root-owned, which breaks every later rsync with "Permission denied".
+sudo mkdir -p /opt/hamster-cam/{storage,db,storage/timelapse}
+sudo chown -R "$USER":"$USER" /opt/hamster-cam
 cd /opt/hamster-cam
 ```
 
@@ -449,23 +453,24 @@ day-to-day it collapses to a single `./deploy.sh`.
 The systemd unit runs the server with the host's Node (`ExecStart` is
 `/usr/bin/node …`), and `deploy.sh` installs prod deps remotely with
 pnpm. Neither was installed in earlier steps, so install both once.
-The repo pins **Node >= 20** and **pnpm 11.x**:
+The repo pins **Node >= 24** and **pnpm 11.x**:
 
 ```sh
 # On the Mac Mini
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
 sudo apt install -y nodejs
 sudo npm i -g pnpm@11
 node --version && pnpm --version
 ```
 
 `deploy.sh` restarts the service with `sudo systemctl` non-interactively
-(it checks `sudo -n`). Give the `hamster` user passwordless sudo for just
-those two commands so the deploy never hangs on a password prompt:
+(it checks `sudo -n`). Give the deploy user (`omegaprime` here — use
+whatever account you SSH in and run the service as) passwordless sudo for
+just those commands so the deploy never hangs on a password prompt:
 
 ```sh
 # On the Mac Mini
-echo 'hamster ALL=(root) NOPASSWD: /bin/systemctl restart hamster-app, /bin/cp app/server/hamster-app.service /etc/systemd/system/hamster-app.service, /bin/systemctl daemon-reload' \
+echo 'omegaprime ALL=(root) NOPASSWD: /bin/systemctl restart hamster-app, /bin/cp app/server/hamster-app.service /etc/systemd/system/hamster-app.service, /bin/systemctl daemon-reload' \
   | sudo tee /etc/sudoers.d/hamster-deploy
 sudo chmod 440 /etc/sudoers.d/hamster-deploy
 ```
@@ -509,14 +514,32 @@ the deploy just placed:
 # On the Mac Mini, one-time
 cd /opt/hamster-cam
 sudo cp app/server/hamster-app.service /etc/systemd/system/
+```
+
+The committed unit defaults to `User=hamster`. If you run as a different
+account (the one you SSH in and deploy as), don't edit the unit — every
+deploy re-copies it and would clobber your change. Instead add a **drop-in
+override**, which systemd merges on top and which deploys never touch:
+
+```sh
+# On the Mac Mini, one-time — $USER is whatever account you're logged in as
+sudo mkdir -p /etc/systemd/system/hamster-app.service.d
+printf '[Service]\nUser=%s\nGroup=%s\n' "$USER" "$USER" \
+  | sudo tee /etc/systemd/system/hamster-app.service.d/override.conf
+```
+
+Then enable and start it:
+
+```sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now hamster-app
 sudo systemctl status hamster-app
 ```
 
 The unit reads `/opt/hamster-cam/.env` via `EnvironmentFile` and runs
-`dist/index.js` as the `hamster` user. `status` should report
-**active (running)**.
+`dist/index.js` as the configured account. `status` should report
+**active (running)**. Confirm the effective user with
+`systemctl show -p User hamster-app`.
 
 ### 10.4 - Subsequent deploys
 
