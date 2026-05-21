@@ -127,8 +127,11 @@ cameras:
             - detect
             - record
     detect:
-      width: 1280
-      height: 720
+      # Match the Pi's MJPEG capture (640x480) — the Pis stream 480p to stay
+      # under the 2.4GHz goodput ceiling (see pi-zero/go2rtc.yaml). Zone
+      # coordinates are normalized (0–1) so they're unaffected by the change.
+      width: 640
+      height: 480
       fps: 5
     objects:
       track:
@@ -167,8 +170,11 @@ cameras:
             - detect
             - record
     detect:
-      width: 1280
-      height: 720
+      # Match the Pi's MJPEG capture (640x480) — the Pis stream 480p to stay
+      # under the 2.4GHz goodput ceiling (see pi-zero/go2rtc.yaml). Zone
+      # coordinates are normalized (0–1) so they're unaffected by the change.
+      width: 640
+      height: 480
       fps: 5
     objects:
       track:

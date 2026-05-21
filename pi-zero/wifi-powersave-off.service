@@ -1,0 +1,26 @@
+# Disable WiFi power management on wlan0 — deploy to /etc/systemd/system/ on each Pi.
+#
+# The BCM43430 (Pi Zero 2 W) brings wlan0 up with power-save ENABLED by default
+# (see `dmesg | grep brcmf_cfg80211_set_power_mgmt`). When the radio naps between
+# beacons it adds latency/jitter and periodic stalls to a continuous MJPEG stream
+# — exactly the kind of intermittent hiccup that compounds the live-view lag.
+# This holds power_save off across reboots.
+#
+# Requires `iw` (sudo apt-get install -y iw). See docs/SETUP_PI_ZERO.md.
+#
+#   sudo cp wifi-powersave-off.service /etc/systemd/system/
+#   sudo systemctl enable --now wifi-powersave-off.service
+
+[Unit]
+Description=Disable WiFi power-save on wlan0 (low-jitter MJPEG streaming)
+After=network-online.target sys-subsystem-net-devices-wlan0.device
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Re-assert on every link-up; harmless if already off.
+ExecStart=/usr/sbin/iw dev wlan0 set power_save off
+
+[Install]
+WantedBy=multi-user.target
