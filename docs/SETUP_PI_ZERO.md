@@ -62,27 +62,59 @@ On the Pi (over SSH):
 
 ```
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y v4l-utils ffmpeg curl
+sudo apt install -y v4l-utils ffmpeg curl iw
 ```
 
+- `ffmpeg` (the Raspberry Pi OS build) provides the `h264_v4l2m2m`
+  hardware H264 encoder — this is what lets the Pi compress the stream
+  on its VideoCore IV block instead of shipping fat MJPEG. See Step 4.
+- `iw` is needed to disable WiFi power-save (Step 7).
 
-## Step 4 - Verify the USB camera
+
+## Step 4 - Verify the USB camera and the hardware H264 encoder
 
 ```
 # Confirm the camera is detected
 v4l2-ctl --list-devices
-# Should show "Arducam IMX462" or similar
+# Should show "Arducam IMX462" or similar, plus a "bcm2835-codec-decode"
+# / "bcm2835-codec-encode" entry (the VideoCore IV codec block).
 
-# Check supported formats
+# Check supported camera formats
 v4l2-ctl -d /dev/video0 --list-formats-ext
-# You should see MJPEG and YUYV options
+# You should see MJPEG (used here) and YUYV. NOTE: this IMX462 only
+# advertises 30fps intervals at every resolution, so it always captures
+# 30fps regardless of any -framerate request.
 ```
 
-If `v4l2-ctl --list-devices` shows nothing:
+Now confirm the **hardware H264 encoder** is present and usable — the
+Pi encodes H264 on-device, so this must work:
+
+```
+# The bcm2835 encoder device node must exist
+ls -l /dev/video11           # → present (the H264 HW encoder)
+
+# H264 must be licensed (always is on Pi Zero 2 W / VideoCore IV)
+vcgencmd codec_enabled H264  # → H264=enabled
+
+# ffmpeg must expose the hardware encoder wrapper
+ffmpeg -hide_banner -encoders | grep h264_v4l2m2m
+# → "V..... h264_v4l2m2m   V4L2 mem2mem H.264 encoder wrapper"
+
+# Smoke-test the encoder (synthetic source, no camera needed):
+ffmpeg -hide_banner -f lavfi -i testsrc=size=1280x720:rate=30 -frames:v 60 \
+  -c:v h264_v4l2m2m -b:v 3M -pix_fmt yuv420p -benchmark -f null -
+# → should report "Using device /dev/video11" and finish with speed > 1x
+```
+
+If the camera (`v4l2-ctl --list-devices`) shows nothing:
 - Try a different USB port or cable.
 - Verify you are using the data port (labeled "USB"), not the power
   port (labeled "PWR IN"). The Pi Zero has two micro-USB ports and
   only one of them carries USB data.
+
+If `/dev/video11` is missing or `vcgencmd codec_enabled H264` is not
+`enabled`, the firmware codec is off — ensure `dtoverlay` hasn't disabled
+it and that you are on a 64-bit Raspberry Pi OS (Bookworm) build.
 
 
 ## Step 5 - Install go2rtc
@@ -113,7 +145,7 @@ On the Pi:
 # Create the env file with the password (use the same value you
 # have in the Mac Mini's .env)
 sudo tee /etc/go2rtc/go2rtc.env > /dev/null <<'EOF'
-RTSP_PASSWORD=g94YRe6Gh0KwGdzeQqpb
+RTSP_PASSWORD=<your-rtsp-password>
 EOF
 sudo chmod 600 /etc/go2rtc/go2rtc.env
 sudo chown root:root /etc/go2rtc/go2rtc.env
@@ -134,8 +166,30 @@ rtsp:
   username: hamster
   password: ${RTSP_PASSWORD}
 streams:
-  camera: exec:ffmpeg -f v4l2 -input_format mjpeg -i /dev/video0 -c copy -f rtsp {output}
+  camera:
+    - exec:ffmpeg ... -f v4l2 -input_format mjpeg -framerate 30 -video_size 1280x720 -i /dev/video0 -c:v h264_v4l2m2m -b:v 3M -g 30 -pix_fmt yuv420p -f mpegts -
 ```
+
+The Pi captures MJPEG from the camera and **hardware-encodes it to H264**
+(`-c:v h264_v4l2m2m`, ~3 Mbps at 720p) before it leaves the box. This is
+deliberate: two cameras shipping raw 720p MJPEG (~25 Mbps each) saturate
+the Pi Zero's 2.4GHz-only radio and cause multi-second live-view lag;
+H264 is ~8x smaller and fixes it. Do NOT change `-c:v h264_v4l2m2m` to
+`libx264` — the Pi's CPU cannot software-encode H264 in real time; the
+VideoCore IV hardware block can.
+
+Two output details that matter (both are in `pi-zero/go2rtc.yaml`):
+
+- **`-f mpegts -` (pipe to stdout), NOT `-f rtsp {output}`.** With the
+  RTSP-publish form, go2rtc never resolves the H264 profile from the
+  hardware encoder (`profile=None`) and the browser MSE live view hangs
+  forever (the `/live/mse/api/ws` socket opens then times out). Piping
+  MPEG-TS lets go2rtc parse the in-band SPS/PPS and report `profile=High`,
+  which MSE needs. If a live view ever loads as a black box with a
+  spinner while snapshots still update, check this first.
+- **`-g 30`** sets a keyframe every second — needed for fast live-view
+  join and loss recovery (H264 smears on packet loss until the next
+  keyframe).
 
 Frigate on the Mac Mini will pull the stream as:
 
@@ -149,7 +203,7 @@ The Mac Mini side reads the same password from
 
 ## Step 7 - Install the systemd service and watchdog
 
-The repo ships four files for the Pi:
+The repo ships five files for the Pi:
 
 - `pi-zero/go2rtc.service` - systemd unit with Restart=always and
   EnvironmentFile=/etc/go2rtc/go2rtc.env
@@ -160,6 +214,11 @@ The repo ships four files for the Pi:
   runs the watchdog script. The timer is bound to this, so it MUST be
   installed or `enable --now` on the timer fails.
 - `pi-zero/go2rtc-watchdog.timer` - runs the watchdog every 60s
+- `pi-zero/wifi-powersave-off.service` - disables WiFi power management
+  on wlan0 at boot. The BCM43430 enables power-save by default, which
+  adds latency/jitter and periodic stalls to a continuous stream. This
+  is REQUIRED for a smooth live view — it was the decisive fix for the
+  multi-camera lag. Needs `iw` (installed in Step 3).
 
 Install them from your dev machine:
 
@@ -168,18 +227,24 @@ scp pi-zero/go2rtc.service hamster@hamster-cam-1.local:/tmp/
 scp pi-zero/go2rtc-watchdog.sh hamster@hamster-cam-1.local:/tmp/
 scp pi-zero/go2rtc-watchdog.service hamster@hamster-cam-1.local:/tmp/
 scp pi-zero/go2rtc-watchdog.timer hamster@hamster-cam-1.local:/tmp/
+scp pi-zero/wifi-powersave-off.service hamster@hamster-cam-1.local:/tmp/
 
 ssh hamster@hamster-cam-1.local '
   sudo mv /tmp/go2rtc.service /etc/systemd/system/
   sudo mv /tmp/go2rtc-watchdog.sh /usr/local/sbin/
   sudo mv /tmp/go2rtc-watchdog.service /etc/systemd/system/
   sudo mv /tmp/go2rtc-watchdog.timer /etc/systemd/system/
+  sudo mv /tmp/wifi-powersave-off.service /etc/systemd/system/
   sudo chmod +x /usr/local/sbin/go2rtc-watchdog.sh
-  sudo chmod 644 /etc/systemd/system/go2rtc.service /etc/systemd/system/go2rtc-watchdog.service /etc/systemd/system/go2rtc-watchdog.timer
+  sudo chmod 644 /etc/systemd/system/go2rtc.service /etc/systemd/system/go2rtc-watchdog.service /etc/systemd/system/go2rtc-watchdog.timer /etc/systemd/system/wifi-powersave-off.service
 
   sudo systemctl daemon-reload
   sudo systemctl enable --now go2rtc
   sudo systemctl enable --now go2rtc-watchdog.timer
+  sudo systemctl enable --now wifi-powersave-off.service
+
+  # Confirm power-save is now off
+  iw dev wlan0 get power_save   # → "Power save: off"
 '
 ```
 
@@ -264,6 +329,12 @@ Before moving on to Frigate configuration on the Mac Mini, confirm:
 - [ ] `systemctl status go2rtc` is "active (running)" on each Pi
 - [ ] `systemctl status go2rtc-watchdog.timer` is "active (waiting)"
       on each Pi
+- [ ] WiFi power-save is OFF: `iw dev wlan0 get power_save` → `off`
+- [ ] The stream is **H264, profile High** (not MJPEG, not profile None):
+      `curl -s http://127.0.0.1:1984/api/streams` on the Pi shows the
+      producer codec as `h264` / `High`. profile `None` means the exec is
+      still publishing via `-f rtsp {output}` instead of piping `-f mpegts -`
+      and the browser live view will hang.
 - [ ] Each Pi's stream plays in the go2rtc web UI at port 1984
 - [ ] Each Pi's RTSP stream plays in VLC with the password
 - [ ] The Pi's go2rtc.env file is chmod 600 owned by root
@@ -274,11 +345,20 @@ Before moving on to Frigate configuration on the Mac Mini, confirm:
 - Camera not detected after a reboot: check that the camera is on
   the data port, not the power port. The Pi Zero only carries USB
   data on one of its two micro-USB jacks.
-- Stream black or low FPS: the IMX462 supports hardware MJPEG; the
-  default go2rtc config uses MJPEG via `-input_format mjpeg`. If you
-  see software encoding chewing the Pi's 512 MB of RAM, confirm
-  `v4l2-ctl --list-formats-ext` shows MJPEG and that the config is
-  using it (not YUYV).
+- Live view loads as a black box / spinner forever, but snapshots
+  update: go2rtc could not resolve the H264 profile (`profile=None`).
+  Almost always the exec is publishing via `-f rtsp {output}` instead of
+  piping `-f mpegts -`. Switch to the pipe form (Step 6) and restart
+  go2rtc; confirm `curl http://127.0.0.1:1984/api/streams` reports
+  `profile=High`.
+- Stream black or capture errors: confirm the camera still does MJPEG
+  capture — `v4l2-ctl --list-formats-ext` should show MJPG, and
+  `-input_format mjpeg` must be in the exec (raw YUYV at 720p exceeds USB
+  2.0 bandwidth). The Pi decodes that MJPEG and re-encodes to H264 on the
+  hardware block; if `/dev/video11` disappeared, re-check Step 4.
+- Live view smears / blocks up on motion: H264 is sensitive to WiFi
+  packet loss. Confirm power-save is off (Step 7); if it persists,
+  shorten `-g` (more keyframes) or lower `-b:v` in the exec line.
 - "Authentication failed" from Frigate: the password on the Pi
   (`/etc/go2rtc/go2rtc.env`) must match `FRIGATE_RTSP_PASSWORD` in
   the Mac Mini's `.env`.

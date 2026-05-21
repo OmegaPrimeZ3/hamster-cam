@@ -281,17 +281,33 @@ The template defines three cameras. Each pulls its stream from a Pi
 using the password from `.env`:
 
 ```yaml
+go2rtc:
+  streams:
+    # The Pis already emit H264 — go2rtc just relays it (native rtsp, copy),
+    # pulling each Pi exactly once. No transcode (see 8.3).
+    hamster_cam_1:
+      - rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera
+
 cameras:
   hamster_cam_1:
     ffmpeg:
       inputs:
-        - path: rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera
+        # detect+record read the LOCAL go2rtc relay over loopback, NOT a second
+        # direct pull from the Pi — so each Pi is pulled only once over WiFi.
+        - path: rtsp://127.0.0.1:8554/hamster_cam_1
+          input_args: preset-rtsp-restream
           roles: [detect, record]
-  # ...hamster_cam_2 and hamster_cam_3 similarly
+    detect:
+      width: 1280     # match the Pi's 720p H264
+      height: 720
+      fps: 5
+  # ...hamster_cam_2 (and hamster_cam_3) follow the same shape
 ```
 
-Confirm the three Pi Zeros are streaming (see
-[SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md)) before bringing Frigate up.
+Confirm the Pi Zeros are streaming **H264** (see
+[SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md)) before bringing Frigate up — on a
+Pi, `curl -s http://127.0.0.1:1984/api/streams` should report the producer
+codec as `h264` with `profile=High`.
 
 ### 8.2 - Let Docker resolve the cameras' `.local` names
 
@@ -340,14 +356,16 @@ block, and replace `192.168.1.X` with the Mac Mini's actual LAN IP (the
 same static IP from step 8.2). This enables the WebRTC live-view path.
 The `stun:8555` line below it does not need editing.
 
-> **Why this matters:** The Pi Zero cameras output MJPEG. The `go2rtc:`
-> streams block transcodes each stream to H264 on the Mac Mini's iGPU
-> (Intel UHD 630 via VAAPI) before Frigate's live-view players see it.
-> Without this, Frigate falls back to the jsmpeg player which
-> transcodes server-side and adds visible buffering delay in the :5000
-> UI. With H264 streams the player switches to MSE (or WebRTC), which
-> is near-realtime. Expect ~20–30% iGPU utilisation per stream —
-> acceptable on the UHD 630.
+> **Why this matters:** the Pi Zeros hardware-encode H264 themselves, so
+> the Mac Mini does **no video transcoding** — `go2rtc` just relays each
+> Pi's H264 (native rtsp, copy) to the MSE/WebRTC live-view players and,
+> over loopback, to Frigate's detect+record. The WebRTC candidate IP lets
+> the browser negotiate the low-latency WebRTC path; without it the player
+> falls back to MSE (still near-realtime). No iGPU/VAAPI is used for live
+> view. (Earlier revisions shipped MJPEG from the Pis and transcoded to
+> H264 here on the UHD 630 via VAAPI; that was replaced by edge encoding
+> to cut WiFi load ~8x and free the iGPU — if you see a `go2rtc.ffmpeg`
+> transcode template or `#video=h264` stream sources, the config is stale.)
 
 The `frigate-config.yml` template references `{FRIGATE_RTSP_PASSWORD}`,
 `{MQTT_USERNAME}`, and `{MQTT_PASSWORD}`. Compose injects those into the
