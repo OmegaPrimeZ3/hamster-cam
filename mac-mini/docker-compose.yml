@@ -80,6 +80,13 @@ services:
     # won't bind. Ubuntu (the recommended path) has nothing on 5000.
     ports:
       - "5000:5000"
+      # WebRTC signalling + media port. Required for go2rtc's WebRTC live-view
+      # path (the low-latency fallback after MSE). Both TCP (signalling) and UDP
+      # (RTP media) must be exposed. The router does NOT need to forward 8555
+      # externally — WebRTC only runs on the LAN; Cloudflare terminates the
+      # public-facing connection before it reaches here.
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
     volumes:
       # NOT read-only: Frigate migrates the config across versions on boot
       # and the built-in zone editor writes zone coordinates back to it.

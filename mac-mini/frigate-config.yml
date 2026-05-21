@@ -171,11 +171,46 @@ cameras:
         coordinates: 0.66,0.70,0.98,0.70,0.98,0.98,0.66,0.98
 
 go2rtc:
+  # MJPEG→H264 transcode is REQUIRED for low-latency live view (MSE / WebRTC).
+  # Without it Frigate falls back to the jsmpeg player which transcodes
+  # server-side and adds noticeable buffering delay in the :5000 web UI.
+  # The Pi Zero cannot realtime-encode H264, so the transcode runs here on
+  # the Mac Mini using the Intel UHD 630 via VAAPI (#hardware). It is not
+  # free — expect ~20–30% iGPU utilisation per stream at 720p/15fps —
+  # but the UHD 630 handles three streams without breaking a sweat.
+  #
+  # Source format: ffmpeg:<input>#video=h264#hardware
+  # go2rtc passes the resulting H264 stream to the Frigate live-view paths
+  # (MSE first, WebRTC fallback), bypassing the jsmpeg transcoder entirely.
+  #
+  # NOTE: {FRIGATE_RTSP_PASSWORD} is substituted by Frigate's template engine
+  # before the config is passed to the embedded go2rtc instance — do NOT
+  # change to ${RTSP_PASSWORD}; that go2rtc-native syntax won't have the
+  # value because Frigate's own env mapping runs first.
   streams:
     hamster_cam_1:
-      - "rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera"
+      - "ffmpeg:rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera#video=h264#hardware"
     hamster_cam_2:
-      - "rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera"
+      - "ffmpeg:rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-2.local:8554/camera#video=h264#hardware"
+
+  # WebRTC candidates — required for the WebRTC live-view path to work over
+  # the LAN. go2rtc needs to know the Mac Mini's reachable LAN IP so it can
+  # include the correct ICE candidate in the offer.
+  #
+  # OPERATOR ACTION REQUIRED: replace 192.168.1.X below with the Mac Mini's
+  # actual LAN IP (the same static-DHCP IP you configured in step 8.2, e.g.
+  # `ip -4 addr show | grep "inet "` on the Mini). A wrong IP here means
+  # WebRTC negotiation fails and the player falls back to MSE — still
+  # low-latency, just not ideal for mobile.
+  #
+  # Frigate 0.17 does not reliably interpolate {FRIGATE_VAR} inside this
+  # nested go2rtc sub-block, so the LAN IP cannot be driven from .env here;
+  # it must be set directly. The stun:8555 entry is kept as a fallback for
+  # NAT traversal and does not need editing.
+  webrtc:
+    candidates:
+      - 192.168.1.X:8555   # ← REPLACE with Mac Mini's LAN IP (see comment above)
+      - stun:8555
 
 logger:
   default: info

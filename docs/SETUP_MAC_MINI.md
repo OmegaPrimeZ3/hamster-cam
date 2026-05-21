@@ -334,6 +334,21 @@ No host daemons, survives reboots.
 
 ### 8.3 - Start Frigate
 
+**Before starting, set the WebRTC candidate IP.** Open
+`mac-mini/frigate-config.yml`, find the `go2rtc: webrtc: candidates:`
+block, and replace `192.168.1.X` with the Mac Mini's actual LAN IP (the
+same static IP from step 8.2). This enables the WebRTC live-view path.
+The `stun:8555` line below it does not need editing.
+
+> **Why this matters:** The Pi Zero cameras output MJPEG. The `go2rtc:`
+> streams block transcodes each stream to H264 on the Mac Mini's iGPU
+> (Intel UHD 630 via VAAPI) before Frigate's live-view players see it.
+> Without this, Frigate falls back to the jsmpeg player which
+> transcodes server-side and adds visible buffering delay in the :5000
+> UI. With H264 streams the player switches to MSE (or WebRTC), which
+> is near-realtime. Expect ~20–30% iGPU utilisation per stream —
+> acceptable on the UHD 630.
+
 The `frigate-config.yml` template references `{FRIGATE_RTSP_PASSWORD}`,
 `{MQTT_USERNAME}`, and `{MQTT_PASSWORD}`. Compose injects those into the
 container by interpolating the matching `${...}` values in
@@ -362,7 +377,8 @@ It must print the real password in the brackets. An empty `[]` means
 plain `restart` will not re-read the environment; it must be recreated.)
 
 Frigate's web UI is at `http://<mac-mini-ip>:5000`. You should see
-all three cameras live within a minute or two.
+all three cameras live within a minute or two. The player controls in
+the live view should show MSE or WebRTC, not jsmpeg.
 
 > **"This site can't be reached"?** First confirm the container bound
 > the host port: `docker compose ps` (frigate should be `running`, not
@@ -468,11 +484,17 @@ node --version && pnpm --version
 whatever account you SSH in and run the service as) passwordless sudo for
 just those commands so the deploy never hangs on a password prompt:
 
+Use the **absolute paths `sudo` actually resolves to** — confirm them with
+`command -v systemctl cp` (Ubuntu 24.04 is `/usr/bin/...`; a sudoers rule
+listing `/bin/systemctl` will silently fail to match and the deploy hangs
+on a password prompt):
+
 ```sh
-# On the Mac Mini
-echo 'omegaprime ALL=(root) NOPASSWD: /bin/systemctl restart hamster-app, /bin/cp app/server/hamster-app.service /etc/systemd/system/hamster-app.service, /bin/systemctl daemon-reload' \
+# On the Mac Mini — adjust paths if `command -v` differs
+echo 'omegaprime ALL=(root) NOPASSWD: /usr/bin/systemctl restart hamster-app, /usr/bin/systemctl daemon-reload, /usr/bin/cp app/server/hamster-app.service /etc/systemd/system/hamster-app.service' \
   | sudo tee /etc/sudoers.d/hamster-deploy
 sudo chmod 440 /etc/sudoers.d/hamster-deploy
+sudo visudo -c -f /etc/sudoers.d/hamster-deploy    # syntax check
 ```
 
 ### 10.2 - Point the dev machine at the Mac Mini
