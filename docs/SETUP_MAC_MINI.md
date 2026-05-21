@@ -152,7 +152,8 @@ cd /opt/hamster-cam
 | Path | Purpose |
 |---|---|
 | `/opt/hamster-cam/.env` | Environment variables consumed by docker-compose and the app. Chmod 600 once populated. |
-| `/opt/hamster-cam/config/` | Frigate config (`frigate-config.yml`), Mosquitto config |
+| `/opt/hamster-cam/frigate-config.yml` | Frigate config. Lives at the root — compose mounts `./frigate-config.yml`. |
+| `/opt/hamster-cam/mosquitto/`, `caddy/`, `fail2ban/` | Per-service config dirs, bind-mounted by compose from the root. |
 | `/opt/hamster-cam/storage/` | Frigate recordings, snapshots, nightly time-lapse MP4s |
 | `/opt/hamster-cam/db/` | SQLite database `hamster.db` and dated backup copies |
 
@@ -187,12 +188,22 @@ Critical values to have ready:
 
 ```sh
 # From the dev machine, in the repo root
-scp mac-mini/docker-compose.yml hamster@<mac-mini-ip>:/opt/hamster-cam/
-scp mac-mini/frigate-config.yml hamster@<mac-mini-ip>:/opt/hamster-cam/config/
+scp mac-mini/docker-compose.yml omegaprime@project-server:/opt/hamster-cam/
+scp mac-mini/frigate-config.yml hamster@<mac-mini-ip>:/opt/hamster-cam/
 scp -r mac-mini/caddy hamster@<mac-mini-ip>:/opt/hamster-cam/
 scp -r mac-mini/fail2ban hamster@<mac-mini-ip>:/opt/hamster-cam/
 scp -r mac-mini/mosquitto hamster@<mac-mini-ip>:/opt/hamster-cam/
 ```
+
+Every config lands at the **project root** (`/opt/hamster-cam/`), because
+that is where `docker-compose.yml`'s relative bind mounts resolve from —
+`./frigate-config.yml`, `./mosquitto/`, `./caddy/`, `./fail2ban/`. Do
+**not** tuck `frigate-config.yml` into a `config/` subdirectory: the
+compose mount is `./frigate-config.yml:/config/config.yml`, so if the
+file isn't at the root, Docker silently creates an empty *directory* in
+its place, Frigate finds no config, logs `No config file found, saving
+default config`, and boots with **zero cameras** — a clean startup with
+an empty UI. Same trap as Mosquitto below.
 
 The `mosquitto/` directory ships `mosquitto/config/mosquitto.conf`, which
 the compose file bind-mounts into the broker container. If you skip it,
@@ -255,7 +266,8 @@ You should see Mosquitto listening on `127.0.0.1:1883` and
 
 ## Step 8 - Configure Frigate
 
-Frigate is configured via `/opt/hamster-cam/config/frigate-config.yml`.
+Frigate is configured via `/opt/hamster-cam/frigate-config.yml` (the
+compose file mounts it to `/config/config.yml` inside the container).
 The repo ships a template that pulls camera credentials from the
 `.env` file.
 

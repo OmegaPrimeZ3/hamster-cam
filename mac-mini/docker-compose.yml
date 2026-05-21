@@ -81,16 +81,21 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./frigate-config.yml:/config/config.yml:ro
+      # NOT read-only: Frigate migrates the config across versions on boot
+      # and the built-in zone editor writes zone coordinates back to it.
+      - ./frigate-config.yml:/config/config.yml
       - ./storage/frigate:/media/frigate
       - type: tmpfs
         target: /tmp/cache
         tmpfs:
           size: 1000000000
     environment:
+      # Frigate substitutes config {PLACEHOLDERS} only from FRIGATE_-prefixed
+      # env vars, so map the shared MQTT creds through prefixed names. The
+      # frigate-config.yml references {FRIGATE_MQTT_USERNAME/PASSWORD}.
       - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD}
-      - MQTT_USERNAME=${MQTT_USERNAME}
-      - MQTT_PASSWORD=${MQTT_PASSWORD}
+      - FRIGATE_MQTT_USERNAME=${MQTT_USERNAME}
+      - FRIGATE_MQTT_PASSWORD=${MQTT_PASSWORD}
       # Make the LAN IPs predictable in logs even when running rootless.
       - TZ=${TZ:-Etc/UTC}
     healthcheck:
