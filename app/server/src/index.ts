@@ -21,7 +21,7 @@ import { access, stat } from 'node:fs/promises';
 import { constants as fsConstants, createReadStream } from 'node:fs';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-import { extname, resolve as pathResolve, sep as pathSep } from 'node:path';
+import { dirname, extname, resolve as pathResolve, sep as pathSep } from 'node:path';
 
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
@@ -108,6 +108,13 @@ export async function buildServer(): Promise<AppServer> {
   // these are household-private pet photos.
   registerPrivateMedia(app, 'snapshots', new Set(['.jpg', '.jpeg', '.png', '.webp']));
 
+  // SPA static handler: serves the built React app for all GET requests that
+  // don't match an existing API route. Registered via setNotFoundHandler so it
+  // only fires after every explicit route (tRPC /trpc/*, /auth/*, /health,
+  // /snapshots/*) has already declined to match. Registration is skipped with
+  // a warning if the dist directory doesn't exist at boot (local dev).
+  await registerSpaStatic(app, cfg.WEB_DIST_PATH);
+
   // REST: /health is reachable on the LAN for docker healthchecks; Caddy
   // returns 404 to external requests via an internal-IP allowlist (see the
   // infra-engineer Stage 5 fix for Security-Review Finding 3). Kept
@@ -149,6 +156,155 @@ export async function buildServer(): Promise<AppServer> {
 
   return app;
 }
+
+// ---------------------------------------------------------------------------
+// SPA static handler
+// ---------------------------------------------------------------------------
+
+// Content-type map for files the React SPA build emits.
+const SPA_CONTENT_TYPES: Readonly<Record<string, string>> = {
+  '.html':        'text/html; charset=utf-8',
+  '.js':          'application/javascript; charset=utf-8',
+  '.mjs':         'application/javascript; charset=utf-8',
+  '.css':         'text/css; charset=utf-8',
+  '.json':        'application/json; charset=utf-8',
+  '.svg':         'image/svg+xml',
+  '.png':         'image/png',
+  '.jpg':         'image/jpeg',
+  '.jpeg':        'image/jpeg',
+  '.webp':        'image/webp',
+  '.woff':        'font/woff',
+  '.woff2':       'font/woff2',
+  '.ico':         'image/x-icon',
+  '.map':         'application/json',
+  '.webmanifest': 'application/manifest+json',
+  '.txt':         'text/plain; charset=utf-8',
+};
+
+// Files that must never be cached (they change on every deploy).
+function isNoCacheFile(rel: string): boolean {
+  return rel === 'index.html' || rel === 'sw.js' || rel === 'registerSW.js';
+}
+
+/**
+ * Resolve the web dist directory from the optional env override, or fall back
+ * to `../../web/dist` relative to the compiled module file (index.js sits at
+ * `app/server/dist/index.js`; the web dist is at `app/web/dist`). Uses
+ * `import.meta.url` so the resolution is independent of the process working
+ * directory.
+ */
+function resolveWebDistPath(envOverride: string | undefined): string {
+  if (envOverride) return pathResolve(envOverride);
+  // `import.meta.url` is the canonical location of this compiled module.
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  return pathResolve(moduleDir, '../../web/dist');
+}
+
+/**
+ * Register a Fastify `setNotFoundHandler` that serves the built React SPA for
+ * any request that fell through all explicit routes. Strategy:
+ *
+ *   1. Real static asset file exists under distRoot → stream it with
+ *      appropriate content-type + cache headers.
+ *   2. GET request with `Accept: text/html` (browser navigation) → stream
+ *      `index.html` (SPA fallback for client-side routes like /diary).
+ *   3. Everything else → plain JSON 404 (API callers hitting unknown paths
+ *      still get a machine-readable response).
+ *
+ * Path traversal is rejected the same way as `registerPrivateMedia`: string
+ * check for `..` / NUL / leading `/` AND re-resolution confirming the
+ * absolute path stays under distRoot.
+ *
+ * Safety gate: if distRoot does not exist at boot, log a warning and return
+ * without registering — the server runs fine, just without SPA serving (local
+ * dev uses the Vite dev server instead).
+ */
+async function registerSpaStatic(app: AppServer, envOverride: string | undefined): Promise<void> {
+  const distRoot = resolveWebDistPath(envOverride);
+
+  let distExists = false;
+  try {
+    const st = await stat(distRoot);
+    distExists = st.isDirectory();
+  } catch {
+    distExists = false;
+  }
+
+  if (!distExists) {
+    app.log.warn(
+      { distRoot },
+      'web dist directory not found — SPA static handler skipped (run `pnpm build` in app/web or set WEB_DIST_PATH)',
+    );
+    return;
+  }
+
+  app.log.info({ distRoot }, 'registering SPA static handler');
+
+  const indexPath = pathResolve(distRoot, 'index.html');
+
+  app.setNotFoundHandler(async (req, reply) => {
+    // Only GET/HEAD can serve files; all other verbs 404 as JSON.
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return reply.code(404).send({ message: 'Not Found', error: 'Not Found', statusCode: 404 });
+    }
+
+    // Strip the leading `/` to get a relative path (req.url is always `/...`).
+    const rawRel = (req.url ?? '/').replace(/^\//, '').split('?')[0] ?? '';
+
+    // Path traversal guards — mirror the pattern from registerPrivateMedia.
+    if (rawRel.includes('..') || rawRel.includes('\0')) {
+      return reply.code(400).send({ error: 'bad path' });
+    }
+
+    // Try to serve a real file first (assets, manifest, favicon, etc.).
+    if (rawRel !== '') {
+      const abs = pathResolve(distRoot, rawRel);
+      // Re-resolve confirms no traversal escaped the guards above.
+      if (abs !== distRoot && !abs.startsWith(distRoot + pathSep)) {
+        return reply.code(400).send({ error: 'bad path' });
+      }
+
+      let fileStat: Awaited<ReturnType<typeof stat>> | null = null;
+      try {
+        fileStat = await stat(abs);
+      } catch {
+        fileStat = null;
+      }
+
+      if (fileStat?.isFile()) {
+        const ext = extname(rawRel).toLowerCase();
+        const contentType = SPA_CONTENT_TYPES[ext] ?? 'application/octet-stream';
+        reply.type(contentType);
+        // Vite hashes asset filenames under assets/ — they're safe to cache
+        // for a year. Root-level files (index.html, sw.js, etc.) must not be
+        // cached so PWA updates land immediately.
+        if (rawRel.startsWith('assets/') && !isNoCacheFile(rawRel)) {
+          reply.header('Cache-Control', 'public, max-age=31536000, immutable');
+        } else {
+          reply.header('Cache-Control', 'no-cache');
+        }
+        return reply.send(createReadStream(abs));
+      }
+    }
+
+    // No matching file. Serve index.html for browser navigations (Accept
+    // includes text/html) so deep links like /diary work after a hard refresh.
+    // For everything else (API clients, fetch() without Accept: text/html)
+    // return JSON 404.
+    const accept = (req.headers['accept'] as string | undefined) ?? '';
+    if (accept.includes('text/html')) {
+      reply.header('Cache-Control', 'no-cache');
+      reply.type('text/html; charset=utf-8');
+      return reply.send(createReadStream(indexPath));
+    }
+
+    return reply.code(404).send({ message: 'Not Found', error: 'Not Found', statusCode: 404 });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Private media streaming
+// ---------------------------------------------------------------------------
 
 // Stream `STORAGE_PATH/<subdir>/<file>` for any `GET /<subdir>/*` after a
 // session check. Rejects path traversal both by string-matching `..` and by

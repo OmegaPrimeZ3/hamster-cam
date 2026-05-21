@@ -42,6 +42,13 @@ const envSchema = z.object({
     .enum(['development', 'production', 'test'])
     .optional()
     .default('development'),
+  // Optional. Absolute path to the built React SPA (app/web/dist). When
+  // unset the server resolves it from ../../web/dist relative to the running
+  // module so it works in both the monorepo dev layout and the production
+  // /opt/hamster-cam tree without any env-var ceremony. If the resolved
+  // directory does not exist at boot the static handler is silently skipped
+  // (local dev runs the Vite dev server on its own port anyway).
+  WEB_DIST_PATH: z.string().optional(),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;
