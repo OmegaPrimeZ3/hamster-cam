@@ -136,6 +136,9 @@ services:
       - CADDY_EMAIL=${CADDY_EMAIL}
       - CADDY_HOSTNAME=${CADDY_HOSTNAME}
       - CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT:-2053}
+      # Caddyfile uses {env.CLOUDFLARE_API_TOKEN} for the DNS-01 cert
+      # challenge (tls { dns cloudflare ... }); without it TLS can't provision.
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
     healthcheck:
       # Caddy exposes its admin API on :2019 inside the container.
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
