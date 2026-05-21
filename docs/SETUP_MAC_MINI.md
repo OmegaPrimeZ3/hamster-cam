@@ -436,22 +436,119 @@ zone) and that the `CADDY_HOSTNAME` matches the A record at Cloudflare.
 
 ## Step 10 - Deploy the app
 
-The application backend and frontend are deployed from the dev
-machine via `deploy.sh` at the repo root. The script rsyncs the
-prebuilt server `dist/` and web `dist/` directories to
-`MAC_MINI_PATH` over SSH and restarts the `hamster-app` systemd
-service.
+The backend and frontend are deployed from the **dev machine** with
+`deploy.sh` at the repo root. The script builds both bundles locally,
+rsyncs only what changed to `MAC_MINI_PATH` over SSH, runs
+`pnpm install --prod` remote-side, and restarts the `hamster-app`
+systemd unit plus the Docker stack. It is idempotent — re-run it for
+every subsequent deploy. The full flow below is first-deploy only;
+day-to-day it collapses to a single `./deploy.sh`.
 
-After the first deploy installs the `hamster-app` systemd service:
+### 10.1 - One-time prerequisites on the Mac Mini
+
+The systemd unit runs the server with the host's Node (`ExecStart` is
+`/usr/bin/node …`), and `deploy.sh` installs prod deps remotely with
+pnpm. Neither was installed in earlier steps, so install both once.
+The repo pins **Node >= 20** and **pnpm 11.x**:
+
+```sh
+# On the Mac Mini
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo npm i -g pnpm@11
+node --version && pnpm --version
+```
+
+`deploy.sh` restarts the service with `sudo systemctl` non-interactively
+(it checks `sudo -n`). Give the `hamster` user passwordless sudo for just
+those two commands so the deploy never hangs on a password prompt:
+
+```sh
+# On the Mac Mini
+echo 'hamster ALL=(root) NOPASSWD: /bin/systemctl restart hamster-app, /bin/cp app/server/hamster-app.service /etc/systemd/system/hamster-app.service, /bin/systemctl daemon-reload' \
+  | sudo tee /etc/sudoers.d/hamster-deploy
+sudo chmod 440 /etc/sudoers.d/hamster-deploy
+```
+
+### 10.2 - Point the dev machine at the Mac Mini
+
+`deploy.sh` reads its target from the repo-root `.env` on the **dev
+machine** (or inline overrides). Set these locally — they are separate
+from the Mac Mini's `.env`:
+
+```sh
+# In the repo-root .env on the dev machine
+MAC_MINI_HOST=hamster-mac.local   # or the static LAN IP from step 1
+MAC_MINI_USER=hamster
+MAC_MINI_PATH=/opt/hamster-cam
+```
+
+If you use a dedicated SSH key, pass it via `SSH_OPTS` rather than
+hardcoding it: `SSH_OPTS="-i ~/.ssh/hamster_ed25519" ./deploy.sh`.
+
+### 10.3 - First deploy
+
+```sh
+# On the dev machine, from the repo root
+./deploy.sh
+```
+
+On the **first** run the systemd unit does not exist yet, so the script
+syncs everything (including `app/server/hamster-app.service`), installs
+deps, brings up the Docker stack, and prints:
+
+```
+deploy.sh: /etc/systemd/system/hamster-app.service not installed yet.
+deploy.sh: run the one-time install per docs/SETUP_MAC_MINI.md step 10.
+```
+
+That is expected. Install the unit once on the Mac Mini using the file
+the deploy just placed:
 
 ```sh
 # On the Mac Mini, one-time
-cd /opt/hamster-cam/app
-sudo cp hamster-app.service /etc/systemd/system/
+cd /opt/hamster-cam
+sudo cp app/server/hamster-app.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now hamster-app
 sudo systemctl status hamster-app
 ```
+
+The unit reads `/opt/hamster-cam/.env` via `EnvironmentFile` and runs
+`dist/index.js` as the `hamster` user. `status` should report
+**active (running)**.
+
+### 10.4 - Subsequent deploys
+
+With the unit installed, every later deploy is one command from the dev
+machine — the script detects the existing unit and restarts it for you:
+
+```sh
+./deploy.sh
+```
+
+The remote `.env` is authoritative and left untouched. To also push the
+dev machine's `.env` (the remote copy is backed up to `.env.bak-<ts>`
+first), pass `--sync-env`:
+
+```sh
+./deploy.sh --sync-env
+```
+
+### 10.5 - Verify
+
+```sh
+# On the Mac Mini
+sudo systemctl status hamster-app          # active (running)
+journalctl -fu hamster-app                 # watch startup + migrations
+curl -fsS http://127.0.0.1:3000/health     # backend answers locally (PORT from .env)
+```
+
+Then load the app over its public Cloudflare URL. If the service
+flaps, `journalctl -u hamster-app` almost always shows why — a missing
+`.env` value or a `better-sqlite3` ABI mismatch (the remote
+`pnpm install --prod` rebuilds it against the Mac Mini's Node; re-run
+`./deploy.sh` if Node was upgraded since).
 
 
 ## Step 11 - Bootstrap the first admin
