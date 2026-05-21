@@ -187,6 +187,7 @@ beforeEach(() => {
   process.env['DATABASE_PATH'] = join(workdir, 'hamster.db');
   process.env['STORAGE_PATH'] = workdir;
   process.env['ZYPHR_API_KEY'] = 'zy_test_dummy';
+  process.env['ZYPHR_APP_SECRET'] = 'zy_test_dummy_secret';
 
   currentSpawnMock = vi.fn(() => makeFakeProc());
   vi.doMock('node:child_process', () => ({

@@ -10,7 +10,12 @@ const envSchema = z.object({
   // Required at runtime; bootstrap CLI also relies on them.
   DATABASE_PATH: z.string().min(1, 'DATABASE_PATH is required'),
   STORAGE_PATH: z.string().min(1, 'STORAGE_PATH is required'),
+  // Zyphr application credentials. Both are required — the SDK sends them as
+  // two distinct headers (X-Application-Key and X-Application-Secret). The key
+  // and secret must come from the SAME Zyphr environment (test vs. live); mixing
+  // them produces an "invalid application credentials" rejection at Zyphr.
   ZYPHR_API_KEY: z.string().min(1, 'ZYPHR_API_KEY is required'),
+  ZYPHR_APP_SECRET: z.string().min(1, 'ZYPHR_APP_SECRET is required — get it from the Zyphr dashboard alongside ZYPHR_API_KEY'),
 
   // Optional with sensible defaults.
   PORT: z

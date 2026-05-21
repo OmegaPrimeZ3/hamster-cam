@@ -1,5 +1,6 @@
 // app/server/src/bootstrap.ts
-// `pnpm hamster bootstrap-admin --email --display-name --password` CLI.
+// bootstrap-admin --email --display-name --password CLI. Dev: `pnpm -C
+// app/server bootstrap-admin`. Prod (--prod host, no tsx): `node dist/bootstrap.js`.
 // Refuses if `users` table is non-empty. Registers at Zyphr, inserts the
 // local admin row. PLAN §7.6.6.
 
@@ -85,7 +86,8 @@ function parseCli(argv: readonly string[]): CliArgs {
 
 function usage(): string {
   return [
-    'Usage: pnpm hamster bootstrap-admin --email <email> --display-name <name> --password <password>',
+    'Usage: bootstrap-admin --email <email> --display-name <name> --password <password>',
+    '  (dev: `pnpm -C app/server bootstrap-admin -- …`; prod: `node dist/bootstrap.js …`)',
     '',
     'Provisions the very first admin account. Refuses to run after the first user exists.',
     '',

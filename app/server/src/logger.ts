@@ -42,6 +42,7 @@ const REDACT_PATHS: readonly string[] = [
   '*.zyphr_access_token',
   // Env-shaped values that occasionally end up logged alongside an error.
   'ZYPHR_API_KEY',
+  'ZYPHR_APP_SECRET',
   'CLOUDFLARE_API_TOKEN',
   'MQTT_PASSWORD',
   'RTSP_PASSWORD',

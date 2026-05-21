@@ -47,6 +47,9 @@ async function main(): Promise<void> {
   // Set env BEFORE importing anything that reads config.
   process.env['ZYPHR_BASE_URL'] = zyphr.baseUrl;
   process.env['ZYPHR_API_KEY'] = process.env['ZYPHR_API_KEY'] ?? 'dev-api-key';
+  // Dev stub ignores the secret header — any non-empty value satisfies config
+  // validation without a real Zyphr tenant.
+  process.env['ZYPHR_APP_SECRET'] = process.env['ZYPHR_APP_SECRET'] ?? 'dev-app-secret';
   process.env['DATABASE_PATH'] = process.env['DATABASE_PATH'] ?? path.join(sandbox, 'db', 'hamster.db');
   process.env['STORAGE_PATH'] = process.env['STORAGE_PATH'] ?? path.join(sandbox, 'storage');
   // Keep PORT off the crowded 3000 default so the launcher can run alongside

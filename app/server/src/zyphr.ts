@@ -24,8 +24,16 @@ let cachedClient: Zyphr | null = null;
 export function getZyphr(): Zyphr {
   if (cachedClient) return cachedClient;
   const cfg = getConfig();
+  // The SDK has two distinct auth credential fields for the Auth-as-a-Service
+  // namespace. Passing only `apiKey` (a single string) causes the SDK to send
+  // that same value for BOTH X-Application-Key and X-Application-Secret,
+  // which Zyphr rejects with "invalid application credentials". The correct
+  // fix is to use the purpose-built `applicationKey` + `applicationSecret`
+  // fields which map 1-to-1 to the two Zyphr headers.
   cachedClient = new Zyphr({
     apiKey: cfg.ZYPHR_API_KEY,
+    applicationKey: cfg.ZYPHR_API_KEY,
+    applicationSecret: cfg.ZYPHR_APP_SECRET,
     ...(cfg.ZYPHR_BASE_URL ? { baseUrl: cfg.ZYPHR_BASE_URL } : {}),
   });
   return cachedClient;

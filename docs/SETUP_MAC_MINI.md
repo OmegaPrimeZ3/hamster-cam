@@ -602,9 +602,14 @@ There is no in-app "create admin" form (anyone with access to the
 public URL could grab admin if there were). Bootstrap the first
 admin once on the Mac Mini:
 
+Run the **built** CLI with `node` — `tsx`/the `pnpm bootstrap-admin` dev
+script isn't available on a `--prod` host. Source `.env` first so the DB
+path and Zyphr key are present (the systemd `EnvironmentFile` doesn't apply
+to a manual shell):
+
 ```sh
-cd /opt/hamster-cam/app
-pnpm hamster bootstrap-admin \
+set -a; . /opt/hamster-cam/.env; set +a
+node /opt/hamster-cam/app/server/dist/bootstrap.js \
   --email you@example.com \
   --display-name "Dad" \
   --password "$(openssl rand -base64 24)"

@@ -115,11 +115,12 @@ describe('logger redact', () => {
   it('drops env-shaped api-key keys at top level', () => {
     const { logger, lines } = makeCaptureLogger();
     logger.info(
-      { ZYPHR_API_KEY: 'zy_live_AAA', MQTT_PASSWORD: 'shhh', RTSP_PASSWORD: 'shhh' },
+      { ZYPHR_API_KEY: 'zy_live_AAA', ZYPHR_APP_SECRET: 'zy_live_SECRET', MQTT_PASSWORD: 'shhh', RTSP_PASSWORD: 'shhh' },
       'env snapshot',
     );
     const first = lines()[0] as Record<string, unknown>;
     expect(first).not.toHaveProperty('ZYPHR_API_KEY');
+    expect(first).not.toHaveProperty('ZYPHR_APP_SECRET');
     expect(first).not.toHaveProperty('MQTT_PASSWORD');
     expect(first).not.toHaveProperty('RTSP_PASSWORD');
   });

@@ -97,6 +97,7 @@ beforeEach(async () => {
   process.env['DATABASE_PATH'] = join(workdir, 'hamster.db');
   process.env['STORAGE_PATH'] = workdir;
   process.env['ZYPHR_API_KEY'] = 'zy_test_dummy';
+  process.env['ZYPHR_APP_SECRET'] = 'zy_test_dummy_secret';
   process.env['ZYPHR_BASE_URL'] = ZYPHR_BASE;
   delete process.env['MQTT_URL'];
   delete process.env['FRIGATE_URL'];
