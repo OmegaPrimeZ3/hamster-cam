@@ -277,7 +277,68 @@ cameras:
 Confirm the three Pi Zeros are streaming (see
 [SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md)) before bringing Frigate up.
 
-### 8.2 - Start Frigate
+### 8.2 - Let Docker resolve the cameras' `.local` names
+
+The camera URLs in `frigate-config.yml` use mDNS names
+(`hamster-cam-1.local`, etc.). Your Mac Mini host resolves these via
+Avahi, but **Docker's container resolver does not speak mDNS** — so
+without this step Frigate starts cleanly but shows no video, because
+ffmpeg inside the container can't resolve the camera hostnames. The Pis
+are fine; the name lookup is what fails.
+
+The fix is host-side: have `systemd-resolved` (already running on
+Ubuntu 24.04) answer mDNS, then point the Docker daemon at it so the
+embedded resolver forwards `.local` lookups there. This keeps Docker's
+own service discovery (e.g. `mosquitto`) working — do **not** override a
+container's `dns:` directly, which would break it.
+
+1. Enable mDNS in `/etc/systemd/resolved.conf` and add a stub listener
+   the containers can reach (the `docker0` bridge IP, normally
+   `172.17.0.1` — confirm with `ip -4 addr show docker0`):
+
+   ```ini
+   [Resolve]
+   MulticastDNS=yes
+   DNSStubListenerExtra=172.17.0.1
+   ```
+
+2. Turn on mDNS for your LAN interface and restart resolved
+   (`<iface>` is your wired NIC from `ip -br link`, e.g. `enp0s31f6`):
+
+   ```sh
+   sudo resolvectl mdns <iface> yes
+   sudo systemctl restart systemd-resolved
+   resolvectl query hamster-cam-1.local      # host resolves it
+   ```
+
+3. Point the Docker daemon's upstream resolver at that listener in
+   `/etc/docker/daemon.json`:
+
+   ```json
+   { "dns": ["172.17.0.1"] }
+   ```
+
+   ```sh
+   sudo systemctl restart docker
+   ```
+
+4. Verify a container can now resolve a camera (do this after 8.3 once
+   Frigate is up, or with any throwaway container):
+
+   ```sh
+   docker exec hamster-frigate getent hosts hamster-cam-1.local
+   ```
+
+   It should print the Pi's live IP. If `172.17.0.1` isn't reachable
+   from the Compose network, bind `DNSStubListenerExtra` to the host's
+   LAN IP instead and use that same IP in `daemon.json`.
+
+> Prefer zero host config? The alternative is static DHCP reservations
+> for each Pi plus an `extra_hosts:` block on the `frigate` service. It
+> works and survives reboots, but you maintain the IP map by hand. The
+> resolved approach above keeps the `.local` names dynamic.
+
+### 8.3 - Start Frigate
 
 ```sh
 docker compose up -d frigate
@@ -287,7 +348,19 @@ docker compose logs -f frigate
 Frigate's web UI is at `http://<mac-mini-ip>:5000`. You should see
 all three cameras live within a minute or two.
 
-### 8.3 - Define zones
+> **"This site can't be reached"?** First confirm the container bound
+> the host port: `docker compose ps` (frigate should be `running`, not
+> restarting) and `sudo lsof -nP -iTCP:5000 -sTCP:LISTEN`.
+>
+> **macOS path only:** Control Center / AirPlay Receiver squats on port
+> 5000, so Docker can't bind it and the container won't start. Free it
+> via **System Settings → General → AirDrop & Handoff → turn off
+> "AirPlay Receiver."** (Ubuntu has nothing on 5000 by default.)
+>
+> The Frigate UI has no auth — it's published to the LAN only; never
+> forward port 5000 at your router.
+
+### 8.4 - Define zones
 
 For each camera, define rectangular zones over the wheel, food bowl,
 and water bottle areas. Frigate has a built-in zone editor.
@@ -303,7 +376,7 @@ The zone names matter - the narrator code on the backend looks for
 specific zone names (`wheel`, `food`, `water`, etc.). Match the
 names used in `app/server/src/narratives.ts`.
 
-### 8.4 - Detection model
+### 8.5 - Detection model
 
 Frigate's default model does not recognize "hamster". You have two
 realistic options.
@@ -323,7 +396,7 @@ Often works well enough for one stationary cage.
    to your custom model.
 6. Restart Frigate.
 
-### 8.5 - Verify detection
+### 8.6 - Verify detection
 
 Watch the Frigate debug view in the web UI. Bounding boxes should
 appear when the hamster is visible. Tune `min_score` and zone

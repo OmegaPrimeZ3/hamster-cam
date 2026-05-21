@@ -92,7 +92,7 @@ ffmpeg:
 # Per-camera blocks. Zones are placeholders — the operator uses Frigate's
 # zone editor in the web UI to draw real boxes over each cage and then
 # Frigate writes the updated coordinates back into this file. See
-# docs/SETUP_MAC_MINI.md step 8.3. Names must match the narrator's
+# docs/SETUP_MAC_MINI.md step 8.4. Names must match the narrator's
 # expectations.
 cameras:
   hamster_cam_1:

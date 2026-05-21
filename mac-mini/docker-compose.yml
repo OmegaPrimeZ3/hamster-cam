@@ -59,15 +59,25 @@ services:
     depends_on:
       mosquitto:
         condition: service_healthy
+    # NOTE: the `.local` camera names in frigate-config.yml are mDNS and
+    # Docker's resolver can't resolve them on its own. The fix is host-side
+    # — systemd-resolved does mDNS and the Docker daemon forwards `.local`
+    # to it. See docs/SETUP_MAC_MINI.md "Step 8.0 - Let Docker resolve the
+    # cameras' .local names". No per-container config needed here.
     # iGPU for OpenVINO. /dev/dri must exist on the host (intel-opencl-icd +
     # intel-media-va-driver-non-free, per docs/SETUP_MAC_MINI.md step 3).
     devices:
       - /dev/dri:/dev/dri
-    # NO published ports — Caddy reaches Frigate's web UI / API on the
-    # compose network at http://frigate:5000. The host-side backend reaches
-    # it via host.docker.internal (see app/server/.env: FRIGATE_URL).
-    expose:
-      - "5000"
+    # Caddy reaches Frigate's web UI / API on the compose network at
+    # http://frigate:5000, and the host-side backend via
+    # host.docker.internal (see app/server/.env: FRIGATE_URL). We also
+    # publish 5000 to the LAN for direct access to Frigate's (unauthenticated)
+    # web UI — zone editing, model debugging, logs. NOTE (macOS path
+    # only): Control Center / AirPlay Receiver squats on host port 5000;
+    # disable it (System Settings → General → AirDrop & Handoff) or this
+    # won't bind. Ubuntu (the recommended path) has nothing on 5000.
+    ports:
+      - "5000:5000"
     volumes:
       - ./frigate-config.yml:/config/config.yml:ro
       - ./storage/frigate:/media/frigate

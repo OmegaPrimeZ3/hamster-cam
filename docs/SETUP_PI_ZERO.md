@@ -113,7 +113,7 @@ On the Pi:
 # Create the env file with the password (use the same value you
 # have in the Mac Mini's .env)
 sudo tee /etc/go2rtc/go2rtc.env > /dev/null <<'EOF'
-RTSP_PASSWORD=PASTE_YOUR_LONG_RANDOM_PASSWORD_HERE
+RTSP_PASSWORD=g94YRe6Gh0KwGdzeQqpb
 EOF
 sudo chmod 600 /etc/go2rtc/go2rtc.env
 sudo chown root:root /etc/go2rtc/go2rtc.env
@@ -149,13 +149,16 @@ The Mac Mini side reads the same password from
 
 ## Step 7 - Install the systemd service and watchdog
 
-The repo ships three files for the Pi:
+The repo ships four files for the Pi:
 
 - `pi-zero/go2rtc.service` - systemd unit with Restart=always and
   EnvironmentFile=/etc/go2rtc/go2rtc.env
 - `pi-zero/go2rtc-watchdog.sh` - probes the local go2rtc HTTP and
   RTSP ports; restarts the service on 3 consecutive failures and
   reboots the Pi on 10 consecutive failures
+- `pi-zero/go2rtc-watchdog.service` - oneshot unit the timer triggers;
+  runs the watchdog script. The timer is bound to this, so it MUST be
+  installed or `enable --now` on the timer fails.
 - `pi-zero/go2rtc-watchdog.timer` - runs the watchdog every 60s
 
 Install them from your dev machine:
@@ -163,14 +166,16 @@ Install them from your dev machine:
 ```
 scp pi-zero/go2rtc.service hamster@hamster-cam-1.local:/tmp/
 scp pi-zero/go2rtc-watchdog.sh hamster@hamster-cam-1.local:/tmp/
+scp pi-zero/go2rtc-watchdog.service hamster@hamster-cam-1.local:/tmp/
 scp pi-zero/go2rtc-watchdog.timer hamster@hamster-cam-1.local:/tmp/
 
 ssh hamster@hamster-cam-1.local '
   sudo mv /tmp/go2rtc.service /etc/systemd/system/
   sudo mv /tmp/go2rtc-watchdog.sh /usr/local/sbin/
+  sudo mv /tmp/go2rtc-watchdog.service /etc/systemd/system/
   sudo mv /tmp/go2rtc-watchdog.timer /etc/systemd/system/
   sudo chmod +x /usr/local/sbin/go2rtc-watchdog.sh
-  sudo chmod 644 /etc/systemd/system/go2rtc.service /etc/systemd/system/go2rtc-watchdog.timer
+  sudo chmod 644 /etc/systemd/system/go2rtc.service /etc/systemd/system/go2rtc-watchdog.service /etc/systemd/system/go2rtc-watchdog.timer
 
   sudo systemctl daemon-reload
   sudo systemctl enable --now go2rtc
