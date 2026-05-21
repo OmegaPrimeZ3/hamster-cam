@@ -5,37 +5,37 @@
 # and are loaded by the go2rtc.service unit's EnvironmentFile= directive.
 # See docs/SETUP_PI_ZERO.md steps 5–7.
 #
-# Tunables an operator may want to adjust live in the `streams.camera` exec line:
-#   -input_format mjpeg  ← IMX462 ships hardware MJPEG; keep this unless you've
-#                          confirmed a different format with `v4l2-ctl --list-formats-ext`.
-#   -framerate 15        ← NOTE: this IMX462 only advertises 30fps discrete at
-#                          every resolution, so the driver clamps capture to 30
-#                          (confirm: `v4l2-ctl -d /dev/video0 --get-parm`). The
-#                          flag is kept as intent, but with `-c copy` we pass all
-#                          30 frames. To truly hit 15fps you'd have to re-encode
-#                          on the Pi (decode MJPEG → -r 15 → mjpeg) — not done,
-#                          to preserve the copy-only design; 480p@30 + power-save
-#                          off was enough to clear the lag (see below).
-#   -video_size 640x480  ← BANDWIDTH-CRITICAL. The Pi ships raw MJPEG (no
-#                          inter-frame compression) over a 2.4GHz-only BCM43430.
-#                          720p MJPEG measured ~18–31 Mbps PER camera; two feeds
-#                          (~49 Mbps) saturated the 2.4GHz band and caused multi-
-#                          second live lag whenever both cams streamed. 640x480@30
-#                          measured ~24 Mbps/cam — still ~48 combined, so the
-#                          resolution cut alone did NOT fix it; the decisive change
-#                          was disabling WiFi power-save on both Pis (see
-#                          wifi-powersave-off.service), which removed the radio's
-#                          beacon-nap latency/jitter. 480p also keeps Frigate's
-#                          detect cheaper and the live image lighter on mobile.
-#                          Supported MJPG modes here: 1920x1080, 1280x720, 640x480,
-#                          320x240 (verify with --list-formats-ext). For full 720p
-#                          on both cams, move the Pis off WiFi (e.g. USB-Ethernet).
+# ENCODE AT THE EDGE. The Pi captures MJPEG from the camera, decodes it, and
+# HARDWARE-encodes H264 on the VideoCore IV block (/dev/video11, bcm2835-codec)
+# via ffmpeg's h264_v4l2m2m. It then ships ~3 Mbps of H264 instead of ~25 Mbps
+# of MJPEG — ~8x less data — which is what lets us run 720p over the 2.4GHz-only
+# BCM43430 radio without saturating it. (Two 720p MJPEG feeds = ~50 Mbps = past
+# the 2.4GHz goodput ceiling = multi-second live lag; that's why we were stuck
+# at 480p MJPEG before.) "The Pi can't encode H264" was only ever true for
+# SOFTWARE libx264; the hardware encoder does 720p30 at >2x realtime (~1 CPU
+# core, just for the MJPEG decode — the encode itself is offloaded to the GPU).
 #
-# The `exec:` source pipes the v4l2 capture straight into RTSP with `-c copy`
-# so the Pi never re-encodes — that's the whole reason this stack works on a
-# $15 board. If `-c copy` ever fails (codec mismatch), check that MJPEG is
-# the actual capture format before reaching for libx264 (which the Pi can't
-# realtime-encode at 720p).
+# Tunables in the `streams.camera` exec line:
+#   -input_format mjpeg  ← IMX462 ships hardware MJPEG over USB (raw YUV at 720p
+#                          would exceed USB 2.0 bandwidth). Decoded on-Pi before
+#                          re-encode. Confirm formats: `v4l2-ctl --list-formats-ext`.
+#   -framerate 30        ← the IMX462 only advertises 30fps discrete at every
+#                          resolution, so it captures 30 regardless. H264's tiny
+#                          footprint means 30fps is affordable now.
+#   -video_size 1280x720 ← 720p H264 ≈ 3 Mbps. 1080x1920 (~4-5 Mbps) is also
+#                          viable on this radio if you want it; bump -b:v with it.
+#   -c:v h264_v4l2m2m    ← the HARDWARE encoder. Do NOT use libx264 (the A53
+#                          can't do it realtime). Needs -pix_fmt yuv420p (the
+#                          encoder wants YU12).
+#   -b:v 3M / -g 30      ← target bitrate / keyframe every 1s. Raise -b:v if the
+#                          VideoCore IV encoder (an old block — softer than x264)
+#                          looks too blocky; lower it for more radio headroom.
+#
+# CAVEAT: H264 is far less tolerant of WiFi packet loss than MJPEG (a lost
+# P-frame smears until the next keyframe, vs MJPEG's single-bad-frame). Mitigated
+# by H264's small footprint (less airtime → less loss), TCP pull on the Mini, and
+# the now-healthy link (power-save off — see wifi-powersave-off.service). If you
+# see persistent green-smear artifacts, shorten -g (more keyframes) or drop -b:v.
 
 # go2rtc's built-in HTTP API + web UI. Used by the watchdog to probe liveness
 # (curl http://localhost:1984/api/streams) and by humans for stream debugging.
@@ -60,4 +60,4 @@ log:
 # Mini pulls this as rtsp://hamster:<password>@hamster-cam-N.local:8554/camera.
 streams:
   camera:
-    - exec:ffmpeg -hide_banner -loglevel warning -f v4l2 -input_format mjpeg -framerate 15 -video_size 640x480 -i /dev/video0 -c copy -f rtsp {output}
+    - exec:ffmpeg -hide_banner -loglevel warning -f v4l2 -input_format mjpeg -framerate 30 -video_size 1280x720 -i /dev/video0 -c:v h264_v4l2m2m -b:v 3M -g 30 -pix_fmt yuv420p -f rtsp {output}
