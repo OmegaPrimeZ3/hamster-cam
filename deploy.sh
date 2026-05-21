@@ -99,6 +99,15 @@ rsync_cmd() {
     # shellcheck disable=SC2086
     rsync -az --delete --human-readable -e "ssh $SSH_OPTS" "$@"
 }
+# Same as rsync_cmd but WITHOUT --delete. Use when the destination tree is
+# SHARED with files this script does not manage. The mac-mini/ configs sync
+# onto /opt/hamster-cam/, which also holds app/ (the synced bundle + systemd
+# unit), db/ (the SQLite database!), and pi-zero-staging/. A root-level
+# --delete there would wipe all of them on every deploy.
+rsync_nodelete() {
+    # shellcheck disable=SC2086
+    rsync -az --human-readable -e "ssh $SSH_OPTS" "$@"
+}
 
 # ----------------------------------------------------------------------
 # 1. Build locally (web + server). pnpm-rooted workspaces handle deps.
@@ -165,11 +174,15 @@ rsync_cmd app/web/dist/ "${REMOTE}:${MAC_MINI_PATH}/app/web/dist/"
 #    instead of silently overwritten).
 # ----------------------------------------------------------------------
 log "syncing Mac Mini infra configs"
-rsync_cmd \
+# mosquitto/config/passwd is generated on the host (SETUP step 7.1) and is
+# NOT in the repo, so without this exclude --delete would wipe it every
+# deploy and break broker auth stack-wide.
+rsync_nodelete \
     --exclude='.env' \
     --exclude='storage/' \
     --exclude='caddy/data/' \
     --exclude='caddy/config/' \
+    --exclude='mosquitto/config/passwd' \
     mac-mini/ "${REMOTE}:${MAC_MINI_PATH}/"
 
 # ----------------------------------------------------------------------
