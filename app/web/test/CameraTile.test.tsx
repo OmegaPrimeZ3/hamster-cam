@@ -11,12 +11,13 @@ import { renderWithProviders } from './test-utils';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 
-function makeCamera(lastFrameAt: number | null): CameraDTO {
+function makeCamera(lastFrameAt: number | null, liveSrc: string | null = null): CameraDTO {
   return {
     id: 1,
     name: 'Wheel Cam',
     emoji: '🎡',
-    stream_url: 'http://localhost/stream/1',
+    stream_url: '',
+    live_src: liveSrc,
     position: 0,
     enabled: true,
     created_at: 0,

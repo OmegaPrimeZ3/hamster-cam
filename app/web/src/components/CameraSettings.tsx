@@ -113,7 +113,11 @@ export function CameraSettings(): JSX.Element {
                 <span aria-hidden style={{ fontSize: 20 }}>{cam.emoji}</span>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 600 }}>{cam.name}</div>
-                  <small style={{ color: 'var(--text-muted)', wordBreak: 'break-all' }}>{cam.stream_url}</small>
+                  <small style={{ color: 'var(--text-muted)', wordBreak: 'break-all' }}>
+                    {cam.live_src
+                      ? <><span aria-label="go2rtc stream">📡</span> {cam.live_src}</>
+                      : <span style={{ fontStyle: 'italic' }}>no stream configured</span>}
+                  </small>
                   <div
                     style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}
                     aria-label="Configured zones"

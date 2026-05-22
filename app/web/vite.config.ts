@@ -46,7 +46,7 @@ export default defineConfig({
         // App shell SPA fallback so the PWA boots offline on any deep link.
         navigateFallback: '/index.html',
         // ALWAYS bypass the SW for these — they must hit the live backend.
-        navigateFallbackDenylist: [/^\/trpc/, /^\/auth/, /^\/snapshots/, /^\/stream/, /^\/api/],
+        navigateFallbackDenylist: [/^\/trpc/, /^\/auth/, /^\/snapshots/, /^\/stream/, /^\/live/, /^\/api/],
         runtimeCaching: [
           {
             // Auth endpoints — never cache.
@@ -85,9 +85,14 @@ export default defineConfig({
             },
           },
           {
-            // Live video streams — never cache. The <video-stream> element
-            // (or <video>) manages its own buffer.
+            // Legacy live stream path — never cache.
             urlPattern: /\/stream\/.*/i,
+            handler: 'NetworkOnly',
+          },
+          {
+            // go2rtc WebSocket live-view proxy — never cache.
+            // The VideoRTC element manages its own WS buffer.
+            urlPattern: /\/live\/.*/i,
             handler: 'NetworkOnly',
           },
         ],
@@ -109,6 +114,7 @@ export default defineConfig({
         '/auth':      { target: backend, changeOrigin: false },
         '/snapshots': { target: backend, changeOrigin: false },
         '/stream':    { target: backend, changeOrigin: false, ws: true },
+        '/live':      { target: backend, changeOrigin: false, ws: true },
       };
     })(),
   },

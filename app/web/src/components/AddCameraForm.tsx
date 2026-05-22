@@ -1,7 +1,9 @@
 // app/web/src/components/AddCameraForm.tsx
 //
-// Add or edit a camera. Stream URL must look like `rtsp://...` or http(s).
-// Discover + Test buttons hit cameras.discover and cameras.testStream.
+// Add or edit a camera. The stream is now configured via a go2rtc stream name
+// (live_src), NOT a raw RTSP URL. The Discover button populates a dropdown
+// from cameras.discover; the user can also type a name manually as a fallback.
+//
 // When 'wheel' is in the zones array, a WheelOdometerSection is rendered
 // below the zones picker — its fields travel through the same save mutation.
 
@@ -16,7 +18,8 @@ import {
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 
-const STREAM_RE = /^(rtsp|rtsps|http|https):\/\//i;
+/** go2rtc stream name: alphanumeric + underscores/hyphens, no slashes or spaces. */
+const LIVE_SRC_RE = /^[a-zA-Z0-9_\-.]+$/;
 
 export interface AddCameraFormProps {
   existing?: CameraDTO;
@@ -46,14 +49,12 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
 
   const [name, setName] = useState(existing?.name ?? '');
   const [emoji, setEmoji] = useState(existing?.emoji ?? '📷');
-  const [url, setUrl] = useState(existing?.stream_url ?? '');
+  // live_src: the go2rtc stream name used by /live/ws?src=<name>
+  const [liveSrc, setLiveSrc] = useState(existing?.live_src ?? '');
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const [zones, setZones] = useState<string[]>(existing?.zones ?? []);
-  const [showPreview, setShowPreview] = useState(false);
 
-  // Wheel odometer config — extract defensively from the existing DTO since
-  // the backend fields are being added in parallel. Fall back to defaults if
-  // the fields aren't present yet.
+  // Wheel odometer config
   const existingExt = existing as (CameraDTO & Partial<WheelConfig>) | undefined;
   const [wheelConfig, setWheelConfig] = useState<WheelConfig>({
     wheel_mark_enabled: existingExt?.wheel_mark_enabled ?? WHEEL_CONFIG_DEFAULTS.wheel_mark_enabled,
@@ -67,38 +68,44 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
     setZones((prev) => (prev.includes(z) ? prev.filter((x) => x !== z) : [...prev, z]));
   }
 
+  // Reset test result when liveSrc changes.
   useEffect(() => {
-    setShowPreview(false);
-  }, [url]);
+    testStream.reset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveSrc]);
 
-  const urlOk = STREAM_RE.test(url);
-  const formOk = name.trim().length > 0 && urlOk;
+  const liveSrcValue = liveSrc.trim();
+  const liveSrcOk = liveSrcValue === '' || LIVE_SRC_RE.test(liveSrcValue);
+  const liveSrcSet = liveSrcValue.length > 0 && liveSrcOk;
+  const formOk = name.trim().length > 0;
   const submitting = create.isLoading || update.isLoading;
 
   function submit(): void {
     if (!formOk) return;
+    const commonFields = {
+      name: name.trim(),
+      emoji,
+      enabled,
+      zones,
+      // live_src: empty string → send null to clear; otherwise send the value.
+      live_src: liveSrcValue.length > 0 ? liveSrcValue : null,
+    };
+
     if (existing) {
-      // The wheel config fields are part of cameras.update per the extended
-      // backend contract. Once the backend ships, these flow through naturally.
-      // Cast the whole mutation input through unknown once here to absorb the
-      // new wheel fields until the AppRouter type reflects them.
       const payload: unknown = {
         id: existing.id,
-        name: name.trim(),
-        emoji,
-        stream_url: url.trim(),
-        enabled,
-        zones,
+        ...commonFields,
+        stream_url: existing.stream_url ?? '',
         ...(zones.includes('wheel') ? wheelConfig : {}),
       };
       (update.mutate as (input: unknown) => void)(payload);
     } else {
       create.mutate({
-        name: name.trim(),
-        emoji,
-        stream_url: url.trim(),
-        enabled,
-        zones,
+        name: commonFields.name,
+        emoji: commonFields.emoji,
+        live_src: commonFields.live_src,
+        enabled: commonFields.enabled,
+        zones: commonFields.zones,
       });
     }
   }
@@ -135,18 +142,37 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
       </div>
 
       <div>
-        <label className="hc-label" htmlFor="cam-url">Stream URL</label>
-        <input
-          id="cam-url"
-          className="hc-input"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          placeholder="rtsp://192.168.1.50:8554/wheel"
-          required
-          aria-invalid={!urlOk && url.length > 0}
-        />
-        {!urlOk && url.length > 0 && (
-          <small style={{ color: 'var(--danger)' }}>Use rtsp://… or http(s)://…</small>
+        <label className="hc-label" htmlFor="cam-live-src">
+          go2rtc stream name
+        </label>
+        <p style={{ margin: '0 0 6px', color: 'var(--text-muted)', fontSize: 12 }}>
+          The stream name configured in Frigate / go2rtc (e.g.{' '}
+          <code>hamster_cam_1</code>). Use <strong>Discover</strong> to pick from
+          detected cameras, or type it manually. Leave blank to skip live video.
+        </p>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            id="cam-live-src"
+            className="hc-input"
+            value={liveSrc}
+            onChange={(e) => setLiveSrc(e.target.value)}
+            placeholder="hamster_cam_1"
+            aria-invalid={!liveSrcOk && liveSrc.length > 0}
+            style={{ flex: 1 }}
+            list="cam-live-src-datalist"
+          />
+          {discover.data && discover.data.length > 0 && (
+            <datalist id="cam-live-src-datalist">
+              {discover.data.map((d) => (
+                <option key={d.live_src} value={d.live_src}>{d.name}</option>
+              ))}
+            </datalist>
+          )}
+        </div>
+        {!liveSrcOk && liveSrc.length > 0 && (
+          <small style={{ color: 'var(--danger)' }}>
+            Use only letters, numbers, underscores, hyphens, and dots — no spaces or slashes.
+          </small>
         )}
       </div>
 
@@ -222,10 +248,10 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
           type="button"
           className="hc-btn"
           onClick={() => {
-            if (!urlOk) return;
-            testStream.mutate({ stream_url: url.trim() }, { onSuccess: () => setShowPreview(true) });
+            if (!liveSrcSet) return;
+            testStream.mutate({ live_src: liveSrcValue });
           }}
-          disabled={!urlOk || testStream.isLoading}
+          disabled={!liveSrcSet || testStream.isLoading}
         >
           {testStream.isLoading ? 'Testing…' : 'Test'}
         </button>
@@ -234,47 +260,46 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
         </button>
       </div>
 
+      {/* Discovery results — tap a chip to fill the live_src field */}
       {discover.data && discover.data.length > 0 && (
         <div className="hc-card-raised" style={{ padding: 10 }}>
-          <p style={{ margin: '0 0 6px' }}>Detected cameras:</p>
+          <p style={{ margin: '0 0 6px', fontSize: 13 }}>Detected streams — tap to select:</p>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             {discover.data.map((d) => (
               <button
-                key={d.stream_url}
+                key={d.live_src}
                 type="button"
                 className="hc-btn"
                 onClick={() => {
-                  setName(d.name);
-                  setUrl(d.stream_url);
+                  setName((prev) => (prev.length > 0 ? prev : d.name));
+                  setLiveSrc(d.live_src);
                 }}
               >
-                {d.name}
+                {d.name}{' '}
+                <code style={{ fontSize: 11, opacity: 0.75 }}>{d.live_src}</code>
               </button>
             ))}
           </div>
         </div>
       )}
       {discover.data && discover.data.length === 0 && (
-        <p style={{ color: 'var(--text-muted)' }}>No cameras found by Frigate.</p>
+        <p style={{ color: 'var(--text-muted)' }}>No streams found via Frigate.</p>
+      )}
+      {discover.isError && (
+        <p style={{ color: 'var(--danger)' }}>
+          Discover failed — is Frigate reachable?
+        </p>
       )}
 
       {testStream.data && (
         <p style={{ color: testStream.data.ok ? 'var(--success)' : 'var(--danger)' }}>
-          {testStream.data.ok ? '✅ Reachable.' : `❌ Probe failed${testStream.data.status ? ` (status ${testStream.data.status})` : ''}.`}
+          {testStream.data.ok
+            ? '✅ Stream name is known to go2rtc.'
+            : '❌ Stream name not found in go2rtc. Check Frigate config.'}
         </p>
       )}
       {testStream.error && (
         <p style={{ color: 'var(--danger)' }}>{testStream.error.message}</p>
-      )}
-
-      {showPreview && testStream.data?.ok && (
-        <video
-          src={url}
-          controls
-          muted
-          playsInline
-          style={{ width: '100%', maxHeight: 220, background: '#000', borderRadius: 10 }}
-        />
       )}
 
       {(create.error || update.error) && (

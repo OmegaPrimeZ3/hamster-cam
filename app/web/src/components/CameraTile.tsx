@@ -2,8 +2,7 @@
 //
 // Single camera tile. Full state machine per PLAN §5.4:
 //   - loading: spinning mascot, "Looking for {pet}..."
-//   - live:    plays stream via <video> (go2rtc HLS/WebRTC URL passed straight
-//              through; backend hands us the resolved URL)
+//   - live:    plays stream via <LiveStream> (go2rtc WebRTC → MSE)
 //   - napping: dimmed + sleeping mascot, "Wheel Cam is taking a nap…"
 //   - offline: deep sleep, prompt to check
 //   - error:   explicit failure, deep-link to settings for admins
@@ -11,12 +10,16 @@
 // State source of truth is the backend's `last_frame_at` on cameras.list — we
 // compute the visual state purely from `Date.now() - last_frame_at`, so the
 // frontend doesn't need its own ticker.
+//
+// If camera.live_src is null the tile renders a "not configured" affordance
+// inside the live-state wrapper instead of a blank stream.
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { Maximize2, AlertCircle } from 'lucide-react';
 import type { RouterOutputs } from '../trpc';
 import { Mascot } from './Mascot';
+import { LiveStream } from './LiveStream';
 import { relativeTime } from '../lib/time';
 
 export type CameraTileState = 'loading' | 'live' | 'napping' | 'offline' | 'error';
@@ -54,21 +57,24 @@ export function CameraTile({
   now,
 }: CameraTileProps): JSX.Element {
   const reduced = useReducedMotion();
-  const [videoError, setVideoError] = useState(false);
+  const [streamError, setStreamError] = useState(false);
 
   const effectiveNow = now ?? Date.now();
   let state: CameraTileState = tileStateFor(camera.last_frame_at, effectiveNow);
-  if (videoError) state = 'error';
+  if (streamError) state = 'error';
 
-  // Retry loop: poll the tile state when napping/offline.
+  const handleStreamError = useCallback(() => {
+    setStreamError(true);
+  }, []);
+
+  // Retry loop: clear the error flag periodically so the stream can reconnect.
+  // The VideoRTC element handles its own WS reconnect; clearing streamError here
+  // lets the parent see the tile re-enter the `live` visual state.
   useEffect(() => {
-    if (state !== 'napping' && state !== 'offline') return undefined;
+    if (state !== 'napping' && state !== 'offline' && state !== 'error') return undefined;
     const interval = state === 'napping' ? 10_000 : 30_000;
     const id = window.setInterval(() => {
-      // Clearing the video error lets the next paint re-attempt the stream;
-      // the actual refresh of last_frame_at is driven by the cameras.list
-      // refetchInterval on Header / parent.
-      setVideoError(false);
+      setStreamError(false);
     }, interval);
     return () => window.clearInterval(id);
   }, [state]);
@@ -94,18 +100,18 @@ export function CameraTile({
       }}
     >
       {state === 'live' && (
-        <video
-          key={camera.stream_url}
-          src={camera.stream_url}
-          autoPlay
-          muted
-          playsInline
-          onError={() => setVideoError(true)}
-          style={{ width: '100%', height: '100%', objectFit: 'cover', background: '#000' }}
+        <LiveStream
+          liveSrc={camera.live_src}
+          onError={handleStreamError}
+          isAdmin={isAdmin}
+          onConfigureClick={onAdminFix ? () => onAdminFix(camera.id) : undefined}
+          style={{ position: 'absolute', inset: 0 }}
         />
       )}
 
-      {state !== 'live' && <PlaceholderArt state={state} petName={petName} petEmoji={petEmoji} camera={camera} />}
+      {state !== 'live' && (
+        <PlaceholderArt state={state} petName={petName} petEmoji={petEmoji} camera={camera} />
+      )}
 
       <div
         style={{
@@ -121,6 +127,7 @@ export function CameraTile({
           fontSize: 14,
           fontWeight: 500,
           maxWidth: 'calc(100% - 80px)',
+          zIndex: 1,
         }}
       >
         <span aria-hidden>{camera.emoji}</span>
@@ -136,6 +143,7 @@ export function CameraTile({
           background: 'color-mix(in srgb, var(--surface) 88%, transparent)',
           borderRadius: 8,
           display: 'inline-flex',
+          zIndex: 1,
         }}
       >
         <Maximize2 aria-hidden size={18} />
@@ -149,7 +157,7 @@ export function CameraTile({
             onAdminFix(camera.id);
           }}
           className="hc-btn"
-          style={{ position: 'absolute', top: 10, right: 10, padding: '4px 10px', minHeight: 36 }}
+          style={{ position: 'absolute', top: 10, right: 10, padding: '4px 10px', minHeight: 36, zIndex: 2 }}
         >
           <AlertCircle aria-hidden size={16} /> Fix
         </button>

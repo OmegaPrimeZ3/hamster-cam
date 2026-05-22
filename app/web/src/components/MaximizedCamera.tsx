@@ -8,6 +8,14 @@
 //   - 📸 Take a photo! → activity.snapshot (saves a diary memory)
 //   - Picture-in-picture + fullscreen via the native APIs
 //   - Auto-rotate every 10s when enabled in settings
+//
+// The <LiveStream> component renders the go2rtc VideoRTC player. The zoom
+// transform (translate + scale) is applied to a wrapper div around <LiveStream>
+// so the pinch-zoom math is identical to how it worked with the raw <video>
+// element — same CSS transform string, same transform-origin tracking.
+//
+// videoRef is forwarded into <LiveStream> so we can request PiP on the inner
+// <video> element that VideoRTC creates internally.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
@@ -16,6 +24,7 @@ import { Camera, PictureInPicture2, Maximize, X } from 'lucide-react';
 import type { RouterOutputs } from '../trpc';
 import { trpc } from '../trpc';
 import { useTouchZoom } from '../hooks/useTouchZoom';
+import { LiveStream } from './LiveStream';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 
@@ -28,6 +37,9 @@ export interface MaximizedCameraProps {
   petEmoji: string;
   autoRotate: boolean;
   onClose: () => void;
+  /** Admin callback to navigate to Settings → Cameras. */
+  onAdminFix?: () => void;
+  isAdmin?: boolean;
 }
 
 export function MaximizedCamera({
@@ -37,11 +49,14 @@ export function MaximizedCamera({
   petEmoji,
   autoRotate,
   onClose,
+  onAdminFix,
+  isAdmin,
 }: MaximizedCameraProps): JSX.Element | null {
   const orderedIds = useMemo(() => cameras.map((c) => c.id), [cameras]);
   const initialIndex = Math.max(0, orderedIds.indexOf(initialCameraId));
   const [index, setIndex] = useState(initialIndex);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // videoRef is forwarded to the inner <video> inside VideoRTC for PiP support.
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [snapMessage, setSnapMessage] = useState<string | null>(null);
   const [snapKind, setSnapKind] = useState<'success' | 'error'>('success');
@@ -175,22 +190,31 @@ export function MaximizedCamera({
           touchAction: 'none',
         }}
       >
-        <video
-          key={current.stream_url}
-          ref={videoRef}
-          src={current.stream_url}
-          autoPlay
-          muted
-          playsInline
+        {/*
+          The zoom transform goes on this wrapper div. <LiveStream> fills it
+          100% × 100%, so the pinch math is identical to what was on the <video>
+          element previously — same CSS transform string, same origin tracking.
+          The key prop on LiveStream ensures a clean DOM remount (VideoRTC
+          teardown + reconnect) when the camera changes.
+        */}
+        <div
           style={{
             width: '100%',
             height: '100%',
-            objectFit: 'contain',
             transform,
             transformOrigin,
             transition: 'transform 60ms linear',
           }}
-        />
+        >
+          <LiveStream
+            key={current.id}
+            liveSrc={current.live_src}
+            videoRef={videoRef}
+            isAdmin={isAdmin}
+            onConfigureClick={onAdminFix}
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+          />
+        </div>
 
         <button
           type="button"
@@ -263,6 +287,7 @@ export function MaximizedCamera({
                 fontSize: 18,
                 boxShadow: '0 12px 28px rgba(0,0,0,0.22)',
                 whiteSpace: 'nowrap',
+                zIndex: 2,
               }}
             >
               {`📸 ${snapMessage}`}
@@ -287,6 +312,7 @@ export function MaximizedCamera({
                 padding: '8px 14px',
                 borderRadius: 10,
                 fontWeight: 500,
+                zIndex: 2,
               }}
             >
               {snapMessage}
@@ -304,6 +330,7 @@ export function MaximizedCamera({
             background: 'rgba(0,0,0,0.5)',
             padding: '4px 10px',
             borderRadius: 999,
+            zIndex: 1,
           }}
         >
           {current.emoji} {current.name} · {petName}
