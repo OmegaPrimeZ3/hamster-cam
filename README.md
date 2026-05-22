@@ -372,33 +372,64 @@ but the send action returns an error — no app crash.
                                       ┌──────────────────────────────┐
 3× IMX462 USB cam ──┐                │  Mac Mini (Ubuntu Server)    │
                     ├─→ Pi Zero 2W ──┤  ├── Frigate (Docker)        │
-3× IMX462 USB cam ──┤  (go2rtc)      │  │   └── go2rtc inside       │
-                    ├─→ Pi Zero 2W ──┤  │   └── OpenVINO inference  │
-3× IMX462 USB cam ──┘  (go2rtc)     WiFi│  ├── Mosquitto MQTT        │
-                                      │  ├── App backend (Fastify)   │
-                                      │  │   ├── SQLite             │
-                                      │  │   ├── MQTT subscriber    │
-                                      │  │   ├── Cron jobs:         │
-                                      │  │   │   ├── 23:55 timelapse│
-                                      │  │   │   ├── 23:58 recap*   │
-                                      │  │   │   ├── 02:00 retention│
-                                      │  │   │   └── 03:00 disk-watch│
-                                      │  │   ├── Web Push fanout    │
-                                      │  │   └── Zyphr SDK (auth)   │
-                                      │  └── App frontend (React)   │
-                                      │      served by backend       │
+3× IMX462 USB cam ──┤  H264 encode   │  │   ├── go2rtc (relay)     │
+                    ├─→ Pi Zero 2W ──┤  │   │   single pull/Pi     │
+3× IMX462 USB cam ──┘  (go2rtc)     WiFi│  │   └── loopback RTSP   │
+                                      │  │   └── OpenVINO inference │
+                                      │  ├── Mosquitto MQTT         │
+                                      │  ├── App backend (Fastify)  │
+                                      │  │   ├── SQLite            │
+                                      │  │   ├── MQTT subscriber   │
+                                      │  │   ├── /live/ws proxy    │ ← authenticated WS
+                                      │  │   ├── Cron jobs:        │   → go2rtc inside Frigate
+                                      │  │   │   ├── 23:55 timelapse
+                                      │  │   │   ├── 23:58 recap*  │
+                                      │  │   │   ├── 02:00 retention
+                                      │  │   │   └── 03:00 disk-watch
+                                      │  │   ├── Web Push fanout   │
+                                      │  │   └── Zyphr SDK (auth)  │
+                                      │  └── App frontend (React)  │
+                                      │      served by backend      │
                                       └──────────────────────────────┘
                                                    ↑
                                               Daughter's tablet
-                                              over the open internet
                                               (DDNS + Caddy + auth)
+                                         LAN: WebRTC (port 8555 UDP)
+                                      Remote: MSE over WSS/Cloudflare
 
                                        * optional, off without GEMINI_API_KEY
 ```
 
+### Live-view data flow
+
+The Pi Zeros hardware-encode H264 (VideoCore IV). go2rtc inside Frigate
+pulls each Pi exactly once over WiFi and fans out to all consumers:
+detect, record, and live view — no transcoding on the Mini.
+
+The browser live view uses go2rtc's auto-negotiating player over a single
+authenticated WebSocket. The backend's `GET /live/ws?src=<stream-name>`
+verifies the `__Host-session` cookie and allows only configured camera
+stream names, then reverse-proxies the WebSocket to Frigate's embedded
+go2rtc at `http://frigate:5000/api/go2rtc/api/ws?src=<name>`.
+
+On the LAN the player negotiates WebRTC (UDP media direct to port 8555,
+sub-second latency). Over Cloudflare it falls back to MSE — Cloudflare
+is an HTTP/HTTPS proxy and cannot relay WebRTC UDP. No TURN server is
+needed; the MSE path rides the existing HTTPS/WSS connection through
+Caddy, which is already near-realtime. This fallback is expected and fine.
+
+Each camera is identified in the app by its **go2rtc stream name**
+(e.g. `hamster_cam_1`). Configure this in Settings → Cameras as the
+"Live source" field; use the Discover button to see all names reported
+by go2rtc.
+
 ## Tech stack
 
-- **Edge:** Raspberry Pi Zero 2 W + go2rtc (RTSP server, WebRTC handoff)
+- **Edge:** Raspberry Pi Zero 2 W + go2rtc (H264 hardware encode via
+  VideoCore IV; RTSP server; single pull per Pi, no Mini transcode)
+- **Live view:** go2rtc auto-negotiating player (WebRTC on LAN, MSE
+  over Cloudflare); authenticated `GET /live/ws` WS proxy in the
+  backend; camera identified by go2rtc stream name (`live_src`)
 - **Brain:** Frigate (NVR + object detection, OpenVINO accelerated)
 - **Messaging:** Mosquitto MQTT (Frigate's event bus)
 - **App backend:** Fastify + tRPC + better-sqlite3 + MQTT subscriber
