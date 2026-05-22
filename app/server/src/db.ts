@@ -51,6 +51,8 @@ export interface CameraRow {
   name: string;
   emoji: string;
   stream_url: string;
+  /** go2rtc stream name — drives the /live/ws?src=<name> proxy. Null until set by operator. */
+  live_src: string | null;
   position: number;
   enabled: 0 | 1;
   created_at: number;
@@ -334,12 +336,12 @@ function statements(): Statements {
     ),
     cameraInsert: db.prepare(`
       INSERT INTO cameras (
-        name, emoji, stream_url, position, enabled, created_at, zones,
+        name, emoji, stream_url, live_src, position, enabled, created_at, zones,
         wheel_mark_enabled, wheel_diameter_mm,
         wheel_band_y_pct, wheel_band_height_pct, wheel_threshold_pct
       )
       VALUES (
-        @name, @emoji, @stream_url, @position, @enabled, @created_at, @zones,
+        @name, @emoji, @stream_url, @live_src, @position, @enabled, @created_at, @zones,
         @wheel_mark_enabled, @wheel_diameter_mm,
         @wheel_band_y_pct, @wheel_band_height_pct, @wheel_threshold_pct
       )
@@ -349,6 +351,7 @@ function statements(): Statements {
          SET name                = @name,
              emoji               = @emoji,
              stream_url          = @stream_url,
+             live_src            = @live_src,
              enabled             = @enabled,
              zones               = @zones,
              wheel_mark_enabled  = @wheel_mark_enabled,
@@ -735,6 +738,7 @@ function decodeCameraRow(raw: unknown): CameraRow {
   }
   return {
     ...r,
+    live_src: typeof r.live_src === 'string' && r.live_src.length > 0 ? r.live_src : null,
     zones,
     wheel_mark_enabled: r.wheel_mark_enabled === 1 ? 1 : 0,
     wheel_diameter_mm: typeof r.wheel_diameter_mm === 'number' ? r.wheel_diameter_mm : 152.0,
@@ -760,6 +764,7 @@ export interface CreateCameraInput {
   name: string;
   emoji: string;
   stream_url: string;
+  live_src?: string | null;
   enabled: boolean;
   zones?: string[];
   wheel_mark_enabled?: boolean;
@@ -776,6 +781,7 @@ export function createCamera(input: CreateCameraInput): CameraRow {
     name: input.name,
     emoji: input.emoji,
     stream_url: input.stream_url,
+    live_src: input.live_src ?? null,
     position,
     enabled: input.enabled ? 1 : 0,
     created_at: Date.now(),
@@ -797,6 +803,7 @@ export interface UpdateCameraInput {
   name: string;
   emoji: string;
   stream_url: string;
+  live_src?: string | null;
   enabled: boolean;
   zones?: string[];
   wheel_mark_enabled?: boolean;
@@ -811,11 +818,16 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
   // This requires reading the existing row so we don't lose settings that a
   // caller omitted from the partial update.
   const existing = getCameraById(input.id);
+  // live_src: explicit undefined means "preserve existing"; null means "clear".
+  const live_src = 'live_src' in input
+    ? (input.live_src ?? null)
+    : (existing?.live_src ?? null);
   statements().cameraUpdate.run({
     id: input.id,
     name: input.name,
     emoji: input.emoji,
     stream_url: input.stream_url,
+    live_src,
     enabled: input.enabled ? 1 : 0,
     zones: JSON.stringify(input.zones ?? []),
     wheel_mark_enabled: input.wheel_mark_enabled !== undefined
@@ -827,6 +839,22 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
     wheel_threshold_pct: input.wheel_threshold_pct ?? existing?.wheel_threshold_pct ?? 50.0,
   });
   return getCameraById(input.id);
+}
+
+/**
+ * Returns the set of enabled cameras' live_src values that are non-null.
+ * Used by the WS proxy's SSRF allowlist check so we never forward arbitrary
+ * src params to go2rtc.
+ */
+export function listEnabledLiveSrcs(): Set<string> {
+  const rows = statements().cameraListEnabled.all() as Array<{ live_src: string | null }>;
+  const out = new Set<string>();
+  for (const row of rows) {
+    if (typeof row.live_src === 'string' && row.live_src.length > 0) {
+      out.add(row.live_src);
+    }
+  }
+  return out;
 }
 
 export function deleteCamera(id: number): void {

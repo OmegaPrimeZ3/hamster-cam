@@ -231,6 +231,8 @@ const cameraSchema = z.object({
   name: z.string(),
   emoji: z.string(),
   stream_url: z.string(),
+  /** go2rtc stream name used by the /live/ws?src=<name> WebSocket proxy. Null until configured. */
+  live_src: z.string().nullable(),
   position: z.number().int(),
   enabled: z.boolean(),
   created_at: z.number().int(),
@@ -322,6 +324,7 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
     name: row.name,
     emoji: row.emoji,
     stream_url: row.stream_url,
+    live_src: row.live_src ?? null,
     position: row.position,
     enabled: row.enabled === 1,
     created_at: row.created_at,
@@ -510,7 +513,8 @@ const camerasRouter = router({
     .input(z.object({
       name: z.string().min(1).max(60),
       emoji: z.string().max(8).default('📷'),
-      stream_url: z.string().min(1),
+      stream_url: z.string().default(''),
+      live_src: z.string().nullable().default(null),
       enabled: z.boolean().default(true),
       zones: z.array(z.string()).default([]),
     }))
@@ -520,6 +524,7 @@ const camerasRouter = router({
         name: input.name,
         emoji: input.emoji,
         stream_url: input.stream_url,
+        live_src: input.live_src,
         enabled: input.enabled,
         zones: input.zones,
       });
@@ -546,7 +551,8 @@ const camerasRouter = router({
       id: z.number().int(),
       name: z.string().min(1).max(60),
       emoji: z.string().max(8),
-      stream_url: z.string().min(1),
+      stream_url: z.string().default(''),
+      live_src: z.string().nullable().optional(),
       enabled: z.boolean(),
       zones: z.array(z.string()).default([]),
       // Wheel odometer — optional; existing values are preserved when omitted.
@@ -565,6 +571,10 @@ const camerasRouter = router({
         name: input.name,
         emoji: input.emoji,
         stream_url: input.stream_url,
+        // `input.live_src` is `string | null | undefined` (Zod optional nullable).
+        // `undefined` means "not provided — preserve existing" which updateCamera handles.
+        // We narrow to `string | null` when defined, else omit the key entirely.
+        ...(input.live_src !== undefined ? { live_src: input.live_src } : {}),
         enabled: input.enabled,
         zones: input.zones,
         ...(input.wheel_mark_enabled !== undefined && { wheel_mark_enabled: input.wheel_mark_enabled }),
@@ -623,21 +633,29 @@ const camerasRouter = router({
       return db.listCameras().map((row) => cameraToDTO(row, null));
     }),
 
-  // Proxied helpers — Frigate-dependent, Stage 2a fills them in.
+  // Proxied helpers — Frigate-dependent.
   discover: adminProcedure
     .meta({ audit: false })
     .input(z.void())
-    .output(z.array(z.object({ name: z.string(), stream_url: z.string() })))
+    .output(z.array(z.object({ name: z.string(), live_src: z.string() })))
     .query(async () => {
       const found = await frigate.discoverCameras();
-      return found.map((c) => ({ name: c.name, stream_url: c.stream_url }));
+      return found.map((c) => ({ name: c.name, live_src: c.live_src }));
     }),
 
+  /**
+   * Validate that the proposed `live_src` name exists in go2rtc. Replaces the
+   * old URL-probe behaviour now that cameras use go2rtc stream names instead of
+   * raw RTSP URLs.
+   */
   testStream: adminProcedure
     .meta({ audit: false })
-    .input(z.object({ stream_url: z.string().min(1) }))
+    .input(z.object({ live_src: z.string().min(1) }))
     .output(z.object({ ok: z.boolean(), status: z.number().int().nullable() }))
-    .mutation(({ input }) => frigate.testStream(input.stream_url)),
+    .mutation(async ({ input }) => {
+      const result = await frigate.checkLiveSrc(input.live_src);
+      return { ok: result.ok, status: null };
+    }),
 
   /**
    * Grab one frame from the camera RTSP stream, crop to the configured band,

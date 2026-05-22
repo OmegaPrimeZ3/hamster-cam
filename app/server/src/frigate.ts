@@ -19,8 +19,9 @@ const DEFAULT_FETCH_TIMEOUT_MS = 5_000;
 
 export interface DiscoveredCamera {
   name: string;
-  /** Suggested `cameras.stream_url` value (rtsp:// or http(s)://). */
-  stream_url: string;
+  /** go2rtc stream name — use as `live_src` on the camera and as the `src`
+   *  query parameter for the /live/ws WebSocket proxy. */
+  live_src: string;
 }
 
 export interface CameraStats {
@@ -65,36 +66,36 @@ async function frigateFetch<T>(
 }
 
 // ---------------------------------------------------------------------------
-// /api/config — camera discovery
+// /api/go2rtc/api/streams — camera discovery via go2rtc
 // ---------------------------------------------------------------------------
 
-// Frigate's config payload is huge; we model only the slice we read.
-interface FrigateConfigCamera {
-  ffmpeg?: {
-    inputs?: Array<{ path?: string; roles?: readonly string[] }>;
-  };
-}
+// go2rtc returns an object whose top-level keys are stream names. We only need
+// the names (values contain producer/consumer details we don't use here).
+type Go2rtcStreams = Record<string, unknown>;
 
-interface FrigateConfig {
-  cameras?: Record<string, FrigateConfigCamera>;
-}
-
+/**
+ * Returns the list of go2rtc stream names Frigate currently knows about.
+ * Each name corresponds to a stream accessible via:
+ *   ws: /api/go2rtc/api/ws?src=<name>
+ *   mp4: /api/go2rtc/api/stream.mp4?src=<name>
+ *
+ * Returns [] if Frigate is unreachable.
+ */
 export async function discoverCameras(): Promise<DiscoveredCamera[]> {
-  const cfg = await frigateFetch<FrigateConfig>('/api/config');
-  if (!cfg?.cameras) return [];
-  const out: DiscoveredCamera[] = [];
-  for (const [name, body] of Object.entries(cfg.cameras)) {
-    const inputs = body.ffmpeg?.inputs ?? [];
-    // Prefer the input flagged as 'detect' (Frigate's main feed), otherwise
-    // the first one with a usable path.
-    const detect = inputs.find((i) => i.roles?.includes('detect'));
-    const fallback = inputs.find((i) => typeof i.path === 'string');
-    const chosen = detect ?? fallback;
-    if (chosen?.path) {
-      out.push({ name, stream_url: chosen.path });
-    }
-  }
-  return out;
+  const streams = await frigateFetch<Go2rtcStreams>('/api/go2rtc/api/streams');
+  if (!streams || typeof streams !== 'object') return [];
+  return Object.keys(streams).map((name) => ({ name, live_src: name }));
+}
+
+/**
+ * Check whether a given go2rtc src name is known to Frigate/go2rtc.
+ * Used by cameras.testStream to validate a proposed live_src value.
+ * Returns `{ ok: true }` if the name exists, `{ ok: false }` otherwise.
+ */
+export async function checkLiveSrc(src: string): Promise<{ ok: boolean }> {
+  const streams = await frigateFetch<Go2rtcStreams>('/api/go2rtc/api/streams');
+  if (!streams || typeof streams !== 'object') return { ok: false };
+  return { ok: Object.prototype.hasOwnProperty.call(streams, src) };
 }
 
 // ---------------------------------------------------------------------------

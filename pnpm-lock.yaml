@@ -37,6 +37,9 @@ importers:
       web-push:
         specifier: ^3.6.7
         version: 3.6.7
+      ws:
+        specifier: ^8.20.1
+        version: 8.20.1
       zod:
         specifier: 3.23.8
         version: 3.23.8
@@ -56,6 +59,9 @@ importers:
       '@types/web-push':
         specifier: ^3.6.4
         version: 3.6.4
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
       aedes:
         specifier: 0.51.3
         version: 0.51.3
@@ -5889,7 +5895,7 @@ snapshots:
 
   '@types/mute-stream@0.0.4':
     dependencies:
-      '@types/node': 22.19.19
+      '@types/node': 24.12.4
 
   '@types/node-cron@3.0.11': {}
 
@@ -5946,11 +5952,11 @@ snapshots:
 
   '@types/ws@8.18.1':
     dependencies:
-      '@types/node': 22.19.19
+      '@types/node': 24.12.4
 
   '@types/yauzl@2.10.3':
     dependencies:
-      '@types/node': 22.19.19
+      '@types/node': 24.12.4
     optional: true
 
   '@vitejs/plugin-react@4.3.2(vite@5.4.21(@types/node@24.12.4)(terser@5.47.1))':

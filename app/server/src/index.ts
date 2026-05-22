@@ -46,6 +46,7 @@ import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
 import { initVapidKeys } from './push.js';
+import { registerLiveWsProxy } from './live-ws.js';
 import { resolveSession } from './session.js';
 import { appRouter, createContext } from './trpc.js';
 
@@ -99,6 +100,10 @@ export async function buildServer(): Promise<AppServer> {
   app.get('/auth/me', me);
   app.post('/auth/password/forgot', forgotPassword);
   app.post('/auth/password/reset', resetPassword);
+
+  // Live-view WebSocket proxy: /live/ws?src=<go2rtc-stream-name>
+  // Auth + SSRF guard are inside registerLiveWsProxy; no additional middleware needed here.
+  registerLiveWsProxy(app);
 
   // Private media: snapshot thumbnails written by `activity.snapshot` land at
   // `STORAGE_PATH/snapshots/<cam>-<ts>.jpg`. The diary entry stores a relative
