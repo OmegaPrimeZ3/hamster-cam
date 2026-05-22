@@ -48,6 +48,17 @@ services:
     # notes, so no chown is required there. Set them explicitly if your user
     # has a different uid (check with: id -u && id -g on the Mac Mini).
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # Security hardening — Node on a high port needs no Linux capabilities.
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    # Read-only rootfs; only the bind-mounted data dirs and /tmp are writable.
+    # /tmp is needed by better-sqlite3 WAL and by any transient ffmpeg work.
+    # Verified working in smoke test: `touch /app/test-rw` returns EROFS.
+    read_only: true
+    tmpfs:
+      - /tmp
     volumes:
       # SQLite database — persists across container restarts and image updates.
       # Path inside container matches DATABASE_PATH in .env.

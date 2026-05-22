@@ -27,46 +27,72 @@ WORKDIR /repo
 
 # Copy the workspace manifests + lockfile first so Docker can cache the
 # install layer separately from source code changes.
-# .npmrc carries `approve-builds=auto` and `verify-deps-before-run=false`,
-# which pnpm v11 requires to allow onlyBuiltDependencies without interactive
-# prompts in a non-TTY environment.
+# .npmrc carries `approve-builds=auto` and `verify-deps-before-run=false`.
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
 COPY app/server/package.json ./app/server/
 COPY app/web/package.json    ./app/web/
 
 # Install ALL workspace deps (including devDeps — needed for tsup/vite builds).
 # --frozen-lockfile: fail fast if the lockfile is out of date.
-# --ignore-scripts: skips lifecycle scripts during install to avoid pnpm v11's
-#   ERR_PNPM_IGNORED_BUILDS gating; we rebuild better-sqlite3 explicitly below.
+# --ignore-scripts: skips lifecycle scripts; pnpm v11 blocks on unapproved
+#   build scripts. We compile better-sqlite3 explicitly below so we control
+#   exactly when and how node-gyp runs.
 # COREPACK_ENABLE_STRICT=0 suppresses the pnpm update nag (non-TTY safe).
 RUN COREPACK_ENABLE_STRICT=0 pnpm install --frozen-lockfile --ignore-scripts
 
-# Rebuild better-sqlite3's native addon for the target platform (linux/amd64).
-# node:24-bookworm has the build tools (python3, g++, make) needed by node-gyp.
-# We skip esbuild (ships prebuilt binaries) and msw (no native addon).
-RUN pnpm rebuild better-sqlite3
+# Compile better-sqlite3's native addon for the target platform (linux/amd64).
+# pnpm v11 silently skips build scripts gated by approve-builds even with rebuild.
+# We install node-gyp globally then call it directly so we control the compile.
+# node:24-bookworm has python3, g++, and make already installed.
+RUN npm install -g node-gyp --silent && \
+    cd /repo/node_modules/.pnpm/better-sqlite3@11.3.0/node_modules/better-sqlite3 && \
+    node-gyp rebuild && \
+    echo "Native addon built:" && \
+    ls build/Release/better_sqlite3.node
 
 # Now copy the full source.
 COPY tsconfig.base.json ./
 COPY app/server/ ./app/server/
 COPY app/web/    ./app/web/
 
-# Build the React SPA (vite) — output lands in app/web/dist.
-# We call vite build directly rather than `pnpm -C app/web build` because
-# the build script runs `tsc --noEmit && vite build`, and there are pre-existing
-# TypeScript errors in app/web that block tsc but do not prevent Vite from
-# emitting valid JavaScript. The Dockerfile's job is to produce a runnable image,
-# not to gate on type-check errors (that is CI's job). This matches how the
-# production bundle was built before containerization.
-# Run from app/web so vite can locate index.html and resolve the vite config
-# root correctly. The bin is in app/web/node_modules/.bin (pnpm does not hoist
-# workspace-only devDeps to the root).
+# Build the Fastify + tRPC server (tsup) FIRST — output lands in app/server/dist.
+# app/web imports AppRouter types from @hamster-cam/server/trpc (resolved to
+# app/server/dist/trpc.d.ts), so the server must be compiled before web tsc runs.
+RUN pnpm -C app/server build
+
+# Build the React SPA — pnpm -C app/web build runs `tsc --noEmit && vite build`
+# so the image build typechecks exactly like CI and the deploy script do.
+# If this fails with a type error, fix the type error — do not bypass tsc.
 WORKDIR /repo/app/web
-RUN node_modules/.bin/vite build
+RUN COREPACK_ENABLE_STRICT=0 pnpm -C /repo/app/web build
 WORKDIR /repo
 
-# Build the Fastify + tRPC server (tsup) — output lands in app/server/dist.
-RUN pnpm -C app/server build
+# -----------------------------------------------------------------------
+# Produce a self-contained, prod-only node_modules for the server using
+# pnpm's purpose-built deploy command. This creates /prod with a flat
+# node_modules that actually resolves at runtime (no pnpm symlink magic).
+# --prod excludes devDependencies so the final image ships only runtime deps.
+# --ignore-scripts skips native rebuilds; we copy the already-compiled
+# better-sqlite3 .node binary in the next step instead.
+# -----------------------------------------------------------------------
+RUN COREPACK_ENABLE_STRICT=0 pnpm --filter "@hamster-cam/server" deploy --prod --legacy \
+    --ignore-scripts /prod
+
+# Restore the amd64 better-sqlite3 native addon compiled above into the
+# deployed node_modules. The deploy --ignore-scripts left an empty Release dir.
+# We copy the pre-compiled binary (same node-gyp build, same container) so
+# the deployed tree is self-contained and correct for linux/amd64.
+RUN mkdir -p /prod/node_modules/better-sqlite3/build/Release && \
+    cp /repo/node_modules/.pnpm/better-sqlite3@11.3.0/node_modules/better-sqlite3/build/Release/better_sqlite3.node \
+       /prod/node_modules/better-sqlite3/build/Release/better_sqlite3.node
+
+# Verify the amd64 .node binary is present and is the right architecture.
+# `file` output must contain "ELF 64-bit LSB" and "x86-64".
+RUN file /prod/node_modules/better-sqlite3/build/Release/better_sqlite3.node
+
+# Copy the freshly compiled server bundle into /prod so the deployed tree
+# has compiled JS. pnpm deploy copies the package files but not dist/.
+RUN cp -r /repo/app/server/dist/. /prod/dist/
 
 # -----------------------------------------------------------------------
 # Stage 2: runtime — slim image, non-root user, only what's needed to run.
@@ -80,20 +106,21 @@ USER node
 
 WORKDIR /app
 
-# Copy compiled server bundle + migrations.
-COPY --from=build --chown=node:node /repo/app/server/dist       ./dist
+# Copy compiled server bundle from the deployed tree.
+COPY --from=build --chown=node:node /prod/dist       ./dist
+
+# Copy the migrations directory. migrate.ts resolves it at runtime as
+# join(__dirname, '..', 'migrations') — from /app/dist/ that is /app/migrations.
 COPY --from=build --chown=node:node /repo/app/server/migrations ./migrations
 
-# Copy the server's production node_modules. We copy the whole workspace
-# node_modules from the build stage — pnpm hoists all packages there.
-# better-sqlite3's native addon (.node file) is already compiled for
-# the target platform from the build stage.
-COPY --from=build --chown=node:node /repo/node_modules          ./node_modules
+# Copy the prod-only, flattened node_modules produced by `pnpm deploy`.
+# Standard flat layout — Node's resolver finds fastify, better-sqlite3, and
+# all other server deps directly. No pnpm store symlinks required at runtime.
+COPY --from=build --chown=node:node /prod/node_modules ./node_modules
 
 # Copy the built React SPA — served by the Fastify static handler.
-# WEB_DIST_PATH (set in docker-compose.yml) overrides the default relative
-# path so the server finds this directory at runtime.
-COPY --from=build --chown=node:node /repo/app/web/dist          ./web/dist
+# WEB_DIST_PATH env var (set in docker-compose.yml) points to this path.
+COPY --from=build --chown=node:node /repo/app/web/dist ./web/dist
 
 # Fastify listen port (also set via env in compose; this documents the default).
 EXPOSE 3000
