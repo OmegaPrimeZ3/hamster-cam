@@ -1,0 +1,64 @@
+# .dockerignore — keeps the build context lean and prevents secrets
+# or large/irrelevant trees from being sent to the Docker daemon.
+#
+# Rule of thumb: if it is not needed by `pnpm install` or the source
+# build steps inside the Dockerfile, exclude it.
+
+# ---- Git metadata ----
+.git
+.gitignore
+
+# ---- Environment / secrets — must NEVER enter the image ----
+.env
+.env.local
+.env.*.local
+
+# ---- Built artifacts (rebuilt inside the image) ----
+**/dist/
+**/build/
+**/.vite/
+*.tsbuildinfo
+
+# ---- Dev-only node_modules ----
+# We COPY package.json files explicitly and let pnpm install inside the
+# image. Including node_modules from the host would corrupt the amd64
+# build with arm64 native binaries (better-sqlite3).
+node_modules/
+**/node_modules/
+
+# ---- Test artifacts ----
+coverage/
+e2e/test-results/
+e2e/playwright-report/
+e2e/.tsbuild/
+e2e/artifacts/
+**/*.test.*
+**/test/
+
+# ---- Docs / plans (don't bloat the image) ----
+docs/
+
+# ---- Host-only infra configs (not needed in the container) ----
+mac-mini/
+pi-zero/
+deploy.sh
+
+# ---- OS/editor noise ----
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+*~
+*.swp
+*.swo
+**/*.bak*
+
+# ---- Python / tooling junk ----
+__pycache__/
+*.pyc
+.venv/
+.turbo/
+
+# ---- Claude agent memory (never in image) ----
+.claude/

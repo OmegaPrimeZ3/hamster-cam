@@ -124,7 +124,8 @@ Roughly four hours spread across an evening or two. The TL;DR:
 3. **Flash three Pi Zero 2 Ws** as RTSP camera servers (go2rtc).
 4. **Point Frigate at the cameras**, define zones (wheel, food, water…).
 5. From your dev machine: `cp .env.example .env`, fill it in, then
-   `pnpm install && ./deploy.sh`.
+   `./deploy.sh` (cross-builds the amd64 app image, ships it to the
+   Mini over SSH, brings up compose — no host pnpm or Node required).
 6. **Set up DDNS + Caddy + auth**, forward the non-standard HTTPS
    port at your router (`CADDY_HTTPS_PORT`, default `2053`, TCP **and**
    UDP for HTTP/3). Add a Cloudflare Origin Rule that maps edge `:443`
@@ -201,6 +202,7 @@ listed there it's listed here and vice versa.
 | Variable | Purpose | Notes |
 |---|---|---|
 | `ZYPHR_API_KEY` | Authenticates the backend against Zyphr's API | Format `zy_live_…`. Required. |
+| `ZYPHR_APP_SECRET` | Zyphr application secret (paired with `ZYPHR_API_KEY`) | Must be from the same Zyphr environment as the key. Required. |
 | `ZYPHR_BASE_URL` | Override the Zyphr API host | *Optional.* Defaults to `https://api.zyphr.dev/v1`. |
 | `ZYPHR_FROM_EMAIL` | Sender address for Zyphr-delivered emails | Used by Send-a-Clip and disk-critical alerts. |
 | `CLOUDFLARE_API_TOKEN` | DDNS + DNS-01 cert issuance | Scoped: `Zone : DNS : Edit` on one zone only. |
@@ -210,12 +212,14 @@ listed there it's listed here and vice versa.
 | `GEMINI_MODEL` | Which Gemini model writes the recap | *Optional.* Defaults to `gemini-2.0-flash`. |
 | `RTSP_USERNAME` / `RTSP_PASSWORD` | Locks the go2rtc RTSP listener on each Pi | Generate password with `openssl rand -base64 24`. |
 | `FRIGATE_RTSP_PASSWORD` | What Frigate sends to the Pi Zeros | Must equal `RTSP_PASSWORD`. |
-| `MQTT_URL` / `MQTT_USERNAME` / `MQTT_PASSWORD` | Mosquitto credentials | Don't run the broker open even on a Docker network. |
-| `FRIGATE_URL` | Where the backend reaches Frigate | `http://frigate:5000` on the compose network. |
+| `MQTT_URL` / `MQTT_USERNAME` / `MQTT_PASSWORD` | Mosquitto credentials | `mqtt://mosquitto:1883` (Docker DNS, compose network). Use `mqtt://127.0.0.1:1883` only on the rollback systemd path. |
+| `FRIGATE_URL` | Where the backend reaches Frigate | `http://frigate:5000` (Docker DNS, compose network). Use `http://127.0.0.1:5000` only on the rollback systemd path. |
 | `PORT` | Fastify listen port | Defaults to `3000`. |
 | `DATABASE_PATH` | SQLite file location | e.g. `/opt/hamster-cam/db/hamster.db`. |
 | `STORAGE_PATH` | Snapshots + time-lapse MP4s | e.g. `/opt/hamster-cam/storage`. |
+| `WEB_DIST_PATH` | Absolute path to built React SPA inside the container | Set to `/app/web/dist` in the compose env block; required in Docker. |
 | `SESSION_TTL_DAYS` | Session cookie lifetime | Defaults to `30`. |
+| `HOST_UID` / `HOST_GID` | UID/GID for the container's bind-mounted dirs | Set to the Mac Mini deploy user's `id -u` / `id -g` (default `1000:1000`). |
 | `CADDY_HTTPS_PORT` | Non-standard HTTPS port at the firewall | Defaults to `2053`. Must be one of Cloudflare's proxied ports. |
 | `CADDY_EMAIL` | Let's Encrypt account contact | For cert expiry notifications. |
 | `CADDY_HOSTNAME` | The FQDN you serve at | e.g. `cam.remy-hamster.com`. |
@@ -377,7 +381,9 @@ but the send action returns an error — no app crash.
 3× IMX462 USB cam ──┘  (go2rtc)     WiFi│  │   └── loopback RTSP   │
                                       │  │   └── OpenVINO inference │
                                       │  ├── Mosquitto MQTT         │
-                                      │  ├── App backend (Fastify)  │
+                                      │  ├── App backend (Docker)   │
+                                      │  │   hamster-cam/app:local  │ ← dev-built, amd64
+                                      │  │   ├── Fastify + tRPC    │
                                       │  │   ├── SQLite            │
                                       │  │   ├── MQTT subscriber   │
                                       │  │   ├── /live/ws proxy    │ ← authenticated WS
@@ -434,7 +440,10 @@ by go2rtc.
 - **Messaging:** Mosquitto MQTT (Frigate's event bus)
 - **App backend:** Fastify + tRPC + better-sqlite3 + MQTT subscriber
   + `web-push` for Web Push fan-out + Google Gemini for the nightly
-  storybook recap
+  storybook recap; runs as Docker container `hamster-cam/app:local`
+  (cross-built linux/amd64 on the arm64 dev machine via `docker buildx`
+  + QEMU; shipped to the Mini with `docker save | gzip | ssh | docker load`;
+  no registry, no host Node/pnpm required)
 - **App frontend:** Vite + React + TypeScript + Framer Motion + Radix UI
 - **PWA:** vite-plugin-pwa with a small hand-rolled push/notificationclick
   service worker (`public/sw-push.js`)
@@ -472,9 +481,16 @@ an opaque HttpOnly session cookie.
   admin-driven via the email reset flow.
 
 **No public sign-up.** New accounts are admin-created from inside the
-app. The very first admin is created with a one-time CLI command on
-the Mac Mini (`pnpm hamster bootstrap-admin --email … --display-name …
---password …`) so a default password is never baked into the image.
+app. The very first admin is created with a one-time CLI command run
+inside the running container on the Mac Mini:
+
+```sh
+docker compose exec hamster-app node dist/bootstrap.js \
+  --email you@example.com --display-name "Dad" \
+  --password "$(openssl rand -base64 24)"
+```
+
+No default password is ever baked into the image.
 
 Error-handling surfaces `ZyphrAuthenticationError`,
 `ZyphrRateLimitError`, etc., and role checks happen server-side

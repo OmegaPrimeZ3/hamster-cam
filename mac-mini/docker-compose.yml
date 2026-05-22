@@ -1,23 +1,73 @@
-# Mac Mini Docker Compose stack — Mosquitto, Frigate, Caddy, Cloudflare DDNS.
+# Mac Mini Docker Compose stack — hamster-app, Mosquitto, Frigate, Caddy,
+# Cloudflare DDNS.
 #
-# The hamster-app Fastify backend is NOT in this file. It runs on the host
-# under systemd (see app/server/hamster-app.service). Caddy reverse-proxies
-# to it via host.docker.internal:3000 (mapped to host-gateway on Linux).
+# The hamster-app Fastify backend runs as a container (image built on the dev
+# machine and docker-loaded here — no build key). Caddy reverse-proxies to it
+# via the compose network name `hamster-app:3000`.
 #
 # Pinned image versions:
 #   eclipse-mosquitto:2.0.22                  — MQTT broker (last stable 2.0.x)
 #   ghcr.io/blakeblackshear/frigate:0.17.1    — Frigate NVR + AI detector
 #   favonia/cloudflare-ddns:1.16.2            — Actively-maintained DDNS updater
 #                                               (oznu/cloudflare-ddns is dead, 5yo)
+#   hamster-cam/app:local                     — built on dev machine (arm64 → amd64
+#                                               cross-build), loaded via docker load
 #   Caddy is built locally from ./caddy/Dockerfile pinning caddy:2.11.3 +
 #   caddy:2-builder for the xcaddy plugin layer.
 #
 # Bring-up order (per docs/SETUP_MAC_MINI.md):
 #   1) docker compose up -d mosquitto
 #   2) docker compose up -d frigate
-#   3) docker compose up -d cloudflare-ddns caddy
+#   3) docker compose up -d hamster-app
+#   4) docker compose up -d cloudflare-ddns caddy
 
 services:
+  hamster-app:
+    # Image is built on the dev machine (arm64 → amd64 cross-build via buildx)
+    # and shipped to the host with `docker save | gzip | ssh | gunzip | docker load`.
+    # There is intentionally NO `build:` key here — the host must never build it.
+    image: hamster-cam/app:local
+    container_name: hamster-app
+    restart: unless-stopped
+    # Load all shared env vars from the host's .env file.
+    env_file: .env
+    environment:
+      # Override the default relative-path SPA lookup so the static handler
+      # finds /app/web/dist inside the container regardless of working directory.
+      WEB_DIST_PATH: /app/web/dist
+      # Ensure the listen port matches what Caddy proxies to.
+      PORT: 3000
+    # UID alignment: the container runs as `node` (uid 1000, gid 1000 in all
+    # official node images). The host dirs ./db and ./storage must be writable
+    # by uid 1000. Simplest approach: set HOST_UID/HOST_GID in .env from the
+    # result of `id -u` / `id -g` on the Mac Mini, then chown the dirs once.
+    # See docs/SETUP_MAC_MINI.md — "Step 10: App container bind-mount prep".
+    #
+    # If HOST_UID/HOST_GID are not set, the container falls back to uid 1000.
+    # `id -u omegaprime` on the Mini is also 1000 per the live deployment
+    # notes, so no chown is required there. Set them explicitly if your user
+    # has a different uid (check with: id -u && id -g on the Mac Mini).
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    volumes:
+      # SQLite database — persists across container restarts and image updates.
+      # Path inside container matches DATABASE_PATH in .env.
+      - ./db:/opt/hamster-cam/db
+      # Snapshots + nightly time-lapse MP4s.
+      # Path inside container matches STORAGE_PATH in .env.
+      - ./storage:/opt/hamster-cam/storage
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      frigate:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "fetch('http://127.0.0.1:3000/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   mosquitto:
     image: eclipse-mosquitto:2.0.22
     container_name: hamster-mosquitto
@@ -125,12 +175,12 @@ services:
     ports:
       - "${CADDY_HTTPS_PORT:-2053}:${CADDY_HTTPS_PORT:-2053}/tcp"
       - "${CADDY_HTTPS_PORT:-2053}:${CADDY_HTTPS_PORT:-2053}/udp"
-    # Canonical Linux fix for "Caddy reaches the host-side Fastify backend":
-    # remap host.docker.internal to the docker bridge gateway. macOS Docker
-    # Desktop resolves the same name natively, so the override is harmless
-    # there. The backend listens on host port ${PORT:-3000}.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # host.docker.internal is no longer needed for the app (hamster-app is on
+    # the compose network now). The camera extra_hosts in the frigate service
+    # are still needed; Caddy itself only needs to reach hamster-app:3000.
+    depends_on:
+      hamster-app:
+        condition: service_healthy
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

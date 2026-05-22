@@ -116,15 +116,16 @@
 	@health {
 		path /health
 	}
-	reverse_proxy @health host.docker.internal:3000
+	# hamster-app is on the same compose network — no host gateway needed.
+	reverse_proxy @health hamster-app:3000
 
-	# Reverse-proxy everything else to the host-side Fastify app. The
-	# compose service injects `host.docker.internal:host-gateway` so
-	# this resolves on Linux as well as macOS Docker Desktop. Caddy
-	# already forwards X-Forwarded-For / X-Forwarded-Proto / Host by
-	# default; we override X-Real-IP with {client_ip} so Fastify sees
-	# the real visitor (resolved via trusted_proxies cloudflare above).
-	reverse_proxy host.docker.internal:3000 {
+	# Reverse-proxy everything else to the hamster-app container. Docker
+	# DNS resolves `hamster-app` to the container's IP on the compose
+	# network. Caddy already forwards X-Forwarded-For / X-Forwarded-Proto
+	# / Host by default; we override X-Real-IP with {client_ip} so
+	# Fastify sees the real visitor (resolved via trusted_proxies cloudflare
+	# above).
+	reverse_proxy hamster-app:3000 {
 		header_up X-Real-IP {client_ip}
 	}
 }

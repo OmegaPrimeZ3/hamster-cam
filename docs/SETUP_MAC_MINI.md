@@ -518,46 +518,58 @@ zone) and that the `CADDY_HOSTNAME` matches the A record at Cloudflare.
 
 ## Step 10 - Deploy the app
 
-The backend and frontend are deployed from the **dev machine** with
-`deploy.sh` at the repo root. The script builds both bundles locally,
-rsyncs only what changed to `MAC_MINI_PATH` over SSH, runs
-`pnpm install --prod` remote-side, and restarts the `hamster-app`
-systemd unit plus the Docker stack. It is idempotent — re-run it for
-every subsequent deploy. The full flow below is first-deploy only;
-day-to-day it collapses to a single `./deploy.sh`.
+The app runs as a Docker container (`hamster-cam/app:local`). The image
+is **built on the dev machine** — a cross-compiled linux/amd64 image from
+the arm64 Apple Silicon laptop — and shipped to the Mini via SSH. The Mini
+never builds the image and no longer needs Node, pnpm, or a systemd service
+for the app.
+
+> **Why dev-only build?**
+> The dev machine is arm64 (Apple Silicon). The Mini is x86_64/amd64.
+> A native arm64 build would die on the Mini with `exec format error`.
+> `docker buildx` with QEMU cross-builds the correct amd64 image locally.
+> There is no Docker registry in this setup — the image is transferred
+> directly over SSH (`docker save | gzip | ssh | docker load`).
 
 ### 10.1 - One-time prerequisites on the Mac Mini
 
-The systemd unit runs the server with the host's Node (`ExecStart` is
-`/usr/bin/node …`), and `deploy.sh` installs prod deps remotely with
-pnpm. Neither was installed in earlier steps, so install both once.
-The repo pins **Node >= 24** and **pnpm 11.x**:
+The Mac Mini needs **nothing extra** for the app — no Node, no pnpm.
+Docker is already installed from Step 2. Confirm the deploy user
+(`omegaprime`) is in the `docker` group so commands run without sudo:
 
 ```sh
 # On the Mac Mini
-curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
-sudo apt install -y nodejs
-sudo npm i -g pnpm@11
-node --version && pnpm --version
+groups omegaprime   # should include "docker"
+# If not: sudo usermod -aG docker omegaprime && newgrp docker
 ```
 
-`deploy.sh` restarts the service with `sudo systemctl` non-interactively
-(it checks `sudo -n`). Give the deploy user (`omegaprime` here — use
-whatever account you SSH in and run the service as) passwordless sudo for
-just those commands so the deploy never hangs on a password prompt:
-
-Use the **absolute paths `sudo` actually resolves to** — confirm them with
-`command -v systemctl cp` (Ubuntu 24.04 is `/usr/bin/...`; a sudoers rule
-listing `/bin/systemctl` will silently fail to match and the deploy hangs
-on a password prompt):
+**Bind-mount UID alignment.** The container runs as the `node` user
+(uid 1000, gid 1000). The host dirs `./db` and `./storage` must be
+owned by uid 1000. Check your deploy user's uid:
 
 ```sh
-# On the Mac Mini — adjust paths if `command -v` differs
-echo 'omegaprime ALL=(root) NOPASSWD: /usr/bin/systemctl restart hamster-app, /usr/bin/systemctl daemon-reload, /usr/bin/cp app/server/hamster-app.service /etc/systemd/system/hamster-app.service' \
-  | sudo tee /etc/sudoers.d/hamster-deploy
-sudo chmod 440 /etc/sudoers.d/hamster-deploy
-sudo visudo -c -f /etc/sudoers.d/hamster-deploy    # syntax check
+id -u && id -g   # if both are 1000, no chown needed
 ```
+
+If your uid differs, update `HOST_UID` / `HOST_GID` in `.env` and chown:
+
+```sh
+# Example — replace 1001 with your actual uid/gid
+sudo chown -R 1001:1001 /opt/hamster-cam/db
+sudo chown -R 1001:1001 /opt/hamster-cam/storage
+```
+
+**Cutover from the systemd path.** If the old `hamster-app` systemd
+service is running, disable it before the first container deploy —
+both would fight over port 3000:
+
+```sh
+# On the Mac Mini — one-time cutover
+sudo systemctl disable --now hamster-app
+```
+
+The service file at `app/server/hamster-app.service` is kept in the repo
+as a documented rollback option.
 
 ### 10.2 - Point the dev machine at the Mac Mini
 
@@ -568,7 +580,7 @@ from the Mac Mini's `.env`:
 ```sh
 # In the repo-root .env on the dev machine
 MAC_MINI_HOST=hamster-mac.local   # or the static LAN IP from step 1
-MAC_MINI_USER=hamster
+MAC_MINI_USER=omegaprime
 MAC_MINI_PATH=/opt/hamster-cam
 ```
 
@@ -577,66 +589,41 @@ hardcoding it: `SSH_OPTS="-i ~/.ssh/hamster_ed25519" ./deploy.sh`.
 
 ### 10.3 - First deploy
 
+The first deploy cross-builds the image (several minutes under QEMU
+emulation — `better-sqlite3` compiles a native addon for amd64) and
+streams it to the Mini:
+
 ```sh
 # On the dev machine, from the repo root
 ./deploy.sh
 ```
 
-On the **first** run the systemd unit does not exist yet, so the script
-syncs everything (including `app/server/hamster-app.service`), installs
-deps, brings up the Docker stack, and prints:
+What the script does, in order:
 
-```
-deploy.sh: /etc/systemd/system/hamster-app.service not installed yet.
-deploy.sh: run the one-time install per docs/SETUP_MAC_MINI.md step 10.
-```
-
-That is expected. Install the unit once on the Mac Mini using the file
-the deploy just placed:
-
-```sh
-# On the Mac Mini, one-time
-cd /opt/hamster-cam
-sudo cp app/server/hamster-app.service /etc/systemd/system/
-```
-
-The committed unit defaults to `User=hamster`. If you run as a different
-account (the one you SSH in and deploy as), don't edit the unit — every
-deploy re-copies it and would clobber your change. Instead add a **drop-in
-override**, which systemd merges on top and which deploys never touch:
-
-```sh
-# On the Mac Mini, one-time — $USER is whatever account you're logged in as
-sudo mkdir -p /etc/systemd/system/hamster-app.service.d
-printf '[Service]\nUser=%s\nGroup=%s\n' "$USER" "$USER" \
-  | sudo tee /etc/systemd/system/hamster-app.service.d/override.conf
-```
-
-Then enable and start it:
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now hamster-app
-sudo systemctl status hamster-app
-```
-
-The unit reads `/opt/hamster-cam/.env` via `EnvironmentFile` and runs
-`dist/index.js` as the configured account. `status` should report
-**active (running)**. Confirm the effective user with
-`systemctl show -p User hamster-app`.
+1. `docker buildx build --platform linux/amd64 -t hamster-cam/app:local -f app/Dockerfile --load .`
+2. `docker save hamster-cam/app:local | gzip | ssh $REMOTE 'gunzip | docker load'`
+3. Rsyncs infra configs (compose, Caddyfile, mosquitto, fail2ban) to the Mini.
+4. Stages `pi-zero/` artifacts for manual Pi deployment.
+5. `docker compose --env-file .env up -d --remove-orphans` on the Mini.
 
 ### 10.4 - Subsequent deploys
 
-With the unit installed, every later deploy is one command from the dev
-machine — the script detects the existing unit and restarts it for you:
+Every later deploy is one command:
 
 ```sh
-./deploy.sh
+./deploy.sh   # re-build image, ship it, compose up
+```
+
+If only infra configs changed (Caddyfile, frigate config, mosquitto
+config) and the app code is unchanged, skip the slow image build:
+
+```sh
+./deploy.sh --infra-only   # syncs configs, runs compose up, no image build
 ```
 
 The remote `.env` is authoritative and left untouched. To also push the
 dev machine's `.env` (the remote copy is backed up to `.env.bak-<ts>`
-first), pass `--sync-env`:
+first):
 
 ```sh
 ./deploy.sh --sync-env
@@ -646,32 +633,47 @@ first), pass `--sync-env`:
 
 ```sh
 # On the Mac Mini
-sudo systemctl status hamster-app          # active (running)
-journalctl -fu hamster-app                 # watch startup + migrations
-curl -fsS http://127.0.0.1:3000/health     # backend answers locally (PORT from .env)
+docker compose ps hamster-app          # should be "Up (healthy)"
+docker compose logs -f hamster-app     # watch startup + migrations
+curl -fsS http://127.0.0.1:3000/health # backend answers locally
 ```
 
-Then load the app over its public Cloudflare URL. If the service
-flaps, `journalctl -u hamster-app` almost always shows why — a missing
-`.env` value or a `better-sqlite3` ABI mismatch (the remote
-`pnpm install --prod` rebuilds it against the Mac Mini's Node; re-run
-`./deploy.sh` if Node was upgraded since).
+Then load the app over its public Cloudflare URL.
+
+### 10.6 - Rollback to systemd (emergency path)
+
+If the container approach has a blocking issue, the old host-side systemd
+service is the rollback:
+
+```sh
+# On the Mac Mini
+docker compose stop hamster-app
+
+# Install the service file (already rsynced to Mac Mini by prior deploys):
+sudo cp /opt/hamster-cam/app/server/hamster-app.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now hamster-app
+sudo systemctl status hamster-app
+```
+
+For the systemd path, `MQTT_URL` must be `mqtt://127.0.0.1:1883` and
+`FRIGATE_URL` must be `http://127.0.0.1:5000` — the host process cannot
+resolve Docker service names. Update `.env` on the Mini accordingly before
+restarting. See comments in `.env.example` for details.
 
 
 ## Step 11 - Bootstrap the first admin
 
 There is no in-app "create admin" form (anyone with access to the
 public URL could grab admin if there were). Bootstrap the first
-admin once on the Mac Mini:
-
-Run the **built** CLI with `node` — `tsx`/the `pnpm bootstrap-admin` dev
-script isn't available on a `--prod` host. Source `.env` first so the DB
-path and Zyphr key are present (the systemd `EnvironmentFile` doesn't apply
-to a manual shell):
+admin once on the Mac Mini. The CLI runs inside the already-running
+container so no host Node install is needed:
 
 ```sh
-set -a; . /opt/hamster-cam/.env; set +a
-node /opt/hamster-cam/app/server/dist/bootstrap.js \
+# On the Mac Mini — source .env so the CLI picks up DATABASE_PATH and ZYPHR keys
+cd /opt/hamster-cam
+set -a; . .env; set +a
+docker compose exec hamster-app node dist/bootstrap.js \
   --email you@example.com \
   --display-name "Dad" \
   --password "$(openssl rand -base64 24)"
@@ -699,7 +701,8 @@ Before declaring the Mac Mini ready, confirm:
 - [ ] `ss -tlnp` shows Caddy listening on the configured non-standard
       HTTPS port (default 2053)
 - [ ] Caddy log shows "certificate obtained successfully"
-- [ ] `systemctl status hamster-app` is "active (running)"
+- [ ] `docker compose ps hamster-app` shows `Up (healthy)`
+- [ ] `curl -fsS http://127.0.0.1:3000/health` returns 200 from the container
 - [ ] Bootstrap admin can sign in via the login screen at the
       Cloudflare-proxied URL
 
