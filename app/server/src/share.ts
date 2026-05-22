@@ -115,7 +115,9 @@ async function sendClip(
     const camera = db.getCameraById(entry.camera_id);
     if (!camera) throw new Error('diary entry references a deleted camera');
     const extracted = await extractClip({
-      cameraName: camera.name,
+      // Frigate identifies cameras by their go2rtc/Frigate stream name (live_src),
+      // not the friendly display name. Fall back to name for legacy rows.
+      cameraName: camera.live_src ?? camera.name,
       centerMs: entry.occurred_at,
     });
     clipPath = extracted.path;

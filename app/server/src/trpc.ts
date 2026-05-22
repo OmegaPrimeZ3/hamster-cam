@@ -481,7 +481,7 @@ const camerasRouter = router({
         rows.map(async (row): Promise<CameraDTO> => {
           let lastFrameAt: number | null = null;
           try {
-            const stats = await frigate.getCameraStats(row.name);
+            const stats = await frigate.getCameraStats(row.live_src ?? row.name);
             lastFrameAt = stats.lastFrameAt;
           } catch {
             lastFrameAt = null;
@@ -722,7 +722,7 @@ const activityRouter = router({
       // best-effort: if Frigate isn't reachable we still record the diary
       // row with an empty media_path so the timestamp lands in the day's
       // feed.
-      const mediaRel = await frigate.captureLatestSnapshot(camera.name, now);
+      const mediaRel = await frigate.captureLatestSnapshot(camera.live_src ?? camera.name, now);
       const entry = await saveManualSnapshot({
         cameraId: camera.id,
         takenAt: now,
