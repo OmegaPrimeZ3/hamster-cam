@@ -79,12 +79,15 @@ export function Header({ onOpenSettings, onOpenChangePassword, activityHint }: H
           gap: 12,
         }}
       >
+        <div aria-hidden style={{ display: 'inline-flex' }}>
+          <Mascot emoji={petEmoji} pose={pose} size={44} waveOnMount ariaLabel="Pet mascot" />
+        </div>
+
         <h1 className="display" style={{ margin: 0, fontSize: 22, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span aria-hidden>{petEmoji}</span>
           {title}
         </h1>
 
-        <div aria-hidden style={{ display: 'inline-flex', marginLeft: 4 }}>
+        <div aria-hidden style={{ display: 'inline-flex' }}>
           <Mascot emoji={petEmoji} pose={pose} size={44} waveOnMount ariaLabel="Pet mascot" />
         </div>
 
