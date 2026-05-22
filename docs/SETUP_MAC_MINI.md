@@ -1,53 +1,48 @@
 # Mac Mini setup
 
 Standalone setup guide for the Mac Mini that acts as the brain of the
-hamster-cam system. The Mini runs Ubuntu Server, hosts the Docker
-Compose stack (Mosquitto, Frigate, Caddy, cloudflare-ddns), runs
-Frigate's AI inference on the Intel iGPU via OpenVINO, and serves the
-React app.
+hamster-cam system. The Mini runs Ubuntu Server and hosts the Docker
+Compose stack: Mosquitto, Frigate, Caddy, cloudflare-ddns, and the
+hamster-app container. Frigate's AI inference runs on the Intel UHD 630
+iGPU via OpenVINO.
 
-Estimated time: about 2 hours total spread across base OS install
-(~1 hour), services bring-up (~45 min), and Frigate configuration
-(~30 min once the Pi Zeros are streaming).
+Estimated time: ~2 hours total — base OS (~1 hour), services bring-up
+(~45 min), and Frigate camera configuration (~30 min once the Pi Zeros
+are streaming).
 
 For the architecture diagram and hardware bill of materials, see the
 [main README](../README.md). For Pi Zero setup, see
-[SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md). For the env-var reference, see
-[.env.example](../.env.example) at the repo root.
+[SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md). For the full env-var reference,
+see [`.env.example`](../.env.example) at the repo root.
 
 
 ## Prerequisites
 
-- One Mac Mini (2018 Intel i5/i7 recommended; an Apple Silicon Mini
-  works but will need the Apple Silicon Asahi/Ubuntu instructions
-  and Frigate will use CPU inference instead of OpenVINO)
+- One Mac Mini (2018 Intel i5/i7 recommended; Apple Silicon works but
+  Frigate will use CPU inference instead of OpenVINO)
 - A USB stick for the Ubuntu installer (8 GB or larger)
-- A USB keyboard and an HDMI monitor for the first boot
-- Your home WiFi credentials (or an ethernet cable, preferred for
-  the brain)
-- A dev machine for SSH access
-- The repo cloned on the dev machine
+- A USB keyboard and HDMI monitor for the first boot
+- Your home WiFi credentials (or ethernet — preferred for the brain)
+- A dev machine for SSH access, with the repo cloned on it
 
 
 ## Path choice: Linux vs macOS
-
-You have two real choices.
 
 | Path | Pros | Cons |
 |---|---|---|
 | **Ubuntu Server (recommended)** | Full OpenVINO acceleration on the UHD 630 iGPU. Lower idle resource use. No Docker Desktop VM overhead. | One-time T2 chip wrangling on 2018/2020 Intel Minis. Wipes macOS. |
 | **macOS + Docker Desktop** | No reformatting. Familiar environment. | Needs a Coral USB Accelerator ($60) for Frigate inference. 2-4 GB RAM goes to the Docker Desktop VM. |
 
-The rest of this doc takes the Ubuntu path. The macOS path differs
-only in section 1 (no Ubuntu install needed) and section 3 (use a
-Coral USB stick instead of OpenVINO drivers). The Docker Compose
-content, Frigate config, and app deployment are identical.
+The rest of this doc takes the Ubuntu path. The macOS path differs only
+in Step 1 (no Ubuntu install needed) and Step 3 (use a Coral USB stick
+instead of OpenVINO drivers). The Docker Compose content, Frigate
+config, and app deployment are identical.
 
 
-## Step 1 - Install Ubuntu Server 24.04 LTS
+## Step 1 — Install Ubuntu Server 24.04 LTS
 
 The 2018/2020 Intel Mac Mini has a T2 security chip that complicates
-Linux installation. The cleanest path is the t2linux.org Ubuntu guide.
+Linux installation. Use the [t2linux.org Ubuntu guide](https://wiki.t2linux.org/distributions/ubuntu/installation/).
 
 1. **Disable Secure Boot.** Boot into macOS Recovery (Cmd+R at
    startup). Open Startup Security Utility. Set "Secure Boot" to
@@ -57,124 +52,110 @@ Linux installation. The cleanest path is the t2linux.org Ubuntu guide.
 2. **Create a Ubuntu USB installer** using balenaEtcher or `dd`.
    Use the Ubuntu 24.04 LTS Server ISO.
 
-3. **Apply T2 patches.** Follow the
-   [t2linux.org Ubuntu installation guide](https://wiki.t2linux.org/distributions/ubuntu/installation/)
-   exactly. The standard Ubuntu installer will install fine, but
-   their post-install steps are needed for audio, suspend, and
-   WiFi drivers.
+3. **Apply T2 patches.** Follow the t2linux.org Ubuntu installation
+   guide exactly. The standard Ubuntu installer works fine, but their
+   post-install steps are needed for audio, suspend, and WiFi drivers.
 
 4. **During install:**
    - Use the full disk.
-   - Install OpenSSH Server (essential - you do not want to keep a
-     monitor and keyboard attached to the Mini).
-   - Skip the snap selections; install what you need from apt.
-   - Create user `hamster` with a strong password.
+   - Install OpenSSH Server (you will not want a monitor attached
+     to the Mini after first boot).
+   - Skip the snap selections.
+   - Create a user (e.g. `omegaprime`) with a strong password.
 
 5. **After install, on the Mac Mini console:**
 
    ```sh
    sudo apt update && sudo apt upgrade -y
    sudo apt install -y curl git build-essential vim htop
-
-   # Get the IP for SSH from your dev machine
-   ip addr show | grep "inet "
+   ip addr show | grep "inet "   # note the IP for SSH
    ```
 
 6. **From your dev machine, SSH in:**
 
    ```sh
-   ssh hamster@<mac-mini-ip>
+   ssh omegaprime@<mac-mini-ip>
    ```
 
 7. **Set up SSH key auth** so you stop typing the password:
 
    ```sh
    # On the dev machine
-   ssh-copy-id hamster@<mac-mini-ip>
+   ssh-copy-id omegaprime@<mac-mini-ip>
    ```
 
 8. **Reserve a static DHCP lease** for the Mac Mini in your router
-   so its LAN IP does not drift. Note its MAC address from
-   `ip link show`. You will need a stable LAN IP for the port-forward
-   step further down in this guide.
+   using its MAC address from `ip link show`. A stable LAN IP is
+   required for the port-forward step later.
 
 
-## Step 2 - Install Docker
+## Step 2 — Install Docker
 
 ```sh
 # On the Mac Mini
 curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker hamster
+sudo usermod -aG docker "$USER"
 # Log out and back in for the docker group to take effect
-```
-
-Verify:
-
-```sh
-docker run hello-world
+docker run hello-world   # verify
 ```
 
 
-## Step 3 - Install OpenVINO drivers (Intel iGPU acceleration)
+## Step 3 — Install OpenVINO drivers (Intel iGPU acceleration)
 
-Skip this section if you took the macOS path - use a Coral USB
-Accelerator instead.
+*Skip this step if you are using the macOS path — use a Coral USB
+Accelerator instead.*
 
 ```sh
 sudo apt install -y intel-opencl-icd intel-media-va-driver-non-free
+sudo usermod -aG video,render "$USER"
 sudo reboot
 ```
 
-After reboot, verify:
+After reboot:
 
 ```sh
-sudo usermod -aG video,render $USER
-# Logout and back in
-
 sudo apt install -y vainfo
-vainfo
+vainfo   # should show Intel iHD driver
 ```
 
-You should see the Intel iHD driver listed. If vainfo errors out,
-re-check the t2linux.org post-install steps - the iGPU is one of
-the things their patches sometimes need.
+If `vainfo` errors, re-check the t2linux.org post-install steps — the
+iGPU driver is one of the things their patches may need.
 
 
-## Step 4 - Set up the host directories
+## Step 4 — Set up host directories
 
 ```sh
-# On the Mac Mini — chown to the account you SSH in and run deploy.sh as
-# (the deploy user; here `omegaprime`). deploy.sh rsyncs as this user and
-# the systemd unit runs as it, so it MUST own the whole tree. If you chown
-# to a user that doesn't exist the command fails silently-ish and the tree
-# stays root-owned, which breaks every later rsync with "Permission denied".
+# On the Mac Mini
+# Chown to the user that deploy.sh SSHes in as (here: omegaprime).
+# The container's bind-mounts under ./db and ./storage must be owned
+# by the same UID the container runs as (see HOST_UID in .env.example).
 sudo mkdir -p /opt/hamster-cam/{storage,db,storage/timelapse}
 sudo chown -R "$USER":"$USER" /opt/hamster-cam
-cd /opt/hamster-cam
 ```
 
 | Path | Purpose |
 |---|---|
-| `/opt/hamster-cam/.env` | Environment variables consumed by docker-compose and the app. Chmod 600 once populated. |
-| `/opt/hamster-cam/frigate-config.yml` | Frigate config. Lives at the root — compose mounts `./frigate-config.yml`. |
-| `/opt/hamster-cam/mosquitto/`, `caddy/`, `fail2ban/` | Per-service config dirs, bind-mounted by compose from the root. |
-| `/opt/hamster-cam/storage/` | Frigate recordings, snapshots, nightly time-lapse MP4s |
-| `/opt/hamster-cam/db/` | SQLite database `hamster.db` and dated backup copies |
+| `/opt/hamster-cam/.env` | Environment variables for the stack. chmod 600 once populated. |
+| `/opt/hamster-cam/frigate-config.yml` | Frigate config. Compose mounts `./frigate-config.yml`. |
+| `/opt/hamster-cam/mosquitto/` | Mosquitto config dir, bind-mounted by compose. |
+| `/opt/hamster-cam/caddy/` | Caddy Dockerfile + Caddyfile, bind-mounted by compose. |
+| `/opt/hamster-cam/fail2ban/` | fail2ban jail + filter files, bind-mounted by compose. |
+| `/opt/hamster-cam/storage/` | Frigate recordings, snapshots, nightly time-lapse MP4s. |
+| `/opt/hamster-cam/db/` | SQLite database `hamster.db` and dated backup copies. |
 
 
-## Step 5 - Create the .env file
+## Step 5 — Create the .env file
 
-Copy `.env.example` from the repo to the Mac Mini and fill in the
-real values. Reference [.env.example](../.env.example) at the repo
-root for the full annotated list.
+Copy `.env.example` from the repo to the Mac Mini and fill in the real
+values. The [`.env.example`](../.env.example) at the repo root is the
+authoritative annotated reference.
 
 ```sh
 # From the dev machine
-scp .env.example hamster@<mac-mini-ip>:/opt/hamster-cam/.env
+scp .env.example omegaprime@<mac-mini-ip>:/opt/hamster-cam/.env
 
 # On the Mac Mini
 chmod 600 /opt/hamster-cam/.env
-# Edit and fill in real values
 vim /opt/hamster-cam/.env
 ```
 
@@ -182,55 +163,56 @@ Critical values to have ready:
 
 | Variable | Where to get it |
 |---|---|
-| `ZYPHR_API_KEY` | Zyphr.dev dashboard, "API Keys" |
-| `CLOUDFLARE_API_TOKEN` | Cloudflare dashboard, My Profile > API Tokens, scoped to `Zone:DNS:Edit` on your zone |
-| `RTSP_PASSWORD` / `FRIGATE_RTSP_PASSWORD` | Generated, then mirrored to each Pi's `/etc/go2rtc/go2rtc.env`. `openssl rand -base64 24` is fine. |
-| `MQTT_PASSWORD` | Generated. Used by Mosquitto, Frigate, and the backend. |
+| `ZYPHR_API_KEY` / `ZYPHR_APP_SECRET` | Zyphr.dev dashboard → Applications → your app → Keys & Secrets |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare dashboard → My Profile → API Tokens, scoped to `Zone:DNS:Edit` on your zone |
+| `RTSP_PASSWORD` / `FRIGATE_RTSP_PASSWORD` | Generate with `openssl rand -base64 24`. Mirror to each Pi's `/etc/go2rtc/go2rtc.env`. |
+| `MQTT_PASSWORD` | Generate with `openssl rand -base64 24`. Used by Mosquitto, Frigate, and the backend. |
+| `PUBLIC_URL` | `https://<CADDY_HOSTNAME>` — required for the live-view WS proxy allowlist. |
+
+For the Docker-compose stack, the correct values for service URLs are:
+
+```sh
+MQTT_URL=mqtt://mosquitto:1883
+FRIGATE_URL=http://frigate:5000
+```
+
+These are Docker DNS names that resolve within the compose network.
+They are the correct values for this setup; no host-IP alternatives
+are needed.
 
 
-## Step 6 - Copy infra configs to the Mac Mini
+## Step 6 — Copy infra configs to the Mac Mini
+
+`deploy.sh` handles this for normal updates, but on first setup you
+can copy manually:
 
 ```sh
 # From the dev machine, in the repo root
-scp mac-mini/docker-compose.yml omegaprime@project-server:/opt/hamster-cam/
-scp mac-mini/frigate-config.yml hamster@<mac-mini-ip>:/opt/hamster-cam/
-scp -r mac-mini/caddy hamster@<mac-mini-ip>:/opt/hamster-cam/
-scp -r mac-mini/fail2ban hamster@<mac-mini-ip>:/opt/hamster-cam/
-scp -r mac-mini/mosquitto hamster@<mac-mini-ip>:/opt/hamster-cam/
+rsync -av mac-mini/ omegaprime@<mac-mini-ip>:/opt/hamster-cam/
 ```
 
-Every config lands at the **project root** (`/opt/hamster-cam/`), because
-that is where `docker-compose.yml`'s relative bind mounts resolve from —
-`./frigate-config.yml`, `./mosquitto/`, `./caddy/`, `./fail2ban/`. Do
-**not** tuck `frigate-config.yml` into a `config/` subdirectory: the
-compose mount is `./frigate-config.yml:/config/config.yml`, so if the
-file isn't at the root, Docker silently creates an empty *directory* in
-its place, Frigate finds no config, logs `No config file found, saving
-default config`, and boots with **zero cameras** — a clean startup with
-an empty UI. Same trap as Mosquitto below.
+Every config lands at the **project root** (`/opt/hamster-cam/`),
+because that is where `docker-compose.yml`'s relative bind mounts
+resolve from. Do **not** place `frigate-config.yml` in a subdirectory —
+the compose mount is `./frigate-config.yml:/config/config.yml`, so a
+missing or misplaced file causes Docker to create an empty directory in
+its place, Frigate finds no config, and cameras boot empty.
 
-The `mosquitto/` directory ships `mosquitto/config/mosquitto.conf`, which
-the compose file bind-mounts into the broker container. If you skip it,
-Docker auto-creates an empty host directory on first bring-up and
-Mosquitto refuses to start with `Unable to open config file
-/mosquitto/config/mosquitto.conf`.
+The `mosquitto/` directory must contain `mosquitto/config/mosquitto.conf`
+before the broker starts — if Docker auto-creates an empty dir, Mosquitto
+refuses to start.
 
 
-## Step 7 - Start Mosquitto first
+## Step 7 — Start Mosquitto
 
-We bring Mosquitto up first because both Frigate and the app need it,
-and you can validate it quickly before adding more moving parts.
+Mosquitto is the MQTT broker; bring it up first because Frigate and the
+app both depend on it.
 
-### 7.1 - Create the MQTT passwd file
+### 7.1 — Create the MQTT passwd file
 
-`mac-mini/mosquitto/config/mosquitto.conf` has `allow_anonymous false`
-and references `password_file /mosquitto/config/passwd`. The passwd
-file is not in git (it holds a hashed credential) and must be created
-once on the Mac Mini before the broker accepts any client.
-
-Source `.env` so `$MQTT_USERNAME` and `$MQTT_PASSWORD` are populated,
-then run `mosquitto_passwd` inside a throwaway broker container so it
-writes the file into the mounted config volume:
+`mosquitto.conf` has `allow_anonymous false` and references
+`password_file /mosquitto/config/passwd`. The passwd file is not in git
+and must be created once on the Mac Mini:
 
 ```sh
 # On the Mac Mini
@@ -238,15 +220,12 @@ cd /opt/hamster-cam
 set -a; . ./.env; set +a
 docker compose run --rm --entrypoint sh mosquitto -c \
   "mosquitto_passwd -b -c /mosquitto/config/passwd \"$MQTT_USERNAME\" \"$MQTT_PASSWORD\" && chmod 600 /mosquitto/config/passwd"
+
+# Verify it landed
+ls -la mosquitto/config/passwd   # should be -rw------- owned by you
 ```
 
-Verify the file landed on the host:
-
-```sh
-ls -la mosquitto/config/passwd   # should be -rw------- and owned by you
-```
-
-### 7.2 - Start the broker
+### 7.2 — Start the broker
 
 ```sh
 docker compose up -d mosquitto
@@ -256,38 +235,30 @@ docker compose logs -f mosquitto
 Verify:
 
 ```sh
-# MQTT is listening on port 1883 (bound to localhost per docker-compose.yml)
+# MQTT is listening on localhost:1883
 ss -tlnp | grep 1883
 
-# The compose healthcheck authenticates with $MQTT_USERNAME / $MQTT_PASSWORD;
-# once it goes green the broker is accepting authenticated clients.
+# Healthcheck should be green within ~10 seconds
 docker compose ps mosquitto
 ```
 
-You should see Mosquitto listening on `127.0.0.1:1883` and
-`docker compose ps` reporting `Up (healthy)` within ~10 seconds.
 
-
-## Step 8 - Configure Frigate
+## Step 8 — Configure and start Frigate
 
 Frigate is configured via `/opt/hamster-cam/frigate-config.yml` (the
 compose file mounts it to `/config/config.yml` inside the container).
-The repo ships a template that pulls camera credentials from the
-`.env` file.
+The repo ships a template that pulls camera credentials from `.env`.
 
-### 8.1 - Camera configuration
+### 8.1 — Camera configuration
 
-The template defines two cameras (add more by duplicating the shape).
 Each camera has a **go2rtc stream name** (the key under `go2rtc.streams`
-and `cameras`) and pulls its stream from the corresponding Pi using the
-RTSP password from `.env`.
+and `cameras`) and pulls its stream from the corresponding Pi's RTSP URL.
 
 ```yaml
 go2rtc:
   streams:
-    # Stream name is the identifier the app uses everywhere — it is what
-    # you enter (or Discover) in Settings → Cameras as the "Live source"
-    # (live_src) for each camera. E.g. "hamster_cam_1".
+    # Stream name is the identifier the app uses everywhere — enter it
+    # (or Discover it) in Settings → Cameras as the "Live source" (live_src).
     hamster_cam_1:
       - rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-1.local:8554/camera
 
@@ -295,131 +266,58 @@ cameras:
   hamster_cam_1:
     ffmpeg:
       inputs:
-        # detect+record read the LOCAL go2rtc relay over loopback, NOT a second
-        # direct pull from the Pi — so each Pi is pulled only once over WiFi.
+        # detect + record read the local go2rtc relay over loopback —
+        # each Pi is pulled only once over WiFi.
         - path: rtsp://127.0.0.1:8554/hamster_cam_1
           input_args: preset-rtsp-restream
           roles: [detect, record]
     detect:
-      width: 1280     # match the Pi's 720p H264
+      width: 1280   # matches the Pi's 720p H264
       height: 720
       fps: 5
-  # ...hamster_cam_2 follows the same shape
 ```
 
-**The go2rtc stream name is the value you configure in Settings → Cameras
-as the "Live source" for each camera.** The app's Settings drawer has a
-Discover button that queries Frigate's go2rtc API and lists available
-stream names — use it to avoid typos.
+Confirm the Pi Zeros are streaming H264 (see
+[SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md) Step 8) before bringing Frigate
+up — on each Pi, `curl -s http://127.0.0.1:1984/api/streams` should
+report the producer codec as `h264` with `profile=High`.
 
-Confirm the Pi Zeros are streaming **H264** (see
-[SETUP_PI_ZERO.md](./SETUP_PI_ZERO.md)) before bringing Frigate up — on a
-Pi, `curl -s http://127.0.0.1:1984/api/streams` should report the producer
-codec as `h264` with `profile=High`.
+### 8.2 — Resolve Pi `.local` names inside Docker
 
-### 8.2 - Let Docker resolve the cameras' `.local` names
+The camera URLs use mDNS names (`hamster-cam-1.local`). The Mac Mini
+host resolves these via Avahi, but Docker's internal resolver does not
+speak mDNS. Without this step Frigate starts but shows no video because
+ffmpeg cannot resolve the hostnames.
 
-The camera URLs in `frigate-config.yml` use mDNS names
-(`hamster-cam-1.local`, etc.). Your Mac Mini host resolves these via
-Avahi, but **Docker's container resolver does not speak mDNS** — so
-without this step Frigate starts cleanly but shows no video, because
-ffmpeg inside the container can't resolve the camera hostnames. The Pis
-are fine; the name lookup is what fails.
+Fix: reserve a static IP for each Pi in your router's DHCP settings
+(bind to the Pi's MAC address), then add `extra_hosts` to the `frigate`
+service in `docker-compose.yml`:
 
-The simplest, most robust fix is a static map: give each Pi a fixed IP
-and tell the Frigate container how to reach the `.local` names directly.
-No host daemons, survives reboots.
+```yaml
+extra_hosts:
+  - "hamster-cam-1.local:192.168.1.51"   # replace with your reserved IPs
+  - "hamster-cam-2.local:192.168.1.52"
+```
 
-1. **Reserve a static IP for each Pi** in your router's DHCP settings
-   (bind to the Pi's MAC address). This keeps the IP from drifting.
-   Find each Pi's current IP and MAC from the router's client list, or
-   on the Mac Mini host (which *can* resolve mDNS):
+Find the current IPs on the Mac Mini host (which can resolve mDNS):
 
-   ```sh
-   getent hosts hamster-cam-1.local
-   getent hosts hamster-cam-2.local
-   ```
+```sh
+getent hosts hamster-cam-1.local
+getent hosts hamster-cam-2.local
+```
 
-2. **Map the names to those IPs** in the `frigate` service of
-   `docker-compose.yml` — replace the placeholders:
+### 8.3 — Set the WebRTC candidate IP
 
-   ```yaml
-   extra_hosts:
-     - "hamster-cam-1.local:192.168.1.51"   # ← your reserved IPs
-     - "hamster-cam-2.local:192.168.1.52"
-   ```
+Open `mac-mini/frigate-config.yml`, find the `go2rtc: webrtc: candidates:`
+block, and replace the placeholder IP with the Mac Mini's actual LAN IP.
+This is required for WebRTC live view on the LAN; without a correct
+candidate IP the player falls back to MSE (still works, not lowest latency).
 
-> Why not make Docker speak mDNS instead? You can (systemd-resolved with
-> `MulticastDNS=yes` + a `DNSStubListenerExtra` the containers reach,
-> then point `/etc/docker/daemon.json` `"dns"` at it) — but it's a
-> daemon-wide change that's fiddly on hosts where the default `docker0`
-> bridge is down and the stack runs on a user-defined network. For a
-> handful of fixed cameras, the static map above is less to go wrong.
+### 8.4 — Start Frigate
 
-### 8.3 - Start Frigate
-
-**Before starting, set the WebRTC candidate IP.** Open
-`mac-mini/frigate-config.yml`, find the `go2rtc: webrtc: candidates:`
-block, and replace `192.168.1.X` with the Mac Mini's actual LAN IP (the
-same static IP from step 8.2). This enables the WebRTC live-view path.
-The `stun:8555` line below it does not need editing.
-
-> **Live-view data flow (current design):**
->
-> ```
-> Pi Zero (H264, VideoCore IV) ──RTSP──► go2rtc (inside Frigate)
->                                               │
->                          ┌────────────────────┤
->                          │                    │
->                  loopback RTSP            WebSocket
->             (detect + record)     /api/go2rtc/api/ws?src=<name>
->                                              │
->                                    backend GET /live/ws
->                                  (auth: __Host-session cookie;
->                                   src allowlisted to configured cameras)
->                                              │
->                                          browser
->                                  go2rtc auto-negotiating player
->                             (WebRTC on LAN, MSE on remote/Cloudflare)
-> ```
->
-> Key properties of this design:
->
-> - **No Mac Mini transcode.** The Pi Zeros hardware-encode H264 via
->   VideoCore IV. go2rtc relays it byte-for-byte (copy). The Mini's
->   iGPU/VAAPI is only used for OpenVINO detection, never for live video.
-> - **Single WiFi pull per Pi.** go2rtc opens one RTSP connection to each
->   Pi. detect, record, and live view all fan out from that one pull.
-> - **Authenticated WS proxy.** The browser never talks directly to
->   Frigate. It connects to the backend's `GET /live/ws?src=<stream-name>`
->   (authenticated via the `__Host-session` cookie), which reverse-proxies
->   the WebSocket to Frigate's embedded go2rtc at
->   `http://frigate:5000/api/go2rtc/api/ws?src=<name>`.
-> - **WebRTC on LAN, MSE remote.** On the LAN the browser negotiates
->   WebRTC (UDP media to the Mini's port 8555, sub-second latency). Over
->   Cloudflare the player automatically falls back to MSE — Cloudflare
->   is an HTTP/HTTPS proxy and cannot relay WebRTC's UDP media. No TURN
->   server is needed; MSE is already near-realtime over HTTPS. The
->   WebRTC candidate IP (step above) is what makes LAN WebRTC work; a
->   wrong or missing IP causes WebRTC negotiation to fail and the player
->   falls back to MSE — still correct behavior, just not the lowest
->   possible latency.
->
-> (Earlier revisions shipped MJPEG from the Pis and transcoded to H264
-> here on the UHD 630 via VAAPI; that was replaced by edge encoding to
-> cut WiFi load ~8x and free the iGPU. If you see a `go2rtc.ffmpeg`
-> transcode template or `#video=h264` stream source syntax, the config
-> is stale.)
-
-The `frigate-config.yml` template references `{FRIGATE_RTSP_PASSWORD}`,
-`{MQTT_USERNAME}`, and `{MQTT_PASSWORD}`. Compose injects those into the
-container by interpolating the matching `${...}` values in
-`docker-compose.yml` — and it only finds them if `.env` is loaded.
-Compose auto-loads `.env` from the **project directory**, so either run
-from `/opt/hamster-cam` or pass `--env-file` explicitly. If the vars are
-missing, compose substitutes an empty string with only a warning,
-Frigate sends a blank RTSP password, every Pi answers `401`, and the
-cameras come up **black with no video** even though startup looks clean.
+`frigate-config.yml` references `{FRIGATE_RTSP_PASSWORD}`, `{MQTT_USERNAME}`,
+and `{MQTT_PASSWORD}`. Compose interpolates these from `.env`, but only if
+run from the project directory or with `--env-file`:
 
 ```sh
 cd /opt/hamster-cam
@@ -427,171 +325,112 @@ docker compose --env-file .env up -d frigate
 docker compose logs -f frigate
 ```
 
-Before opening the UI, confirm the password actually reached the
-container (this is the single most common cause of black cameras):
+Confirm the password reached the container (the most common cause of
+black cameras is an empty var):
 
 ```sh
 docker exec hamster-frigate sh -c 'echo "[$FRIGATE_RTSP_PASSWORD]"'
+# Must print the real password; empty [] means .env wasn't loaded.
+# A plain restart won't re-read env — recreate with the command above.
 ```
 
-It must print the real password in the brackets. An empty `[]` means
-`.env` wasn't loaded — recreate the container from the command above. (A
-plain `restart` will not re-read the environment; it must be recreated.)
+Frigate's web UI is at `http://<mac-mini-ip>:5000`. All cameras should
+be live within a minute or two. The Frigate UI has no auth — it is
+published to the LAN only. Never forward port 5000 at your router.
 
-Frigate's web UI is at `http://<mac-mini-ip>:5000`. You should see
-all three cameras live within a minute or two. The player controls in
-the live view should show MSE or WebRTC, not jsmpeg.
+> **Port 5000 conflict (macOS path only):** AirPlay Receiver squats on
+> 5000. Disable it via System Settings → General → AirDrop & Handoff →
+> turn off "AirPlay Receiver." Ubuntu has nothing on 5000 by default.
 
-> **"This site can't be reached"?** First confirm the container bound
-> the host port: `docker compose ps` (frigate should be `running`, not
-> restarting) and `sudo lsof -nP -iTCP:5000 -sTCP:LISTEN`.
->
-> **macOS path only:** Control Center / AirPlay Receiver squats on port
-> 5000, so Docker can't bind it and the container won't start. Free it
-> via **System Settings → General → AirDrop & Handoff → turn off
-> "AirPlay Receiver."** (Ubuntu has nothing on 5000 by default.)
->
-> The Frigate UI has no auth — it's published to the LAN only; never
-> forward port 5000 at your router.
+### 8.5 — Define zones
 
-### 8.4 - Define zones
+Draw rectangular zones over the wheel, food bowl, and water bottle using
+Frigate's built-in zone editor (Frigate UI → camera → Edit Config). The
+zone names must match what the narrator looks for in
+`app/server/src/narratives.ts` (`wheel`, `food`, `water`, etc.). Save,
+then restart Frigate to apply:
 
-For each camera, define rectangular zones over the wheel, food bowl,
-and water bottle areas. Frigate has a built-in zone editor.
+```sh
+docker compose restart frigate
+```
 
-1. Open the Frigate UI at `http://<mac-mini-ip>:5000`.
-2. Click a camera, then "Edit Config" in the camera view.
-3. Use the zone editor to draw boxes over the wheel, food, and water.
-4. Save. Frigate writes the resulting `zones:` block back into
-   `frigate-config.yml`.
-5. Restart Frigate to apply: `docker compose restart frigate`.
+### 8.6 — Detection model
 
-The zone names matter - the narrator code on the backend looks for
-specific zone names (`wheel`, `food`, `water`, etc.). Match the
-names used in `app/server/src/narratives.ts`.
+Frigate's default model does not recognize "hamster". Two options:
 
-### 8.5 - Detection model
+**Quick path:** Track `mouse` or `cat` with a low `min_score` (e.g.
+0.30) in `frigate-config.yml`. Works well enough for one stationary cage.
 
-Frigate's default model does not recognize "hamster". You have two
-realistic options.
+**Better path:** Collect 200–500 snapshots via Frigate's snapshot
+feature, label them in Roboflow, train a YOLOv8n model on Roboflow's
+free tier, export to OpenVINO IR format, and replace the `model:` block
+in `frigate-config.yml`.
 
-**Quick path: lenient generic classes.** Edit `frigate-config.yml`
-to track `mouse` or `cat` with a very low `min_score` (e.g. 0.30).
-Often works well enough for one stationary cage.
-
-**Better path: train a custom YOLO on Roboflow.**
-
-1. Use Frigate's snapshot feature to collect 200-500 photos of your
-   pet from each camera angle. Snapshots are timestamped and free.
-2. Upload to Roboflow, label "hamster" bounding boxes.
-3. Train a YOLOv8n model on Roboflow's free tier (about 30 minutes).
-4. Export to ONNX or OpenVINO IR format.
-5. Replace the `model:` block in `frigate-config.yml` with a path
-   to your custom model.
-6. Restart Frigate.
-
-### 8.6 - Verify detection
-
-Watch the Frigate debug view in the web UI. Bounding boxes should
-appear when the hamster is visible. Tune `min_score` and zone
-thresholds until false positives are minimal but the hamster is
-reliably detected.
+Watch the Frigate debug view to confirm detections; tune `min_score`
+and zone thresholds until false positives are minimal.
 
 
-## Step 9 - Bring up the rest of the stack
-
-Once Mosquitto and Frigate are healthy:
+## Step 9 — Bring up Caddy and DDNS
 
 ```sh
 cd /opt/hamster-cam
 docker compose up -d cloudflare-ddns caddy
-docker compose ps
-docker compose logs -f
+docker compose logs -f caddy
 ```
 
-Wait for Caddy to issue its Let's Encrypt cert via the Cloudflare
-DNS-01 challenge. You should see "certificate obtained successfully"
-in the Caddy logs within about 30 seconds. If it does not, double-check
-your `CLOUDFLARE_API_TOKEN` scope (must be `Zone:DNS:Edit` on the one
-zone) and that the `CADDY_HOSTNAME` matches the A record at Cloudflare.
+Wait for Caddy to obtain its Let's Encrypt cert via the Cloudflare
+DNS-01 challenge. Look for "certificate obtained successfully" in the
+logs within ~30 seconds. If it does not appear, double-check that
+`CLOUDFLARE_API_TOKEN` has `Zone:DNS:Edit` scope on the correct zone
+and that `CADDY_HOSTNAME` matches the A record at Cloudflare.
 
 
-## Step 10 - Deploy the app
+## Step 10 — Deploy the app
 
-The app runs as a Docker container (`hamster-cam/app:local`). The image
-is **built on the dev machine** — a cross-compiled linux/amd64 image from
-the arm64 Apple Silicon laptop — and shipped to the Mini via SSH. The Mini
-never builds the image and no longer needs Node, pnpm, or a systemd service
-for the app.
+The hamster-app image is **built on the dev machine** — a cross-compiled
+linux/amd64 image from the arm64 Apple Silicon laptop — and shipped to
+the Mini via SSH. The Mini never builds the image and needs no Node or
+pnpm installed.
 
-> **Why dev-only build?**
-> The dev machine is arm64 (Apple Silicon). The Mini is x86_64/amd64.
-> A native arm64 build would die on the Mini with `exec format error`.
-> `docker buildx` with QEMU cross-builds the correct amd64 image locally.
-> There is no Docker registry in this setup — the image is transferred
-> directly over SSH (`docker save | gzip | ssh | docker load`).
+### 10.1 — One-time: UID alignment
 
-### 10.1 - One-time prerequisites on the Mac Mini
-
-The Mac Mini needs **nothing extra** for the app — no Node, no pnpm.
-Docker is already installed from Step 2. Confirm the deploy user
-(`omegaprime`) is in the `docker` group so commands run without sudo:
+The container runs as the `node` user (uid 1000). The bind-mounted dirs
+`./db` and `./storage` must be owned by that same uid:
 
 ```sh
 # On the Mac Mini
-groups omegaprime   # should include "docker"
-# If not: sudo usermod -aG docker omegaprime && newgrp docker
-```
-
-**Bind-mount UID alignment.** The container runs as the `node` user
-(uid 1000, gid 1000). The host dirs `./db` and `./storage` must be
-owned by uid 1000. Check your deploy user's uid:
-
-```sh
 id -u && id -g   # if both are 1000, no chown needed
 ```
 
-If your uid differs, update `HOST_UID` / `HOST_GID` in `.env` and chown:
+If your uid differs, set `HOST_UID` / `HOST_GID` in `.env` and chown:
 
 ```sh
-# Example — replace 1001 with your actual uid/gid
-sudo chown -R 1001:1001 /opt/hamster-cam/db
+sudo chown -R 1001:1001 /opt/hamster-cam/db     # replace 1001 with your uid
 sudo chown -R 1001:1001 /opt/hamster-cam/storage
 ```
 
-**Cutover from the systemd path.** If the old `hamster-app` systemd
-service is running, disable it before the first container deploy —
-both would fight over port 3000:
+Also confirm the deploy user is in the `docker` group:
 
 ```sh
-# On the Mac Mini — one-time cutover
-sudo systemctl disable --now hamster-app
+groups omegaprime   # must include "docker"
+# If not: sudo usermod -aG docker omegaprime && newgrp docker
 ```
 
-The service file at `app/server/hamster-app.service` is kept in the repo
-as a documented rollback option.
+### 10.2 — Point deploy.sh at the Mac Mini
 
-### 10.2 - Point the dev machine at the Mac Mini
-
-`deploy.sh` reads its target from the repo-root `.env` on the **dev
-machine** (or inline overrides). Set these locally — they are separate
-from the Mac Mini's `.env`:
+In the repo-root `.env` on the **dev machine** (separate from the Mini's
+`.env`), set the SSH target:
 
 ```sh
-# In the repo-root .env on the dev machine
-MAC_MINI_HOST=hamster-mac.local   # or the static LAN IP from step 1
+MAC_MINI_HOST=project-server   # or the static LAN IP from Step 1
 MAC_MINI_USER=omegaprime
 MAC_MINI_PATH=/opt/hamster-cam
 ```
 
-If you use a dedicated SSH key, pass it via `SSH_OPTS` rather than
-hardcoding it: `SSH_OPTS="-i ~/.ssh/hamster_ed25519" ./deploy.sh`.
+If you use a dedicated SSH key, pass it via `SSH_OPTS`:
+`SSH_OPTS="-i ~/.ssh/hamster_ed25519" ./deploy.sh`
 
-### 10.3 - First deploy
-
-The first deploy cross-builds the image (several minutes under QEMU
-emulation — `better-sqlite3` compiles a native addon for amd64) and
-streams it to the Mini:
+### 10.3 — First deploy
 
 ```sh
 # On the dev machine, from the repo root
@@ -601,76 +440,54 @@ streams it to the Mini:
 What the script does, in order:
 
 1. `docker buildx build --platform linux/amd64 -t hamster-cam/app:local -f app/Dockerfile --load .`
+   (The dev machine is arm64; this flag is mandatory for the amd64 Mini.)
 2. `docker save hamster-cam/app:local | gzip | ssh $REMOTE 'gunzip | docker load'`
 3. Rsyncs infra configs (compose, Caddyfile, mosquitto, fail2ban) to the Mini.
-4. Stages `pi-zero/` artifacts for manual Pi deployment.
-5. `docker compose --env-file .env up -d --remove-orphans` on the Mini.
+4. `docker compose --env-file .env up -d --remove-orphans` on the Mini.
 
-### 10.4 - Subsequent deploys
+The first build is slow (several minutes — `better-sqlite3` compiles
+a native addon under QEMU emulation for amd64). Subsequent builds are
+much faster because Docker caches the layers.
 
-Every later deploy is one command:
-
-```sh
-./deploy.sh   # re-build image, ship it, compose up
-```
-
-If only infra configs changed (Caddyfile, frigate config, mosquitto
-config) and the app code is unchanged, skip the slow image build:
+### 10.4 — Subsequent deploys
 
 ```sh
+./deploy.sh            # rebuild image, ship, compose up
+
+# If only infra configs changed (no app code changes):
 ./deploy.sh --infra-only   # syncs configs, runs compose up, no image build
-```
 
-The remote `.env` is authoritative and left untouched. To also push the
-dev machine's `.env` (the remote copy is backed up to `.env.bak-<ts>`
-first):
-
-```sh
+# To also push the dev machine's .env (remote copy backed up to .env.bak-<ts>):
 ./deploy.sh --sync-env
 ```
 
-### 10.5 - Verify
+### 10.5 — Verify
 
 ```sh
 # On the Mac Mini
-docker compose ps hamster-app          # should be "Up (healthy)"
-docker compose logs -f hamster-app     # watch startup + migrations
-curl -fsS http://127.0.0.1:3000/health # backend answers locally
+docker compose ps hamster-app           # should be "Up (healthy)"
+docker compose logs -f hamster-app      # watch startup + migrations
+curl -fsS http://127.0.0.1:3000/health  # backend answers locally
 ```
 
-Then load the app over its public Cloudflare URL.
+Then load the app at its public Cloudflare URL.
 
-### 10.6 - Rollback to systemd (emergency path)
+> **Rollback footnote.** If the container has a blocking issue,
+> a host-side systemd unit is available as an emergency path —
+> the service file `app/server/hamster-app.service` is kept in the
+> repo. For that path, set `MQTT_URL=mqtt://127.0.0.1:1883` and
+> `FRIGATE_URL=http://127.0.0.1:5000` (Docker service names do not
+> resolve from the host process). This path is not the normal
+> deployment model.
 
-If the container approach has a blocking issue, the old host-side systemd
-service is the rollback:
+
+## Step 11 — Bootstrap the first admin
+
+There is no in-app "create admin" form. Bootstrap the first admin once
+on the Mac Mini via the CLI inside the running container:
 
 ```sh
 # On the Mac Mini
-docker compose stop hamster-app
-
-# Install the service file (already rsynced to Mac Mini by prior deploys):
-sudo cp /opt/hamster-cam/app/server/hamster-app.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now hamster-app
-sudo systemctl status hamster-app
-```
-
-For the systemd path, `MQTT_URL` must be `mqtt://127.0.0.1:1883` and
-`FRIGATE_URL` must be `http://127.0.0.1:5000` — the host process cannot
-resolve Docker service names. Update `.env` on the Mini accordingly before
-restarting. See comments in `.env.example` for details.
-
-
-## Step 11 - Bootstrap the first admin
-
-There is no in-app "create admin" form (anyone with access to the
-public URL could grab admin if there were). Bootstrap the first
-admin once on the Mac Mini. The CLI runs inside the already-running
-container so no host Node install is needed:
-
-```sh
-# On the Mac Mini — source .env so the CLI picks up DATABASE_PATH and ZYPHR keys
 cd /opt/hamster-cam
 set -a; . .env; set +a
 docker compose exec hamster-app node dist/bootstrap.js \
@@ -681,47 +498,57 @@ docker compose exec hamster-app node dist/bootstrap.js \
 
 Record the password somewhere safe. After this, sign in normally via
 the login screen, and create every subsequent account (children,
-co-admins, etc.) from Settings > Users in the running app.
+co-admins, etc.) from Settings → Users in the running app.
 
 
 ## Verification checklist
 
 Before declaring the Mac Mini ready, confirm:
 
-- [ ] `ssh hamster@<mac-mini-ip>` works with key auth (no password)
+- [ ] `ssh omegaprime@<mac-mini-ip>` works with key auth (no password prompt)
 - [ ] Static DHCP lease reserved for the Mini's MAC address
 - [ ] `docker run hello-world` succeeds
 - [ ] `vainfo` shows the Intel iHD driver (Linux path only)
 - [ ] `/opt/hamster-cam/.env` exists, chmod 600, with real values
-- [ ] `docker compose ps` shows mosquitto, frigate, caddy, and
-      cloudflare-ddns all `Up (healthy)`
-- [ ] Frigate web UI at port 5000 shows all three cameras live
-- [ ] go2rtc WS path responds: `curl -s -o /dev/null -w '%{http_code}' --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13' 'http://127.0.0.1:5000/api/go2rtc/api/ws?src=hamster_cam_1'` → `101`
+- [ ] `docker compose ps` shows mosquitto, frigate, caddy, cloudflare-ddns,
+      and hamster-app all `Up (healthy)`
+- [ ] Frigate web UI at port 5000 shows all cameras live
+- [ ] go2rtc WS endpoint responds 101:
+      ```sh
+      curl -s -o /dev/null -w '%{http_code}' --http1.1 \
+        -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+        -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+        -H 'Sec-WebSocket-Version: 13' \
+        'http://127.0.0.1:5000/api/go2rtc/api/ws?src=hamster_cam_1'
+      # → 101
+      ```
 - [ ] Frigate zones are defined for each camera
-- [ ] `ss -tlnp` shows Caddy listening on the configured non-standard
-      HTTPS port (default 2053)
+- [ ] `ss -tlnp` shows Caddy listening on the configured HTTPS port (default 2053)
 - [ ] Caddy log shows "certificate obtained successfully"
 - [ ] `docker compose ps hamster-app` shows `Up (healthy)`
-- [ ] `curl -fsS http://127.0.0.1:3000/health` returns 200 from the container
-- [ ] Bootstrap admin can sign in via the login screen at the
-      Cloudflare-proxied URL
+- [ ] `curl -fsS http://127.0.0.1:3000/health` returns 200
+- [ ] Bootstrap admin can sign in at the Cloudflare-proxied URL
 
 
 ## Common issues
 
-- **Frigate restarts in a loop** with "cannot find /dev/dri": the
-  OpenVINO drivers are not installed or the iGPU is not exposed to
-  the container. Re-check step 3 (vainfo) and the
-  `device_cgroup_rules` in `mac-mini/docker-compose.yml`.
-- **Caddy fails to obtain a cert**: usually a Cloudflare API token
-  scope problem. The token needs `Zone:DNS:Edit` on the specific
-  zone, not "All zones".
-- **Frigate streams are black** or show "Cannot open RTSP source":
-  check the password in `.env` matches each Pi's
-  `/etc/go2rtc/go2rtc.env`. Test the URL directly with VLC.
-- **MQTT events are not flowing** to the backend: confirm Mosquitto
-  has username/password auth enabled (no anonymous access) and that
-  both Frigate and the backend use the same `MQTT_PASSWORD`.
-- **OpenVINO inference is slow on 2018 Mini**: the UHD 630 is fine
-  for three cameras at 720p/15fps. If it is overloaded, drop fps
-  per camera in `frigate-config.yml` before adding hardware.
+- **Frigate restarts in a loop** with "cannot find /dev/dri": OpenVINO
+  drivers are not installed or the iGPU is not exposed to the container.
+  Re-check Step 3 (`vainfo`) and the `device_cgroup_rules` in
+  `mac-mini/docker-compose.yml`.
+- **Caddy fails to obtain a cert**: usually a Cloudflare API token scope
+  problem. The token needs `Zone:DNS:Edit` on the specific zone, not
+  "All zones".
+- **Camera streams are black** or show "Cannot open RTSP source": the
+  RTSP password in `.env` does not match each Pi's
+  `/etc/go2rtc/go2rtc.env`. Test the URL directly with VLC. Also
+  confirm `FRIGATE_RTSP_PASSWORD` is non-empty inside the container
+  (`docker exec hamster-frigate sh -c 'echo [$FRIGATE_RTSP_PASSWORD]'`).
+- **MQTT events not flowing**: confirm Mosquitto's passwd file exists
+  and that both Frigate and the backend use the same `MQTT_PASSWORD`.
+- **hamster-app container crashes on startup**: check
+  `docker compose logs hamster-app` for migration errors or missing
+  env vars (especially `WEB_DIST_PATH` and `DATABASE_PATH`).
+- **OpenVINO inference slow on 2018 Mini**: the UHD 630 handles two
+  cameras at 720p/5fps fine. If overloaded, reduce fps per camera in
+  `frigate-config.yml` before adding hardware.

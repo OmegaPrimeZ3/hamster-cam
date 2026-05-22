@@ -1,7 +1,7 @@
 # remy-hamster
 
 > A weekend-buildable, child-friendly pet camera. Cheap Pi-Zero cameras,
-> on-device AI, a storybook activity diary, and now a tiny AI ghostwriter
+> on-device AI, a storybook activity diary, and a tiny AI ghostwriter
 > that tucks your hamster in at night.
 
 <!-- Hero placeholder — drop a 5-second GIF of the tablet view here once the
@@ -36,13 +36,16 @@ If you build one, please send a photo.
 - [Tech stack](#tech-stack)
 - [Customization](#customization)
 - [Contributing](#contributing)
+- [Authentication](#authentication--accounts)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
 
 ## What it does
 
 ### Core
 
 - **Live multi-camera streaming** from cheap WiFi-connected Pi Zero rigs
-  (3 cameras shipped by default, scales out).
+  (2 cameras shipped by default, scales out).
 - **On-device AI activity detection** via Frigate + OpenVINO. Per-zone
   boxes flag wheel, food bowl, water, tunnel, hideaway, and more.
 - **Kid-friendly storybook diary** translates raw events into prose:
@@ -51,7 +54,7 @@ If you build one, please send a photo.
 - **Playful badges** earned automatically: Night Owl, Marathon Runner,
   Foodie, Early Bird, Memory Keeper, Hat Trick — plus distance badges
   (Mile High Club, Marathon Club, Ultra) when the wheel odometer is on.
-- **🏃 Wheel odometer** *(optional, see below)*: stick a piece of dark
+- **Wheel odometer** *(optional, see below)*: stick a piece of dark
   tape on the wheel rim and the app counts rotations from the camera
   feed. The diary then says *"… ran on the wheel for 8 min · 0.27 mi"*
   and the stats strip shows weekly distance.
@@ -75,13 +78,13 @@ If you build one, please send a photo.
 ### Whimsy & accessibility
 
 - **Tablet-first**, 64-px tap targets, large readable type, dark mode.
-- **🔊 Read-aloud TTS** on every diary card. Pre-readers tap the speaker
+- **Read-aloud TTS** on every diary card. Pre-readers tap the speaker
   icon and the browser narrates the storybook sentence. No backend, no
   cost, no tracking — pure `SpeechSynthesis`.
-- **🤖 AI daily storybook recap** *(optional, see below)*: each night
+- **AI daily storybook recap** *(optional, see below)*: each night
   Google Gemini writes one warm paragraph summarizing the day's events.
   Kids wake up to a fresh recap pinned to the top of yesterday's diary.
-- **🔔 Push notifications** *(optional, see below)*: rare-moment alerts
+- **Push notifications** *(optional, see below)*: rare-moment alerts
   — first-of-day, waking-up, long wheel runs — straight to your phone or
   tablet. Per-activity toggles, quiet hours, browser-native Web Push.
 - **PWA install** with iOS/Android home-screen icons, splash screens,
@@ -102,14 +105,14 @@ dogs, parrots, lizards, fish, and turtles.
 
 | Item                              | Qty | Approx. cost |
 |-----------------------------------|-----|--------------|
-| Raspberry Pi Zero 2 W             | 3   | $15 ea       |
-| Arducam IMX462 USB low-light cam  | 3   | $35 ea       |
-| 16 GB microSD card                | 3   | $6 ea        |
-| USB-A → micro-USB OTG cable       | 3   | $4 ea        |
-| 5 V 2.5 A power supply (micro-USB)| 3   | $8 ea        |
+| Raspberry Pi Zero 2 W             | 2   | $15 ea       |
+| Arducam IMX462 USB low-light cam  | 2   | $35 ea       |
+| 16 GB microSD card                | 2   | $6 ea        |
+| USB-A → micro-USB OTG cable       | 2   | $4 ea        |
+| 5 V 2.5 A power supply (micro-USB)| 2   | $8 ea        |
 | Mac Mini (2018+, Intel)           | 1   | use what you have / ~$300 used |
 | Coral USB Accelerator (optional)  | 1   | $60          |
-| **Total (excluding Mac Mini)**    |     | **~$200**    |
+| **Total (excluding Mac Mini)**    |     | **~$130**    |
 
 The Mac Mini is the brain. Any always-on Linux box with an Intel iGPU
 (for OpenVINO) or a Coral USB stick will work — a NUC, an old laptop,
@@ -120,16 +123,19 @@ even a beefier Raspberry Pi 5 with a Coral.
 Roughly four hours spread across an evening or two. The TL;DR:
 
 1. **Flash Ubuntu Server** onto the Mac Mini, install Docker.
-2. **Bring up Mosquitto + Frigate** via Docker Compose.
-3. **Flash three Pi Zero 2 Ws** as RTSP camera servers (go2rtc).
-4. **Point Frigate at the cameras**, define zones (wheel, food, water…).
-5. From your dev machine: `cp .env.example .env`, fill it in, then
-   `./deploy.sh` (cross-builds the amd64 app image, ships it to the
-   Mini over SSH, brings up compose — no host pnpm or Node required).
-6. **Set up DDNS + Caddy + auth**, forward the non-standard HTTPS
-   port at your router (`CADDY_HTTPS_PORT`, default `2053`, TCP **and**
-   UDP for HTTP/3). Add a Cloudflare Origin Rule that maps edge `:443`
-   → origin `:2053` so visitors keep using the clean URL.
+2. **Flash two Pi Zero 2 Ws** as RTSP camera servers (go2rtc + H264
+   hardware encode via VideoCore IV). See [`docs/SETUP_PI_ZERO.md`](docs/SETUP_PI_ZERO.md).
+3. **Copy `.env.example` to `.env`** on the Mac Mini and fill it in.
+4. From your dev machine: `./deploy.sh` — cross-builds the linux/amd64
+   app image, ships it to the Mini over SSH, and brings up the full
+   Docker Compose stack (Mosquitto, Frigate, Caddy, hamster-app). No
+   host Node or pnpm required on the Mini.
+5. **Configure Frigate:** point it at your Pi RTSP streams, define zones
+   (wheel, food, water…) in the Frigate UI.
+6. **Set up DDNS + Caddy + auth.** Forward the non-standard HTTPS port
+   at your router (`CADDY_HTTPS_PORT`, default `2053`, TCP **and** UDP
+   for HTTP/3). Add a Cloudflare Origin Rule that maps edge `:443` →
+   origin `:2053` so visitors use the clean URL.
 7. **Open the URL on a tablet**, run the onboarding wizard, done.
 
 Detailed Mac Mini and Pi Zero setup guides:
@@ -212,18 +218,20 @@ listed there it's listed here and vice versa.
 | `GEMINI_MODEL` | Which Gemini model writes the recap | *Optional.* Defaults to `gemini-2.0-flash`. |
 | `RTSP_USERNAME` / `RTSP_PASSWORD` | Locks the go2rtc RTSP listener on each Pi | Generate password with `openssl rand -base64 24`. |
 | `FRIGATE_RTSP_PASSWORD` | What Frigate sends to the Pi Zeros | Must equal `RTSP_PASSWORD`. |
-| `MQTT_URL` / `MQTT_USERNAME` / `MQTT_PASSWORD` | Mosquitto credentials | `mqtt://mosquitto:1883` (Docker DNS, compose network). Use `mqtt://127.0.0.1:1883` only on the rollback systemd path. |
-| `FRIGATE_URL` | Where the backend reaches Frigate | `http://frigate:5000` (Docker DNS, compose network). Use `http://127.0.0.1:5000` only on the rollback systemd path. |
+| `MQTT_URL` | Mosquitto connection string for the backend | `mqtt://mosquitto:1883` (Docker DNS, compose network). |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | Mosquitto credentials | Same values used by Frigate and the backend. |
+| `FRIGATE_URL` | Where the backend reaches Frigate | `http://frigate:5000` (Docker DNS, compose network). |
 | `PORT` | Fastify listen port | Defaults to `3000`. |
 | `DATABASE_PATH` | SQLite file location | e.g. `/opt/hamster-cam/db/hamster.db`. |
 | `STORAGE_PATH` | Snapshots + time-lapse MP4s | e.g. `/opt/hamster-cam/storage`. |
-| `WEB_DIST_PATH` | Absolute path to built React SPA inside the container | Set to `/app/web/dist` in the compose env block; required in Docker. |
+| `WEB_DIST_PATH` | Absolute path to built React SPA inside the container | Set to `/app/web/dist` in the compose env block. |
+| `PUBLIC_URL` | Public HTTPS origin for the live-view WS proxy allowlist | e.g. `https://cam.remy-hamster.com`. Required in production. |
 | `SESSION_TTL_DAYS` | Session cookie lifetime | Defaults to `30`. |
 | `HOST_UID` / `HOST_GID` | UID/GID for the container's bind-mounted dirs | Set to the Mac Mini deploy user's `id -u` / `id -g` (default `1000:1000`). |
 | `CADDY_HTTPS_PORT` | Non-standard HTTPS port at the firewall | Defaults to `2053`. Must be one of Cloudflare's proxied ports. |
 | `CADDY_EMAIL` | Let's Encrypt account contact | For cert expiry notifications. |
 | `CADDY_HOSTNAME` | The FQDN you serve at | e.g. `cam.remy-hamster.com`. |
-| `MAC_MINI_HOST` / `MAC_MINI_USER` / `MAC_MINI_PATH` | SSH target for `deploy.sh` | Dev-machine-side. |
+| `MAC_MINI_HOST` / `MAC_MINI_USER` / `MAC_MINI_PATH` | SSH target for `deploy.sh` | Dev-machine-side only. |
 | `TZ` | Container timezone | IANA name, defaults to `Etc/UTC`. |
 
 ### Per-Pi-Zero secrets
@@ -242,9 +250,9 @@ command line or in `/proc`.
 ### What's NOT in `.env`
 
 - **Admin account credentials.** The first admin is created via the
-  bootstrap CLI (`pnpm hamster bootstrap-admin --email … --password …`)
-  on the Mac Mini, then every subsequent account is admin-created from
-  Settings → Users. No default password is ever baked in.
+  bootstrap CLI run inside the running container on the Mac Mini, then
+  every subsequent account is admin-created from Settings → Users. No
+  default password is ever baked in.
 - **Pet name, camera URLs, theme, notification preferences, wheel
   odometer config, distance unit.** Stored in the SQLite `settings`,
   `cameras`, and `notification_preferences` tables — configured
@@ -260,7 +268,7 @@ Every optional feature has a safety gate: if the configuration is
 missing, the feature stays silent and the rest of the app keeps
 working. Nothing crashes the server.
 
-### 🤖 AI daily storybook recap (Google Gemini)
+### AI daily storybook recap (Google Gemini)
 
 **What it does.** Every night at 23:58 local, the backend reads the
 day's diary entries and asks Gemini to write one warm 2–4 sentence
@@ -287,7 +295,7 @@ app uses one request per night. You will never approach the limit.
 **If the key is missing or revoked,** the recap job logs and exits
 cleanly. Every other feature keeps working.
 
-### 🔊 Read-aloud TTS
+### Read-aloud TTS
 
 **What it does.** A speaker icon appears on every diary card. Tap it
 and your browser speaks the storybook sentence aloud — useful for
@@ -301,7 +309,7 @@ diary aloud" if you'd rather have silent cards.
 **Privacy.** Uses your browser's built-in `SpeechSynthesis` API. No
 backend call, no audio leaves the device, no cost.
 
-### 🔔 Push notifications
+### Push notifications
 
 **What it does.** Subscribes your tablet or phone to native Web Push
 notifications. By default you'll get a notification only on **rare
@@ -323,7 +331,7 @@ detects an iOS browser that isn't running standalone.
 **VAPID keys** are generated on first boot and stored in the SQLite
 `settings` table — you don't need to configure anything in `.env`.
 
-### 🏃 Wheel odometer
+### Wheel odometer
 
 **What it does.** Counts actual wheel rotations by watching for a
 high-contrast mark crossing a fixed line in the camera frame. The
@@ -344,11 +352,11 @@ badges unlock at 1 mile, marathon, and 100 miles.
 5. Adjust **Detection band Y position** so the horizontal red line
    sits across the wheel rim where the tape passes.
 6. Hit **Test detection**. The cropped band image appears; you'll
-   see "Tape visible ✓" once your tape passes through. If the ratio
+   see "Tape visible" once your tape passes through. If the ratio
    stays low, drop the **Dark threshold** slider; if it stays high
    even without the tape, raise it.
 7. Save. From the next wheel session onward, the diary cards will
-   carry an `≈ 0.15 mi` note.
+   carry an `~0.15 mi` note.
 
 **Privacy / cost.** Zero. Detection runs locally on the Mac Mini
 against the camera's RTSP feed — no frames leave your network.
@@ -356,7 +364,7 @@ against the camera's RTSP feed — no frames leave your network.
 **If the toggle is off** per camera, the feature is silent. Diary
 entries keep working without distance numbers.
 
-### 📨 Send-a-Clip email sharing
+### Send-a-Clip email sharing
 
 **What it does.** A "Send a clip" button on every diary card lets you
 email the entry to a pre-approved recipient (Grandma's email, your
@@ -372,57 +380,72 @@ but the send action returns an error — no app crash.
 ## Architecture
 
 ```
-[Cage room]                          [Office rack]
+[Cage room]                          [Mac Mini — Ubuntu Server]
                                       ┌──────────────────────────────┐
-3× IMX462 USB cam ──┐                │  Mac Mini (Ubuntu Server)    │
-                    ├─→ Pi Zero 2W ──┤  ├── Frigate (Docker)        │
-3× IMX462 USB cam ──┤  H264 encode   │  │   ├── go2rtc (relay)     │
-                    ├─→ Pi Zero 2W ──┤  │   │   single pull/Pi     │
-3× IMX462 USB cam ──┘  (go2rtc)     WiFi│  │   └── loopback RTSP   │
-                                      │  │   └── OpenVINO inference │
-                                      │  ├── Mosquitto MQTT         │
-                                      │  ├── App backend (Docker)   │
-                                      │  │   hamster-cam/app:local  │ ← dev-built, amd64
-                                      │  │   ├── Fastify + tRPC    │
-                                      │  │   ├── SQLite            │
-                                      │  │   ├── MQTT subscriber   │
-                                      │  │   ├── /live/ws proxy    │ ← authenticated WS
-                                      │  │   ├── Cron jobs:        │   → go2rtc inside Frigate
-                                      │  │   │   ├── 23:55 timelapse
-                                      │  │   │   ├── 23:58 recap*  │
-                                      │  │   │   ├── 02:00 retention
-                                      │  │   │   └── 03:00 disk-watch
-                                      │  │   ├── Web Push fanout   │
-                                      │  │   └── Zyphr SDK (auth)  │
-                                      │  └── App frontend (React)  │
-                                      │      served by backend      │
+2× IMX462 USB cam                     │  Docker Compose stack        │
+    │                                 │                              │
+    ▼                                 │  ┌─────────────────────────┐ │
+Pi Zero 2 W ─────────────────────────►│  │ frigate (0.17)          │ │
+  VideoCore IV H264 encode            │  │  embedded go2rtc        │ │
+  ffmpeg -c:v h264_v4l2m2m            │  │  ├── pulls RTSP once/Pi │ │
+  720p ~3 Mbps MPEG-TS to go2rtc     │  │  ├── relays to detect   │ │
+  go2rtc serves RTSP on :8554         │  │  ├── relays to record   │ │
+                                      │  │  └── relays to browser  │ │
+Pi Zero 2 W ─────────────────────────►│  │  OpenVINO inference     │ │
+  (same setup)                        │  │  (Intel UHD 630 iGPU)   │ │
+                                      │  └─────────────────────────┘ │
+                                      │  ┌──────────────┐            │
+                                      │  │ mosquitto    │ MQTT 1883  │
+                                      │  └──────────────┘            │
+                                      │  ┌──────────────────────────┐│
+                                      │  │ hamster-app container    ││
+                                      │  │  Fastify + tRPC          ││
+                                      │  │  SQLite (./db bind-mount)││
+                                      │  │  MQTT subscriber         ││
+                                      │  │  /live/ws WS proxy       ││ ← auth-gated
+                                      │  │  Cron: timelapse 23:55   ││
+                                      │  │  Cron: recap*  23:58     ││
+                                      │  │  Cron: retention 02:00   ││
+                                      │  │  Cron: disk-watch 03:00  ││
+                                      │  │  React SPA served here   ││
+                                      │  └──────────────────────────┘│
+                                      │  ┌──────────────┐            │
+                                      │  │ caddy        │ :2053 TLS  │
+                                      │  │ Cloudflare   │ DDNS       │
+                                      │  │ DNS-01 cert  │            │
+                                      │  └──────────────┘            │
                                       └──────────────────────────────┘
                                                    ↑
-                                              Daughter's tablet
-                                              (DDNS + Caddy + auth)
-                                         LAN: WebRTC (port 8555 UDP)
-                                      Remote: MSE over WSS/Cloudflare
+                                         Daughter's tablet / browser
+                                         Cloudflare CDN maps :443 → :2053
+                                         LAN: WebRTC (UDP :8555, ~sub-second)
+                                         Remote: MSE over WSS/Cloudflare
 
-                                       * optional, off without GEMINI_API_KEY
+                                      * recap: optional, skips without GEMINI_API_KEY
 ```
 
 ### Live-view data flow
 
-The Pi Zeros hardware-encode H264 (VideoCore IV). go2rtc inside Frigate
-pulls each Pi exactly once over WiFi and fans out to all consumers:
-detect, record, and live view — no transcoding on the Mini.
+Each Pi Zero hardware-encodes H264 on its VideoCore IV block
+(`ffmpeg -c:v h264_v4l2m2m`, 720p, ~3 Mbps), pipes it as MPEG-TS to
+go2rtc, and go2rtc serves the stream over RTSP on port 8554.
 
-The browser live view uses go2rtc's auto-negotiating player over a single
-authenticated WebSocket. The backend's `GET /live/ws?src=<stream-name>`
-verifies the `__Host-session` cookie and allows only configured camera
-stream names, then reverse-proxies the WebSocket to Frigate's embedded
-go2rtc at `http://frigate:5000/api/go2rtc/api/ws?src=<name>`.
+Frigate's embedded go2rtc pulls each Pi exactly once over WiFi.
+From that single pull it fans out to all consumers — detect, record,
+and live view — without transcoding. The Mac Mini's iGPU is used
+only for OpenVINO object detection.
+
+The browser live view connects to the backend's
+`GET /live/ws?src=<stream-name>` — an authenticated WebSocket endpoint
+that verifies the `__Host-session` cookie and allows only configured
+camera stream names, then reverse-proxies the connection to Frigate's
+embedded go2rtc at `http://frigate:5000/api/go2rtc/api/ws?src=<name>`.
 
 On the LAN the player negotiates WebRTC (UDP media direct to port 8555,
 sub-second latency). Over Cloudflare it falls back to MSE — Cloudflare
 is an HTTP/HTTPS proxy and cannot relay WebRTC UDP. No TURN server is
 needed; the MSE path rides the existing HTTPS/WSS connection through
-Caddy, which is already near-realtime. This fallback is expected and fine.
+Caddy, which is already near-realtime.
 
 Each camera is identified in the app by its **go2rtc stream name**
 (e.g. `hamster_cam_1`). Configure this in Settings → Cameras as the
@@ -431,34 +454,39 @@ by go2rtc.
 
 ## Tech stack
 
-- **Edge:** Raspberry Pi Zero 2 W + go2rtc (H264 hardware encode via
-  VideoCore IV; RTSP server; single pull per Pi, no Mini transcode)
+- **Edge:** Raspberry Pi Zero 2 W + Arducam IMX462 USB camera + go2rtc.
+  Each Pi captures MJPEG from the camera and hardware-encodes H264 on
+  the VideoCore IV block (`ffmpeg -c:v h264_v4l2m2m`, 720p, ~3 Mbps),
+  pipes it as MPEG-TS to go2rtc, which serves it over RTSP. WiFi
+  power-save disabled; go2rtc + a watchdog run as systemd units.
+- **NVR + detection:** Frigate 0.17 with OpenVINO accelerated inference
+  on the Intel UHD 630 iGPU. Embedded go2rtc pulls each Pi's H264 once
+  and relays it (copy, no transcode) to the browser live view and
+  to Frigate's own detect + record pipelines.
 - **Live view:** go2rtc auto-negotiating player (WebRTC on LAN, MSE
   over Cloudflare); authenticated `GET /live/ws` WS proxy in the
-  backend; camera identified by go2rtc stream name (`live_src`)
-- **Brain:** Frigate (NVR + object detection, OpenVINO accelerated)
-- **Messaging:** Mosquitto MQTT (Frigate's event bus)
+  backend; camera identified by go2rtc stream name (`live_src`).
+- **Messaging:** Mosquitto MQTT (Frigate's event bus).
 - **App backend:** Fastify + tRPC + better-sqlite3 + MQTT subscriber
   + `web-push` for Web Push fan-out + Google Gemini for the nightly
   storybook recap; runs as Docker container `hamster-cam/app:local`
   (cross-built linux/amd64 on the arm64 dev machine via `docker buildx`
   + QEMU; shipped to the Mini with `docker save | gzip | ssh | docker load`;
-  no registry, no host Node/pnpm required)
-- **App frontend:** Vite + React + TypeScript + Framer Motion + Radix UI
+  no registry, no host Node/pnpm required). Non-root, hardened
+  container (cap_drop ALL, no-new-privileges, read-only rootfs + tmpfs).
+- **App frontend:** Vite + React + TypeScript + Framer Motion + Radix UI.
 - **PWA:** vite-plugin-pwa with a small hand-rolled push/notificationclick
-  service worker (`public/sw-push.js`)
+  service worker (`public/sw-push.js`).
 - **Transport:** Cloudflare DDNS + Caddy reverse proxy with Let's
-  Encrypt TLS on a non-standard port (SNI-routed for multi-site
-  hosting)
+  Encrypt TLS (DNS-01 via Cloudflare) on a non-standard port (2053).
 - **Auth:** [Zyphr.dev](https://zyphr.dev) via the official
-  [`@zyphr-dev/node-sdk`](https://www.npmjs.com/package/@zyphr-dev/node-sdk)
-  (`zyphr.auth.login.loginEndUser`,
-  `zyphr.auth.registration.registerEndUser`,
-  `zyphr.auth.passwordReset.forgotPassword`); our own Login form (no
-  Zyphr-hosted page); opaque server-side sessions in SQLite with
-  HttpOnly `__Host-session` cookie; two roles (`admin` / `child`)
-  enforced server-side
-- **Host OS:** Ubuntu Server 24.04 LTS on a Mac Mini
+  `@zyphr-dev/node-sdk`; our own Login form (no Zyphr-hosted page);
+  opaque server-side sessions in SQLite with HttpOnly `__Host-session`
+  cookie; two roles (`admin` / `child`) enforced server-side.
+- **Host OS:** Ubuntu Server 24.04 LTS on a Mac Mini.
+- **Deploy:** `docker buildx` cross-build on the dev machine → pipe
+  over SSH → `docker compose up -d` on the Mini. No registry, no build
+  on the host, no host Node/pnpm.
 
 ## Authentication & accounts
 
