@@ -91,6 +91,23 @@ export function resetConnectionCountsForTests(): void {
   perUserConnectionCount.clear();
 }
 
+/**
+ * Close the module-level WebSocketServer, terminating all in-flight proxy
+ * connections. Called from the graceful-shutdown handler in index.ts so that
+ * `docker stop` / SIGTERM doesn't leave orphaned WS sockets open after the
+ * Fastify HTTP server has already stopped accepting new connections.
+ */
+export function closeWss(): Promise<void> {
+  return new Promise((resolve) => {
+    // Terminate every open client socket first so `wss.close` doesn't wait for
+    // them to finish the handshake (they never will — we're shutting down).
+    for (const socket of wss.clients) {
+      socket.terminate();
+    }
+    wss.close(() => resolve());
+  });
+}
+
 // We only need the server for its `handleUpgrade` plumbing.
 // maxPayload caps frames sent by the client (go2rtc protocol frames are tiny).
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES });

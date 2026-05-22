@@ -46,7 +46,7 @@ import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
 import { initVapidKeys } from './push.js';
-import { registerLiveWsProxy } from './live-ws.js';
+import { closeWss, registerLiveWsProxy } from './live-ws.js';
 import { resolveSession } from './session.js';
 import { appRouter, createContext } from './trpc.js';
 
@@ -416,26 +416,66 @@ function scheduleCronJobs(app: AppServer): ScheduledTask[] {
   return tasks;
 }
 
+// Hard deadline: if the graceful sequence hasn't finished in 8 s we force-exit
+// so `docker stop`'s 10 s SIGKILL window doesn't land mid-write. The DB close
+// step is last — once SQLite's WAL checkpoint completes the exit is safe.
+const SHUTDOWN_TIMEOUT_MS = 8_000;
+
 async function shutdown(handles: RuntimeHandles, sig: string): Promise<void> {
   handles.app.log.info({ sig }, 'shutting down');
+
+  // Arm the hard-exit timer FIRST so it covers every step below.
+  const forceExit = setTimeout(() => {
+    handles.app.log.error('shutdown timeout — forcing exit(1)');
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  // Don't let this timer keep the event-loop alive if everything finishes early.
+  forceExit.unref();
+
+  // 1. Stop cron schedulers (synchronous; no more ticks will fire).
   for (const t of handles.crons) {
     try { t.stop(); } catch { /* noop */ }
   }
+
+  // 2. Flush the narrator's in-memory coalescing window to the DB.
   try {
     await flushPendingEntries();
   } catch (err) {
     handles.app.log.warn({ err: (err as Error).message }, 'narrator flush failed');
   }
+
+  // 3. Close in-flight live-view WS proxy connections (terminates all clients,
+  //    closes the module-level WebSocketServer). Must happen before Fastify
+  //    closes so the underlying http.Server upgrade listener is cleared.
+  try {
+    await closeWss();
+  } catch (err) {
+    handles.app.log.warn({ err: (err as Error).message }, 'wss close failed');
+  }
+
+  // 4. Disconnect the MQTT client.
   try {
     await handles.mqtt.close();
   } catch (err) {
     handles.app.log.warn({ err: (err as Error).message }, 'mqtt close failed');
   }
+
+  // 5. Stop accepting new HTTP connections + drain in-flight requests.
   try {
     await handles.app.close();
   } catch (err) {
     handles.app.log.warn({ err: (err as Error).message }, 'fastify close failed');
   }
+
+  // 6. Close the SQLite connection last — ensures the WAL checkpoint runs
+  //    after all writes have landed, preventing truncated DB writes.
+  try {
+    getDb().close();
+  } catch (err) {
+    handles.app.log.warn({ err: (err as Error).message }, 'db close failed');
+  }
+
+  clearTimeout(forceExit);
 }
 
 async function main(): Promise<void> {

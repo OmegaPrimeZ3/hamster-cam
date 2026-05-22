@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# deploy.sh — push a fresh hamster-cam build from the dev machine to the
-# Mac Mini and bounce the systemd unit + docker compose stack.
+# deploy.sh — cross-build the hamster-cam app image on the dev machine,
+# ship it to the Mac Mini, and bring up the Docker Compose stack.
 #
-# Idempotent: re-run as often as you like. Builds locally, rsyncs only
-# what changed, restarts the app, runs `docker compose up -d` to apply
-# any infra-config changes. Pi-side artifacts are staged but not pushed
-# to individual Pis (see SETUP_PI_ZERO.md for the per-Pi flow).
+# The app runs as a Docker container (hamster-cam/app:local) — it is
+# cross-built for linux/amd64 here on the arm64 dev machine and loaded
+# onto the host via docker save | gzip | ssh | docker load. The host
+# does NOT build anything and does NOT need pnpm or Node installed.
+#
+# Idempotent: re-run as often as you like.
 #
 # Configuration (env vars; can be set in a local .env at repo root or
 # overridden inline):
@@ -26,13 +28,24 @@
 #                           OFF by default — the remote copy is host-authoritative:
 #                           Frigate's zone editor writes zone coordinates back into
 #                           it, and it holds the host-specific WebRTC LAN IP.
+#   --infra-only          — skip the image build+ship step; only sync infra
+#                           configs and run compose up. Useful when only
+#                           Caddyfile / frigate config / mosquitto config changed.
 #
 # Examples:
 #   ./deploy.sh
 #   ./deploy.sh --sync-env
 #   ./deploy.sh --sync-frigate-config
+#   ./deploy.sh --infra-only
 #   MAC_MINI_HOST=192.168.1.50 ./deploy.sh
 #   SSH_OPTS="-i ~/.ssh/hamster_ed25519" ./deploy.sh
+#
+# Cutover note (first container deploy):
+#   On the Mac Mini, before the first container-based deploy, disable the
+#   old systemd service (it conflicts with the container on port 3000):
+#     sudo systemctl disable --now hamster-app
+#   The service file at app/server/hamster-app.service is kept in the repo
+#   as a rollback option. See docs/SETUP_MAC_MINI.md for details.
 
 set -euo pipefail
 
@@ -41,6 +54,7 @@ set -euo pipefail
 # ----------------------------------------------------------------------
 SYNC_ENV=0
 SYNC_FRIGATE_CONFIG=0
+INFRA_ONLY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sync-env|-e)
@@ -49,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --sync-frigate-config)
             SYNC_FRIGATE_CONFIG=1
+            shift
+            ;;
+        --infra-only)
+            INFRA_ONLY=1
             shift
             ;;
         --help|-h)
@@ -71,7 +89,6 @@ cd "$REPO_ROOT"
 
 # Source .env if it's there — but never require it. Inline overrides win.
 if [[ -f .env ]]; then
-    # .env is not version-controlled, so shellcheck can't follow it.
     set -a
     # shellcheck disable=SC1091
     . ./.env
@@ -82,12 +99,13 @@ MAC_MINI_HOST=${MAC_MINI_HOST:-}
 MAC_MINI_USER=${MAC_MINI_USER:-}
 MAC_MINI_PATH=${MAC_MINI_PATH:-/opt/hamster-cam}
 SSH_OPTS=${SSH_OPTS:-}
+APP_IMAGE="hamster-cam/app:local"
 
 if [[ -z "$MAC_MINI_HOST" || -z "$MAC_MINI_USER" ]]; then
     cat >&2 <<EOF
 deploy.sh: MAC_MINI_HOST and MAC_MINI_USER must be set.
 Either populate them in .env at the repo root or pass them inline:
-  MAC_MINI_HOST=hamster-mac.local MAC_MINI_USER=hamster ./deploy.sh
+  MAC_MINI_HOST=hamster-mac.local MAC_MINI_USER=omegaprime ./deploy.sh
 EOF
     exit 2
 fi
@@ -112,78 +130,63 @@ rsync_cmd() {
     rsync -az --delete --human-readable -e "ssh $SSH_OPTS" "$@"
 }
 # Same as rsync_cmd but WITHOUT --delete. Use when the destination tree is
-# SHARED with files this script does not manage. The mac-mini/ configs sync
-# onto /opt/hamster-cam/, which also holds app/ (the synced bundle + systemd
-# unit), db/ (the SQLite database!), and pi-zero-staging/. A root-level
-# --delete there would wipe all of them on every deploy.
+# SHARED with files this script does not manage.
 rsync_nodelete() {
     # shellcheck disable=SC2086
     rsync -az --human-readable -e "ssh $SSH_OPTS" "$@"
 }
 
 # ----------------------------------------------------------------------
-# 1. Build locally (web + server). pnpm-rooted workspaces handle deps.
+# 1. (Optional) Cross-build the app image for linux/amd64 and ship it.
+#    Skipped when --infra-only is passed.
 # ----------------------------------------------------------------------
-log "building app/server (tsup)"
-pnpm -C app/server build
+if [[ "$INFRA_ONLY" == "0" ]]; then
+    # Verify buildx is available. The cross-build is mandatory because the
+    # dev machine is arm64 and the host is x86_64/amd64 — a native build
+    # would produce an arm64 binary that dies on the Mini with "exec format
+    # error". The emulated amd64 build (QEMU via Docker Desktop) takes longer
+    # (~5-15 min) but produces the correct binary. Run it once per code change.
+    if ! docker buildx version > /dev/null 2>&1; then
+        cat >&2 <<EOF
+deploy.sh: docker buildx is required for the cross-build but is not available.
+Install Docker Desktop (includes buildx) or docker-ce with the buildx plugin.
+EOF
+        exit 1
+    fi
 
-log "building app/web (vite)"
-pnpm -C app/web build
+    log "cross-building ${APP_IMAGE} for linux/amd64 (arm64→amd64 via QEMU — this takes a few minutes)"
+    docker buildx build \
+        --platform linux/amd64 \
+        -t "${APP_IMAGE}" \
+        -f app/Dockerfile \
+        --load \
+        .
+
+    log "shipping image to ${REMOTE} (docker save | gzip | ssh | docker load)"
+    # Pipeline: save → gzip (cuts transfer size ~50-60%) → load on remote.
+    # `set -o pipefail` is active so any failure in the pipeline exits non-zero.
+    docker save "${APP_IMAGE}" | gzip | ssh_cmd 'gunzip | docker load'
+
+    log "image shipped: ${APP_IMAGE}"
+fi
 
 # ----------------------------------------------------------------------
-# 2. Pre-flight: ensure remote directories exist. Created with mkdir -p
-#    so re-runs are no-ops. We do NOT chown — the operator owns
-#    /opt/hamster-cam per docs/SETUP_MAC_MINI.md step 4.
+# 2. Pre-flight: ensure remote directories exist.
 # ----------------------------------------------------------------------
 log "preparing remote layout under ${MAC_MINI_PATH}"
 ssh_cmd "mkdir -p \
-    '${MAC_MINI_PATH}/app/server' \
-    '${MAC_MINI_PATH}/app/server/migrations' \
-    '${MAC_MINI_PATH}/app/web/dist' \
+    '${MAC_MINI_PATH}/db' \
+    '${MAC_MINI_PATH}/storage/timelapse' \
     '${MAC_MINI_PATH}/caddy' \
     '${MAC_MINI_PATH}/fail2ban' \
     '${MAC_MINI_PATH}/mosquitto/config' \
     '${MAC_MINI_PATH}/storage/frigate' \
-    '${MAC_MINI_PATH}/db' \
     '${MAC_MINI_PATH}/pi-zero-staging'"
 
 # ----------------------------------------------------------------------
-# 3. Sync the backend bundle + package.json + migrations + systemd unit.
-#    We deliberately do NOT rsync node_modules from the dev machine —
-#    Mac Mini and a dev MacBook may not have the same native-module ABI
-#    (better-sqlite3 is the obvious one). We `pnpm install --prod`
-#    remote-side once everything else is in place.
-# ----------------------------------------------------------------------
-log "syncing app/server bundle"
-rsync_cmd \
-    --exclude='node_modules' \
-    --exclude='*.test.*' \
-    --exclude='test/' \
-    app/server/dist/ "${REMOTE}:${MAC_MINI_PATH}/app/server/dist/"
-
-rsync_cmd app/server/package.json "${REMOTE}:${MAC_MINI_PATH}/app/server/package.json"
-rsync_cmd app/server/migrations/ "${REMOTE}:${MAC_MINI_PATH}/app/server/migrations/"
-rsync_cmd app/server/hamster-app.service "${REMOTE}:${MAC_MINI_PATH}/app/server/hamster-app.service"
-
-log "syncing pnpm-workspace metadata + lockfile (needed by pnpm install --prod)"
-rsync_cmd pnpm-lock.yaml "${REMOTE}:${MAC_MINI_PATH}/pnpm-lock.yaml"
-rsync_cmd pnpm-workspace.yaml "${REMOTE}:${MAC_MINI_PATH}/pnpm-workspace.yaml"
-rsync_cmd package.json "${REMOTE}:${MAC_MINI_PATH}/package.json"
-
-# ----------------------------------------------------------------------
-# 4. Sync the React build. Backend's static handler (or Caddy, if you
-#    prefer that path later) serves this. Path is referenced from
-#    /opt/hamster-cam/app/web/dist; the backend has a built-in default.
-# ----------------------------------------------------------------------
-log "syncing app/web/dist"
-rsync_cmd app/web/dist/ "${REMOTE}:${MAC_MINI_PATH}/app/web/dist/"
-
-# ----------------------------------------------------------------------
-# 5. Sync Mac-Mini-side infra configs. The remote .env is preserved
-#    deliberately — we never rsync the dev machine's .env over the
-#    Mini's populated one unless the operator passes --sync-env
-#    (handled separately in step 5b so the remote file gets backed up
-#    instead of silently overwritten).
+# 3. Sync Mac-Mini-side infra configs (Caddyfile, compose, mosquitto,
+#    fail2ban). The remote .env is preserved — we never rsync the dev
+#    machine's .env over the Mini's populated one unless --sync-env.
 # ----------------------------------------------------------------------
 log "syncing Mac Mini infra configs"
 # mosquitto/config/passwd is generated on the host (SETUP step 7.1) and is
@@ -197,15 +200,12 @@ rsync_nodelete \
     --exclude='caddy/config/' \
     --exclude='mosquitto/config/passwd' \
     mac-mini/ "${REMOTE}:${MAC_MINI_PATH}/"
-# frigate-config.yml is excluded above because it is host-authoritative: Frigate's
-# zone editor writes zone coordinates back into the Mini's copy, and it holds the
-# host-specific WebRTC candidate LAN IP. Push it deliberately with --sync-frigate-config.
+# frigate-config.yml is excluded above because it is host-authoritative:
+# Frigate's zone editor writes zone coordinates back into the Mini's copy,
+# and it holds the host-specific WebRTC candidate LAN IP.
 
 # ----------------------------------------------------------------------
-# 5b. Optional: push the dev machine's .env to the Mac Mini. Only runs
-#     when --sync-env / -e was passed. The remote file is copied to
-#     .env.bak-<UTC ts> first so the previous values are recoverable
-#     for one revert without a re-keying scramble.
+# 3b. Optional: push the dev machine's .env to the Mac Mini.
 # ----------------------------------------------------------------------
 if [[ "$SYNC_ENV" == "1" ]]; then
     if [[ ! -f .env ]]; then
@@ -220,13 +220,7 @@ if [[ "$SYNC_ENV" == "1" ]]; then
 fi
 
 # ----------------------------------------------------------------------
-# 5c. Optional: push the repo's mac-mini/frigate-config.yml to the Mini.
-#     Only runs when --sync-frigate-config was passed. This is opt-in
-#     because the remote copy is host-authoritative — Frigate's zone editor
-#     writes operator-drawn zone coordinates back into it, and it holds the
-#     real WebRTC candidate LAN IP that can't live in the public repo.
-#     A wrong push would silently overwrite live zones; the .bak file makes
-#     it a one-revert recovery rather than a re-draw-from-scratch scramble.
+# 3c. Optional: push the repo's mac-mini/frigate-config.yml to the Mini.
 # ----------------------------------------------------------------------
 if [[ "$SYNC_FRIGATE_CONFIG" == "1" ]]; then
     FRIGATE_CFG="mac-mini/frigate-config.yml"
@@ -241,7 +235,7 @@ if [[ "$SYNC_FRIGATE_CONFIG" == "1" ]]; then
 fi
 
 # ----------------------------------------------------------------------
-# 6. Stage Pi-Zero artifacts on the Mac Mini for the operator to scp
+# 4. Stage Pi-Zero artifacts on the Mac Mini for the operator to scp
 #    onward to each Pi (per docs/SETUP_PI_ZERO.md). Deliberately a
 #    separate manual step — we don't want a misconfigured deploy.sh
 #    rebooting three Pi Zeros at once.
@@ -250,43 +244,30 @@ log "staging pi-zero/ artifacts (not pushed to Pis automatically)"
 rsync_cmd pi-zero/ "${REMOTE}:${MAC_MINI_PATH}/pi-zero-staging/"
 
 # ----------------------------------------------------------------------
-# 7. Remote-side: install prod deps, restart the systemd unit, refresh
-#    the docker compose stack.
+# 5. Bring up the hamster-app container (and any other changed services).
+#    `docker compose up -d` is idempotent and will only recreate services
+#    whose image or config changed. The new image load in step 1 changes
+#    the image digest, which triggers hamster-app recreation automatically.
+#    No sudo needed — omegaprime is in the docker group.
 # ----------------------------------------------------------------------
-log "remote: pnpm install --prod and service bounce"
-# Quoting the heredoc with 'EOREMOTE' means $vars expand on the remote, not here.
-# We interpolate the path once via ${MAC_MINI_PATH@Q} (the bash 4.4+ Q operator)
-# so it's quoted safely regardless of contents.
+log "remote: docker compose up"
 ssh_cmd "bash -se" <<EOREMOTE
 set -euo pipefail
-cd "${MAC_MINI_PATH}"
+cd '${MAC_MINI_PATH}'
 
-# Install backend prod deps — rebuilds better-sqlite3 against the local
-# Node ABI on first run; subsequent runs are no-ops if the lockfile is
-# unchanged.
-if command -v pnpm >/dev/null 2>&1; then
-    pnpm install --prod --frozen-lockfile --filter @hamster-cam/server...
-else
-    echo "deploy.sh: pnpm is not installed on the Mac Mini. Install with: npm i -g pnpm" >&2
-    exit 1
-fi
+# Rebuild the Caddy image if its Dockerfile or plugins changed (build context
+# is local on the Mini). Skip if the image already exists and nothing changed
+# (docker compose build is a no-op when the context hash is unchanged).
+docker compose --env-file .env build caddy
 
-# Reload systemd in case the unit file changed since last deploy.
-if [[ -f /etc/systemd/system/hamster-app.service ]]; then
-    if ! sudo -n true 2>/dev/null; then
-        echo "deploy.sh: sudo password required for systemctl restart" >&2
-    fi
-    sudo cp app/server/hamster-app.service /etc/systemd/system/hamster-app.service
-    sudo systemctl daemon-reload
-    sudo systemctl restart hamster-app
-else
-    echo "deploy.sh: /etc/systemd/system/hamster-app.service not installed yet."
-    echo "deploy.sh: run the one-time install per docs/SETUP_MAC_MINI.md step 10."
-fi
+# Recreate only the hamster-app container so it picks up the new image.
+# Other services (mosquitto, frigate, caddy, cloudflare-ddns) are left
+# running unless their own definition changed.
+docker compose --env-file .env up -d --remove-orphans hamster-app
 
-# Bring the Docker stack up. Idempotent — running compose up -d on an
-# already-running stack just recreates services whose definition changed.
-docker compose --env-file .env -f docker-compose.yml up -d --remove-orphans
+# Bring everything else up (no-op if already running and unchanged).
+docker compose --env-file .env up -d --remove-orphans
 EOREMOTE
 
-log "done. Tail logs with: ssh ${REMOTE} 'journalctl -fu hamster-app'"
+log "done. Tail logs with:"
+log "  ssh ${REMOTE} 'cd ${MAC_MINI_PATH} && docker compose logs -f hamster-app'"
