@@ -124,9 +124,17 @@ export async function getCameraStats(cameraName: string): Promise<CameraStats> {
   // `null`, which the frontend renders as the napping/offline state.
   const stats = await frigateFetch<FrigateStats>('/api/stats');
   const entry = stats?.cameras?.[cameraName];
+  // Prefer an explicit per-camera last_frame_time when present. Otherwise treat
+  // a positive camera_fps as "live right now": Frigate 0.17's /api/stats reports
+  // camera_fps per camera (and NOT last_frame_time), and a non-zero rate means
+  // it's actively pulling frames. Without this, last_frame_time being absent
+  // leaves restLast null and grid tiles never reach the 'live' state (the
+  // maximized view plays regardless, which is why single-camera worked).
   const restLast = typeof entry?.last_frame_time === 'number'
     ? Math.round(entry.last_frame_time * 1000)
-    : null;
+    : typeof entry?.camera_fps === 'number' && entry.camera_fps > 0
+      ? Date.now()
+      : null;
   const heartbeatLast = getCameraHeartbeat(cameraName);
   const lastFrameAt = restLast ?? heartbeatLast;
   return {
