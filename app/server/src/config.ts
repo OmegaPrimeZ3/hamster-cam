@@ -54,6 +54,20 @@ const envSchema = z.object({
   // directory does not exist at boot the static handler is silently skipped
   // (local dev runs the Vite dev server on its own port anyway).
   WEB_DIST_PATH: z.string().optional(),
+
+  // The public-facing HTTPS origin for the deployed site (e.g. from CADDY_HOSTNAME).
+  // Used by the live-view WS proxy's Origin allowlist to block cross-site WS
+  // hijacking. When set, the allowlist contains exactly this origin. When unset
+  // in development, the VITE_DEV_ORIGINS list covers localhost.
+  //
+  // In production: set to  https://<CADDY_HOSTNAME>
+  // In docker-compose this can be  PUBLIC_URL=https://${CADDY_HOSTNAME}
+  PUBLIC_URL: z.string().url().optional(),
+
+  // Comma-separated extra origins permitted during local development (e.g.
+  // "http://localhost:5173,http://localhost:5174"). Ignored when NODE_ENV is
+  // not 'development'. Keep empty in production .env.
+  DEV_ORIGINS: z.string().optional(),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

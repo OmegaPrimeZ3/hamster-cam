@@ -505,6 +505,7 @@ const camerasRouter = router({
             name: input['name'],
             emoji: input['emoji'],
             stream_url: input['stream_url'],
+            live_src: input['live_src'],
             enabled: input['enabled'],
           };
         },
@@ -514,7 +515,7 @@ const camerasRouter = router({
       name: z.string().min(1).max(60),
       emoji: z.string().max(8).default('📷'),
       stream_url: z.string().default(''),
-      live_src: z.string().nullable().default(null),
+      live_src: z.string().regex(/^[a-zA-Z0-9_-]+$/, 'live_src may only contain letters, digits, hyphens, and underscores').max(64).nullable().default(null),
       enabled: z.boolean().default(true),
       zones: z.array(z.string()).default([]),
     }))
@@ -552,7 +553,7 @@ const camerasRouter = router({
       name: z.string().min(1).max(60),
       emoji: z.string().max(8),
       stream_url: z.string().default(''),
-      live_src: z.string().nullable().optional(),
+      live_src: z.string().regex(/^[a-zA-Z0-9_-]+$/, 'live_src may only contain letters, digits, hyphens, and underscores').max(64).nullable().optional(),
       enabled: z.boolean(),
       zones: z.array(z.string()).default([]),
       // Wheel odometer — optional; existing values are preserved when omitted.

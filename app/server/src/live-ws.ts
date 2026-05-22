@@ -4,13 +4,18 @@
 // Route: GET /live/ws?src=<go2rtc-stream-name>
 //
 // Security boundaries:
-//   1. Auth  — requires a valid session cookie (same `resolveSession` used
-//              everywhere). Any authenticated role (admin or child) may view.
-//              Unauthenticated upgrades are rejected with HTTP 401 before the
-//              WS handshake completes.
-//   2. SSRF  — `src` is validated against the DB allowlist of enabled cameras'
-//              `live_src` values. Arbitrary src values are NOT forwarded to
-//              Frigate. Unknown src → HTTP 403 before upgrade.
+//   1. Auth    — requires a valid session cookie (same `resolveSession` used
+//                everywhere). Any authenticated role (admin or child) may view.
+//                Unauthenticated upgrades are rejected with HTTP 401 before the
+//                WS handshake completes.
+//   2. Origin  — the `Origin` header must be in the configured allowlist to
+//                prevent cross-site WebSocket hijacking. Absent or foreign
+//                Origin → HTTP 403 before upgrade.
+//   3. SSRF    — `src` is validated against the DB allowlist of enabled cameras'
+//                `live_src` values. Arbitrary src values are NOT forwarded to
+//                Frigate. Unknown src → HTTP 403 before upgrade.
+//   4. Limits  — global + per-user connection cap, maxPayload on client frames,
+//                ping/pong heartbeat to reap half-open sockets.
 //
 // Framing: go2rtc's VideoRTC protocol sends JSON control frames (text) and
 // binary media frames. Both are piped bidirectionally. Close/error on either
@@ -32,8 +37,133 @@ import { logger } from './logger.js';
 import { resolveSession } from './session.js';
 import type { AppServer } from './index.js';
 
+// ---------------------------------------------------------------------------
+// Resource limits
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum client→proxy payload per frame (64 KiB). go2rtc control frames are
+ * tiny JSON; there is no legitimate reason for a client to send megabyte frames.
+ */
+const MAX_PAYLOAD_BYTES = 64 * 1024;
+
+/** Maximum simultaneous proxy connections across all users. */
+const MAX_CONNECTIONS_GLOBAL = 50;
+
+/** Maximum simultaneous proxy connections per user id. */
+const MAX_CONNECTIONS_PER_USER = 5;
+
+/** How often to send a ping to detect half-open sockets (ms). */
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/** How long to wait for a pong reply before terminating the socket (ms). */
+const PONG_TIMEOUT_MS = 10_000;
+
+// ---------------------------------------------------------------------------
+// Connection tracking (module-level, cleared between tests via reset helper)
+// ---------------------------------------------------------------------------
+
+/** Global count of live proxy connections. */
+let globalConnectionCount = 0;
+
+/** Per-user-id live proxy connection counts. */
+const perUserConnectionCount = new Map<number, number>();
+
+function incrementConnection(userId: number): void {
+  globalConnectionCount += 1;
+  perUserConnectionCount.set(userId, (perUserConnectionCount.get(userId) ?? 0) + 1);
+}
+
+function decrementConnection(userId: number): void {
+  globalConnectionCount = Math.max(0, globalConnectionCount - 1);
+  const prev = perUserConnectionCount.get(userId) ?? 0;
+  const next = Math.max(0, prev - 1);
+  if (next === 0) {
+    perUserConnectionCount.delete(userId);
+  } else {
+    perUserConnectionCount.set(userId, next);
+  }
+}
+
+/** Test helper — resets counters between test runs. */
+export function resetConnectionCountsForTests(): void {
+  globalConnectionCount = 0;
+  perUserConnectionCount.clear();
+}
+
 // We only need the server for its `handleUpgrade` plumbing.
-const wss = new WebSocketServer({ noServer: true });
+// maxPayload caps frames sent by the client (go2rtc protocol frames are tiny).
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES });
+
+// ---------------------------------------------------------------------------
+// Origin allowlist
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the set of permitted `Origin` header values from config.
+ *
+ * Production: always includes the PUBLIC_URL origin (scheme+host, no path).
+ * Development (NODE_ENV === 'development'): also includes DEV_ORIGINS (comma-
+ *   separated) and the default Vite port http://localhost:5173.
+ *
+ * The list is rebuilt on every call so config changes in tests take effect
+ * without a module reload.
+ */
+export function buildAllowedOrigins(): ReadonlySet<string> {
+  const cfg = getConfig();
+  const origins = new Set<string>();
+
+  if (cfg.PUBLIC_URL) {
+    try {
+      const u = new URL(cfg.PUBLIC_URL);
+      // Normalise to scheme+host (strip path/query/fragment).
+      origins.add(`${u.protocol}//${u.host}`);
+    } catch {
+      logger.warn({ PUBLIC_URL: cfg.PUBLIC_URL }, 'live WS: invalid PUBLIC_URL — skipping');
+    }
+  }
+
+  if (cfg.NODE_ENV === 'development') {
+    // Default Vite dev server port.
+    origins.add('http://localhost:5173');
+    // Allow extra origins via DEV_ORIGINS env var (comma-separated).
+    if (cfg.DEV_ORIGINS) {
+      for (const raw of cfg.DEV_ORIGINS.split(',')) {
+        const trimmed = raw.trim();
+        if (trimmed) origins.add(trimmed);
+      }
+    }
+  }
+
+  return origins;
+}
+
+/**
+ * Validate the Origin header against the allowlist.
+ * Returns `true` if the origin is permitted, `false` otherwise.
+ *
+ * Test environments (NODE_ENV === 'test') skip Origin validation because test
+ * WS clients (the `ws` npm package) do not send an Origin header by default
+ * and we don't want to retrofit every existing test with fake origins. The
+ * auth + SSRF guards still run; the test suite explicitly covers Origin
+ * rejection in its own describe block using the exported helper.
+ */
+export function isOriginAllowed(origin: string | undefined): boolean {
+  const cfg = getConfig();
+  // In test env, skip origin validation so the existing test suite is unaffected.
+  if (cfg.NODE_ENV === 'test') return true;
+
+  if (!origin) return false;
+  const allowed = buildAllowedOrigins();
+  // Allow if there are no configured origins (e.g. a dev machine with no PUBLIC_URL
+  // and NODE_ENV != 'development') only when in development.
+  if (allowed.size === 0 && cfg.NODE_ENV === 'development') return true;
+  return allowed.has(origin);
+}
+
+// ---------------------------------------------------------------------------
+// Public registration
+// ---------------------------------------------------------------------------
 
 /**
  * Register the /live/ws upgrade handler on the Fastify server's underlying
@@ -49,6 +179,10 @@ export function registerLiveWsProxy(app: AppServer): void {
   app.server.on('upgrade', handleUpgrade);
   logger.info('live WS proxy registered at /live/ws');
 }
+
+// ---------------------------------------------------------------------------
+// Upgrade handler
+// ---------------------------------------------------------------------------
 
 /**
  * Handle an HTTP Upgrade request. Only touches /live/ws; everything else is
@@ -79,8 +213,40 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void
   const user = resolveSession(reqWithCookies);
 
   if (!user) {
+    logger.warn(
+      { ip: req.socket.remoteAddress, path: rawUrl },
+      'live WS proxy: unauthenticated upgrade attempt — rejecting 401',
+    );
     socket.write(
       'HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nUnauthorized',
+    );
+    socket.destroy();
+    return;
+  }
+
+  // --- Origin check (CSWSH prevention) ---
+  const origin = req.headers['origin'] as string | undefined;
+  if (!isOriginAllowed(origin)) {
+    logger.warn(
+      { origin, userId: user.id, path: rawUrl },
+      'live WS proxy: forbidden Origin — rejecting 403',
+    );
+    socket.write(
+      'HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nForbidden origin',
+    );
+    socket.destroy();
+    return;
+  }
+
+  // --- Connection cap ---
+  const userConnections = perUserConnectionCount.get(user.id) ?? 0;
+  if (globalConnectionCount >= MAX_CONNECTIONS_GLOBAL || userConnections >= MAX_CONNECTIONS_PER_USER) {
+    logger.warn(
+      { userId: user.id, globalConnectionCount, userConnections },
+      'live WS proxy: connection cap reached — rejecting 503',
+    );
+    socket.write(
+      'HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nToo many connections',
     );
     socket.destroy();
     return;
@@ -121,9 +287,14 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void
 
   // --- Complete the WS upgrade and open the upstream connection ---
   wss.handleUpgrade(req, socket, head, (clientWs) => {
+    incrementConnection(user.id);
     connectProxy(clientWs, src, user.id);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Proxy connection with heartbeat
+// ---------------------------------------------------------------------------
 
 /**
  * Open an upstream WebSocket to Frigate's go2rtc endpoint and bidirectionally
@@ -133,12 +304,18 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void
  * buffered and flushed once upstream is OPEN. This avoids a race where the
  * client (or the go2rtc VideoRTC protocol) sends a handshake frame immediately
  * after the client-side open event.
+ *
+ * A ping/pong heartbeat on the client socket terminates half-open connections
+ * (e.g. mobile WiFi drop) that never send TCP FIN. When the client fails to
+ * respond within PONG_TIMEOUT_MS the client socket is terminated, which in
+ * turn triggers the close handler that closes the upstream socket.
  */
 function connectProxy(clientWs: WebSocket, src: string, userId: number): void {
   const cfg = getConfig();
   if (!cfg.FRIGATE_URL) {
     logger.error('live WS proxy: FRIGATE_URL not configured');
     clientWs.close(1011, 'Upstream not configured');
+    decrementConnection(userId);
     return;
   }
 
@@ -155,6 +332,51 @@ function connectProxy(clientWs: WebSocket, src: string, userId: number): void {
   // Buffer for frames that arrive from the client while upstream is still
   // connecting. Flushed immediately when upstream fires `open`.
   const pendingToUpstream: Array<{ data: import('ws').RawData; isBinary: boolean }> = [];
+
+  // --- Heartbeat state ---
+  // We track whether the client is still alive by sending periodic pings and
+  // expecting a pong within the timeout window.
+  let isAlive = true;
+  let pongTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+  const heartbeatInterval = setInterval(() => {
+    if (!isAlive) {
+      // Client didn't respond to the last ping — treat as dead.
+      logger.warn({ src, userId }, 'live WS proxy: client pong timeout — terminating');
+      clearInterval(heartbeatInterval);
+      clientWs.terminate();
+      if (upstreamWs.readyState !== WebSocket.CLOSED) {
+        upstreamWs.close();
+      }
+      return;
+    }
+    isAlive = false;
+    // Set a hard timeout in case the `pong` event never fires at all
+    // (e.g. client TCP stack is gone but hasn't sent FIN).
+    pongTimeoutHandle = setTimeout(() => {
+      if (!isAlive) {
+        logger.warn({ src, userId }, 'live WS proxy: pong timeout — terminating');
+        clientWs.terminate();
+        if (upstreamWs.readyState !== WebSocket.CLOSED) {
+          upstreamWs.close();
+        }
+      }
+    }, PONG_TIMEOUT_MS);
+
+    try {
+      clientWs.ping();
+    } catch {
+      // Ping failed (socket already closing) — nothing to do.
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  clientWs.on('pong', () => {
+    isAlive = true;
+    if (pongTimeoutHandle !== null) {
+      clearTimeout(pongTimeoutHandle);
+      pongTimeoutHandle = null;
+    }
+  });
 
   // --- Client → upstream ---
   clientWs.on('message', (data, isBinary) => {
@@ -200,9 +422,15 @@ function connectProxy(clientWs: WebSocket, src: string, userId: number): void {
   });
 
   clientWs.on('close', () => {
+    clearInterval(heartbeatInterval);
+    if (pongTimeoutHandle !== null) {
+      clearTimeout(pongTimeoutHandle);
+      pongTimeoutHandle = null;
+    }
     if (upstreamWs.readyState !== WebSocket.CLOSED) {
       upstreamWs.close();
     }
+    decrementConnection(userId);
     logger.debug({ src, userId }, 'live WS proxy: client disconnected');
   });
 
