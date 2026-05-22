@@ -81,8 +81,11 @@ export function LiveStream({
     const host = hostRef.current;
     if (!host || !liveSrc) return;
 
-    // WebRTC preferred, MSE fallback per the task spec.
-    host.mode = 'webrtc,mse,hls,mjpeg';
+    // WebRTC on LAN, MSE everywhere else. HLS and MJPEG are intentionally
+    // excluded: HLS assigns a data: URL to <video>.src which the site CSP
+    // (media-src 'self' blob:) blocks, and MJPEG is an unnecessary extra
+    // fallback surface. Changing this set requires a matching CSP update.
+    host.mode = 'webrtc,mse';
     host.media = 'video,audio';
 
     // Setting .src on the VideoRTC element triggers onconnect().
