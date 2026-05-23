@@ -99,6 +99,26 @@
 		}
 	}
 
+	# Edge rate-limit for the live-view WebSocket path.
+	# Belt-and-braces on top of the app-level connection cap in the backend's
+	# /live/ws handler (PLAN §7.7). Keyed on {client_ip} (resolved via the
+	# global trusted_proxies cloudflare block so the bucket is per real
+	# visitor, not per Cloudflare edge node).
+	#
+	# Limit math: go2rtc opens 1 WS per camera tile. A typical household
+	# (3 cameras, 3 devices) at first load does 3 cams × 3 devices = 9 opens;
+	# with reconnect bursts on a flaky wifi that might double to ~18. A limit
+	# of 30/min gives comfortable headroom for that pattern while still
+	# blocking a client that hammers upgrades in a tight loop.
+	@live_paths path /live/*
+	rate_limit @live_paths {
+		zone live {
+			key {client_ip}
+			events 30
+			window 1m
+		}
+	}
+
 	# /health is unauthenticated by design (Fastify docker healthcheck
 	# uses it). Restrict at the edge so the disk_free_pct side channel
 	# isn't exposed to the public internet. Loopback + RFC1918 ranges
