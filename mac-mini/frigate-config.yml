@@ -33,23 +33,26 @@ mqtt:
   client_id: frigate-mac-mini
   stats_interval: 60
 
-# OpenVINO on the iGPU. The default `ssdlite_mobilenet_v2` model ships
-# inside the Frigate image and knows the COCO classes (which includes
-# `mouse` and `cat` — see PLAN §4.3 "quick path"). Swap to a custom
-# YOLO IR after the Roboflow training round; just point `path` at a
-# file in /config and update labelmap.
+# OpenVINO on the iGPU running a CUSTOM single-class hamster model
+# (YOLOv9-tiny, trained via scripts/pet-model/ — see docs/HAMSTER_MODEL_PLAN.md).
+# COCO has NO rodent class (its `mouse` is a *computer mouse*), so the stock
+# ssdlite could never recognize a hamster — this model can. The .onnx and
+# labelmap are shipped to the host dir mounted at /config/model_cache (see the
+# frigate `volumes:` in docker-compose.yml); they are NOT committed (gitignored).
+# To retrain / swap pets, re-run scripts/pet-model/run.sh and replace the files.
 detectors:
   ov:
     type: openvino
     device: GPU
 
 model:
-  width: 300
-  height: 300
-  input_tensor: nhwc
-  input_pixel_format: bgr
-  path: /openvino-model/ssdlite_mobilenet_v2.xml
-  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
+  model_type: yolo-generic
+  width: 320
+  height: 320
+  input_tensor: nchw
+  input_dtype: float
+  path: /config/model_cache/hamster_y9.onnx
+  labelmap_path: /config/model_cache/hamster.txt
 
 # Defaults applied to every camera unless overridden. Per-PLAN §8 retention
 # math: continuous = 3 days, event clips = 30 days.
@@ -72,20 +75,15 @@ snapshots:
   retain:
     default: 14
 
-# `mouse` and `cat` are COCO classes the default detector already knows —
-# good enough to fire the wheel/food/water zones until a custom YOLO ships.
-# `min_score` of 0.30 is intentionally lenient per PLAN §4.3 "quick path".
+# Single custom class from the hamster model. min_score is a real threshold now
+# (the old 0.30 was a hack to coax detections out of the wrong COCO classes).
 objects:
   track:
-    - mouse
-    - cat
+    - hamster
   filters:
-    mouse:
-      min_score: 0.30
-      threshold: 0.50
-    cat:
-      min_score: 0.30
-      threshold: 0.50
+    hamster:
+      min_score: 0.5
+      threshold: 0.6
 
 ffmpeg:
   # Detect AND record consume the LOCAL go2rtc restream over loopback (see
@@ -128,13 +126,10 @@ cameras:
       fps: 5
     objects:
       track:
-        - mouse
-        - cat
+        - hamster
       filters:
-        mouse:
-          min_score: 0.30
-        cat:
-          min_score: 0.30
+        hamster:
+          min_score: 0.5
     zones:
       wheel:
         coordinates: 0.02,0.05,0.48,0.05,0.48,0.35,0.02,0.35
@@ -171,13 +166,10 @@ cameras:
       fps: 5
     objects:
       track:
-        - mouse
-        - cat
+        - hamster
       filters:
-        mouse:
-          min_score: 0.30
-        cat:
-          min_score: 0.30
+        hamster:
+          min_score: 0.5
     zones:
       wheel:
         coordinates: 0.02,0.05,0.48,0.05,0.48,0.35,0.02,0.35

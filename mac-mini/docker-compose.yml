@@ -153,6 +153,11 @@ services:
       # and the built-in zone editor writes zone coordinates back to it.
       - ./frigate-config.yml:/config/config.yml
       - ./storage/frigate:/media/frigate
+      # Custom detector model + labelmap (the hamster YOLOv9 ONNX). NOT read-only:
+      # OpenVINO caches the converted IR here on first load. Files are shipped to
+      # the host ./models dir out-of-band (gitignored .onnx) — see
+      # docs/HAMSTER_MODEL_PLAN.md and scripts/pet-model/.
+      - ./models:/config/model_cache
       - type: tmpfs
         target: /tmp/cache
         tmpfs:
