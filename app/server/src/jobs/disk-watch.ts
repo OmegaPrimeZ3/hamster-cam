@@ -1,6 +1,11 @@
 // app/server/src/jobs/disk-watch.ts
 // `df`-based disk monitor. Warn → in-app diary entry; critical → Zyphr-sent
 // email to admin. Thresholds live in `settings`.
+//
+// Self-clearing: the job tracks the last severity in memory and only writes
+// a diary entry (or sends email) on threshold crossings. When disk recovers
+// below the warn threshold a one-time "disk recovered" entry is emitted so
+// the diary doesn't leave a stuck alert visible to users.
 // PLAN §8.
 
 import { execFile } from 'node:child_process';
@@ -24,6 +29,14 @@ export interface DiskWatchRunResult {
   /** True if this run actually emitted an alert (diary entry or email). */
   alerted: boolean;
 }
+
+/**
+ * In-memory state — tracks the previous severity so we only fire on
+ * threshold crossings rather than every run while in an alerted state.
+ * Resets to 'ok' on server restart, which is fine: the first run after
+ * a restart that finds disk high will re-alert once, matching user expectation.
+ */
+let lastSeverity: DiskWatchSeverity = 'ok';
 
 interface DfReading {
   pctUsed: number;
@@ -66,12 +79,15 @@ export async function runDiskWatchJob(): Promise<DiskWatchRunResult> {
   else if (reading.pctUsed >= warnPct) severity = 'warn';
 
   let alerted = false;
-  if (severity !== 'ok') {
+  const prevSeverity = lastSeverity;
+
+  if (severity !== 'ok' && severity !== prevSeverity) {
+    // Threshold crossed upward (ok→warn, ok→critical, warn→critical).
     const now = Date.now();
     const narrative =
       severity === 'critical'
-        ? `⚠️ Disk is ${reading.pctUsed}% full — only ${freeGb} GB free. Free up space soon!`
-        : `📦 Disk is getting full (${reading.pctUsed}%) — ${freeGb} GB free.`;
+        ? `Disk is ${reading.pctUsed}% full — only ${freeGb} GB free. Free up space soon!`
+        : `Disk is getting full (${reading.pctUsed}%) — ${freeGb} GB free.`;
     db.createDiaryEntry({
       occurred_at: now,
       kind: 'narrative',
@@ -90,13 +106,37 @@ export async function runDiskWatchJob(): Promise<DiskWatchRunResult> {
     if (severity === 'critical') {
       await emailAdminsBestEffort(narrative, reading);
     }
+  } else if (severity === 'ok' && prevSeverity !== 'ok') {
+    // Recovered — emit a one-time resolution entry so the diary self-clears.
+    db.createDiaryEntry({
+      occurred_at: Date.now(),
+      kind: 'narrative',
+      activity: null,
+      narrative: `Disk space recovered — now ${reading.pctUsed}% used, ${freeGb} GB free.`,
+      pet_name: null,
+      camera_id: null,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: null,
+      snapshot_id: null,
+      media_path: null,
+      details: JSON.stringify({ severity: 'ok', pctUsed: reading.pctUsed, freeGb, resolved: true }),
+    });
+    alerted = true;
   }
 
+  lastSeverity = severity;
+
   logger.info(
-    { severity, pctUsed: reading.pctUsed, freeGb, alerted },
+    { severity, prevSeverity, pctUsed: reading.pctUsed, freeGb, alerted },
     'disk-watch complete',
   );
   return { severity, pct_used: reading.pctUsed, free_gb: freeGb, alerted };
+}
+
+/** Test helper — resets in-memory state between test runs. */
+export function resetDiskWatchStateForTests(): void {
+  lastSeverity = 'ok';
 }
 
 function clampPct(raw: number, fallback: number): number {

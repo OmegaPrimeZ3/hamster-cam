@@ -261,8 +261,11 @@ interface Statements {
   shareUpdateStatus: Database.Statement;
   shareCountSinceForUser: Database.Statement;
   shareListForUser: Database.Statement;
-  // wheel odometer — aggregate for badge evaluation
+  // wheel odometer — aggregate for badge evaluation + stats
   diaryWheelEntriesAll: Database.Statement;
+  diaryWheelEntriesBetween: Database.Statement;
+  diaryWheelEntriesGroupedByDay: Database.Statement;
+  diaryWheelBestSession: Database.Statement;
   // push subscriptions
   pushSubUpsert: Database.Statement;
   pushSubDeleteByEndpointForUser: Database.Statement;
@@ -501,6 +504,33 @@ function statements(): Statements {
     diaryWheelEntriesAll: db.prepare(`
       SELECT details FROM diary_entries
        WHERE activity = 'wheel' AND details IS NOT NULL
+    `),
+    diaryWheelEntriesBetween: db.prepare(`
+      SELECT details FROM diary_entries
+       WHERE activity = 'wheel' AND details IS NOT NULL
+         AND occurred_at >= ? AND occurred_at < ?
+    `),
+    // Returns one row per local date (YYYY-MM-DD) summing wheel_meters for
+    // sparkline / trend display. SQLite's date() uses UTC by default; we work
+    // in UTC consistently — the day boundary logic in tRPC handles local-tz.
+    diaryWheelEntriesGroupedByDay: db.prepare(`
+      SELECT date(occurred_at / 1000, 'unixepoch') AS day,
+             json_group_array(details)              AS details_arr
+        FROM diary_entries
+       WHERE activity = 'wheel'
+         AND details IS NOT NULL
+         AND occurred_at >= ?
+       GROUP BY day
+       ORDER BY day ASC
+    `),
+    // SQLite JSON_EXTRACT for best single session — returns the max
+    // wheel_meters numeric value across all wheel diary entries.
+    diaryWheelBestSession: db.prepare(`
+      SELECT MAX(CAST(json_extract(details, '$.wheel_meters') AS REAL)) AS best
+        FROM diary_entries
+       WHERE activity = 'wheel'
+         AND details IS NOT NULL
+         AND json_extract(details, '$.wheel_meters') IS NOT NULL
     `),
 
     // push subscriptions -----------------------------------------------
@@ -996,13 +1026,8 @@ export function clearOldTimelapseMedia(cutoffMs: number): number {
   return info.changes;
 }
 
-/**
- * Sum all wheel_meters values stored in diary_entries.details across all time.
- * Used by the odometer badge rules. Details is a JSON object; we parse each
- * row and extract the numeric `wheel_meters` field.
- */
-export function sumAllWheelMeters(): number {
-  const rows = statements().diaryWheelEntriesAll.all() as Array<{ details: string }>;
+/** Shared helper: sum wheel_meters from a set of detail rows. */
+function extractWheelMetersSum(rows: Array<{ details: string }>): number {
   let total = 0;
   for (const row of rows) {
     try {
@@ -1018,6 +1043,75 @@ export function sumAllWheelMeters(): number {
     }
   }
   return total;
+}
+
+/**
+ * Sum all wheel_meters values stored in diary_entries.details across all time.
+ * Used by the odometer badge rules. Details is a JSON object; we parse each
+ * row and extract the numeric `wheel_meters` field.
+ */
+export function sumAllWheelMeters(): number {
+  const rows = statements().diaryWheelEntriesAll.all() as Array<{ details: string }>;
+  return extractWheelMetersSum(rows);
+}
+
+/**
+ * Sum wheel_meters for diary wheel entries within a time range [fromMs, toMs).
+ */
+export function sumWheelMetersBetween(fromMs: number, toMs: number): number {
+  const rows = statements().diaryWheelEntriesBetween.all(fromMs, toMs) as Array<{ details: string }>;
+  return extractWheelMetersSum(rows);
+}
+
+export interface WheelDaySeries {
+  /** YYYY-MM-DD in UTC. */
+  date: string;
+  meters: number;
+}
+
+/**
+ * Returns one entry per UTC calendar day for the last `days` days (default 14),
+ * summing wheel_meters. Days with no wheel activity are omitted (sparse series).
+ */
+export function listWheelMetersByDay(sinceMs: number): WheelDaySeries[] {
+  const rows = statements().diaryWheelEntriesGroupedByDay.all(sinceMs) as Array<{
+    day: string;
+    details_arr: string;
+  }>;
+  const result: WheelDaySeries[] = [];
+  for (const row of rows) {
+    let detailsList: unknown[];
+    try {
+      const parsed = JSON.parse(row.details_arr) as unknown;
+      detailsList = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      detailsList = [];
+    }
+    let dayMeters = 0;
+    for (const rawDetail of detailsList) {
+      let detail: unknown;
+      try {
+        detail = typeof rawDetail === 'string' ? (JSON.parse(rawDetail) as unknown) : rawDetail;
+      } catch {
+        continue;
+      }
+      if (typeof detail === 'object' && detail !== null && 'wheel_meters' in detail) {
+        const m = (detail as Record<string, unknown>)['wheel_meters'];
+        if (typeof m === 'number' && Number.isFinite(m)) dayMeters += m;
+      }
+    }
+    result.push({ date: row.day, meters: dayMeters });
+  }
+  return result;
+}
+
+/**
+ * Returns the highest `wheel_meters` value from any single wheel diary entry.
+ * Uses SQLite's JSON_EXTRACT for efficiency — no full table scan in JS.
+ */
+export function bestWheelSessionMeters(): number {
+  const row = statements().diaryWheelBestSession.get() as { best: number | null };
+  return typeof row.best === 'number' && Number.isFinite(row.best) ? row.best : 0;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 // app/server/src/jobs/retention.ts
 // Nightly retention sweep. PLAN §8.
 
-import { unlink } from 'node:fs/promises';
+import { readdir, stat, unlink } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
 
 import { getConfig } from '../config.js';
@@ -10,10 +10,14 @@ import { childLogger } from '../logger.js';
 
 const logger = childLogger('retention-job');
 
+/** Default clip retention window — 14 days. Overridden by `clip_retention_days` setting. */
+const CLIP_RETENTION_DAYS_DEFAULT = 14;
+
 export interface RetentionRunResult {
   snapshots_deleted: number;
   timelapse_media_cleared: number;
   audit_rows_deleted: number;
+  clips_deleted: number;
 }
 
 function days(n: number): number {
@@ -42,6 +46,7 @@ export async function runRetentionJob(): Promise<RetentionRunResult> {
   const snapWindow = days(readSettingInt('snapshot_retention_days', 90));
   const tlWindow = days(readSettingInt('timelapse_retention_days', 30));
   const auditWindow = days(readSettingInt('audit_retention_days', 365));
+  const clipWindow = days(readSettingInt('clip_retention_days', CLIP_RETENTION_DAYS_DEFAULT));
 
   // Snapshots — delete file then row.
   const snapshotsToDelete = db.listSnapshotsBetween(0, now - snapWindow);
@@ -66,6 +71,10 @@ export async function runRetentionJob(): Promise<RetentionRunResult> {
 
   const auditRowsDeleted = db.deleteAuditOlderThan(now - auditWindow);
 
+  // Clips — extracted MP4s written by Send-a-Clip. They are not tracked in
+  // any DB table (they're temp files), so we scan the directory directly.
+  const clipsDeleted = await pruneClipsDir(now - clipWindow);
+
   // Also opportunistically purge expired sessions — cheap and keeps the
   // table from growing forever in a long-lived install.
   db.purgeExpiredSessions(now);
@@ -76,6 +85,7 @@ export async function runRetentionJob(): Promise<RetentionRunResult> {
       snapshotDiaryDeleted,
       timelapseFiles,
       auditRowsDeleted,
+      clipsDeleted,
     },
     'retention sweep complete',
   );
@@ -83,5 +93,40 @@ export async function runRetentionJob(): Promise<RetentionRunResult> {
     snapshots_deleted: snapshotsDeleted,
     timelapse_media_cleared: timelapseFiles,
     audit_rows_deleted: auditRowsDeleted,
+    clips_deleted: clipsDeleted,
   };
+}
+
+/**
+ * Delete files under `STORAGE_PATH/clips/` that are older than `cutoffMs`.
+ * Best-effort per file — one failure does not abort the rest.
+ */
+async function pruneClipsDir(cutoffMs: number): Promise<number> {
+  const cfg = getConfig();
+  const clipsDir = join(cfg.STORAGE_PATH, 'clips');
+  let deleted = 0;
+  let entries: string[];
+  try {
+    entries = await readdir(clipsDir);
+  } catch (err: unknown) {
+    // Directory doesn't exist yet — nothing to prune.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    logger.warn({ err: (err as Error).message }, 'clips dir readdir failed');
+    return 0;
+  }
+  for (const name of entries) {
+    const abs = join(clipsDir, name);
+    try {
+      const info = await stat(abs);
+      if (info.mtimeMs < cutoffMs) {
+        await unlink(abs);
+        deleted += 1;
+      }
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.warn({ path: abs, err: (err as Error).message }, 'failed to prune clip file');
+      }
+    }
+  }
+  return deleted;
 }

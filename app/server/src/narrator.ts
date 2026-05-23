@@ -174,6 +174,60 @@ export function getRecentEvents(): RecentEventEntry[] {
   return all.sort((a, b) => b.at - a.at).slice(0, RECENT_RING_SIZE);
 }
 
+/**
+ * How long (ms) before a last-seen reading is considered stale. If Remy
+ * hasn't triggered any Frigate events in this window, she's probably napping
+ * somewhere off-camera.
+ */
+const STALE_THRESHOLD_MS = 60_000;
+
+export interface PetStatus {
+  /** Classified activity from the zone/camera name. Null when no state. */
+  activity: Activity | null;
+  /** Zone name from the most recent Frigate event. Null when no state. */
+  zone: string | null;
+  /** Camera row id of the most recent sighting. Null when no state. */
+  cameraId: number | null;
+  /** Milliseconds elapsed since the last sighting. Null when no state. */
+  sinceMs: number | null;
+  /**
+   * True when there is no recorded state, or the last sighting is older than
+   * STALE_THRESHOLD_MS (pet is probably napping off-camera).
+   */
+  stale: boolean;
+}
+
+/**
+ * Returns the live status of the first (and typically only) pet being tracked.
+ * When multiple pet labels are in play, we use whichever had the most recent
+ * sighting — practical enough for a single-hamster setup.
+ */
+export function getPetStatus(now: number = Date.now()): PetStatus {
+  let newest: { petKey: string; lastSeen: LastSeen } | null = null;
+  for (const [petKey, s] of state.entries()) {
+    if (s.lastSeen && (!newest || s.lastSeen.at > newest.lastSeen.at)) {
+      newest = { petKey, lastSeen: s.lastSeen };
+    }
+  }
+  if (!newest) {
+    return { activity: null, zone: null, cameraId: null, sinceMs: null, stale: true };
+  }
+  const { lastSeen } = newest;
+  const sinceMs = now - lastSeen.at;
+  const stale = sinceMs > STALE_THRESHOLD_MS;
+
+  // Re-construct a minimal side object so we can reuse classifyActivity.
+  const side: FrigateEventPayloadSide = {
+    camera: lastSeen.camera,
+    label: newest.petKey,
+    current_zones: lastSeen.zone ? [lastSeen.zone] : [],
+  };
+  const activity = classifyActivity(side);
+  const cameraId = cameraIdByName(lastSeen.camera);
+
+  return { activity, zone: lastSeen.zone, cameraId, sinceMs, stale };
+}
+
 // ---------------------------------------------------------------------------
 // Diary writer
 // ---------------------------------------------------------------------------

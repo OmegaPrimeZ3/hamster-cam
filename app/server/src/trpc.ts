@@ -32,7 +32,7 @@ import * as db from './db.js';
 import { resolveSession } from './session.js';
 import * as frigate from './frigate.js';
 import { triggerForgotPassword, registerAccount, ZyphrEmailTaken } from './zyphr.js';
-import { saveManualSnapshot, getRecentEvents } from './narrator.js';
+import { saveManualSnapshot, getRecentEvents, getPetStatus } from './narrator.js';
 import { startShareJob } from './share.js';
 
 // ---------------------------------------------------------------------------
@@ -810,6 +810,68 @@ const statsRouter = router({
         }));
       return { zones };
     }),
+
+  wheelRecords: protectedProcedure
+    .input(z.void())
+    .output(z.object({
+      /** Total wheel metres run today (local calendar day). */
+      todayMeters: z.number(),
+      /** Total wheel metres in the current 7-day window (Mon–Sun local week, Sun-origin). */
+      weekMeters: z.number(),
+      /** All-time cumulative wheel metres. */
+      allTimeMeters: z.number(),
+      /** Highest single-day wheel metres ever recorded (UTC day boundary). */
+      bestDayMeters: z.number(),
+      /** The UTC date string (YYYY-MM-DD) for the best day. Null when no data. */
+      bestDayDate: z.string().nullable(),
+      /** Highest single wheel-session metres ever recorded. */
+      bestSessionMeters: z.number(),
+      /** Per-day series for the last 14 days — sparse (days with 0 activity omitted). */
+      dailySeries: z.array(z.object({
+        date: z.string(),
+        meters: z.number(),
+      })),
+    }))
+    .query(() => {
+      const now = Date.now();
+      const todayStart = startOfLocalDay(new Date(now));
+      const todayEnd = todayStart + 24 * 60 * 60 * 1000;
+
+      // Week: Sunday-based, same pattern as startOfLocalDay.
+      const weekStart = startOfLocalWeek(new Date(now));
+
+      const todayMeters = db.sumWheelMetersBetween(todayStart, todayEnd);
+      const weekMeters = db.sumWheelMetersBetween(weekStart, now);
+      const allTimeMeters = db.sumAllWheelMeters();
+
+      // Daily series for the last 14 days.
+      const fourteenDaysAgo = todayStart - 13 * 24 * 60 * 60 * 1000;
+      const dailySeries = db.listWheelMetersByDay(fourteenDaysAgo);
+
+      // Best day from the series — but we need all-time, so query all days.
+      const allDays = db.listWheelMetersByDay(0);
+      let bestDayMeters = 0;
+      let bestDayDate: string | null = null;
+      for (const day of allDays) {
+        if (day.meters > bestDayMeters) {
+          bestDayMeters = day.meters;
+          bestDayDate = day.date;
+        }
+      }
+
+      // Best single session: one diary_entries row with the highest wheel_meters.
+      const bestSessionMeters = db.bestWheelSessionMeters();
+
+      return {
+        todayMeters,
+        weekMeters,
+        allTimeMeters,
+        bestDayMeters,
+        bestDayDate,
+        bestSessionMeters,
+        dailySeries,
+      };
+    }),
 });
 
 /** Activities that make sense as a scoreboard tile (excludes snapshot/timelapse/transition). */
@@ -825,6 +887,50 @@ function isStatsActivity(value: string): value is db.DiaryActivity {
     value === 'hiding'
   );
 }
+
+// ---------------------------------------------------------------------------
+// pet.*
+// ---------------------------------------------------------------------------
+
+const activityValueSchema = z.enum([
+  'wheel', 'food', 'water', 'bathroom', 'resting', 'tunnel', 'exploring', 'hiding',
+]);
+
+const petCurrentStatusSchema = z.object({
+  /**
+   * Classified activity derived from zone/camera name. Null when no in-memory
+   * state exists (server just restarted or no Frigate events received yet).
+   */
+  activity: activityValueSchema.nullable(),
+  /** Zone name from the most recent Frigate event. Null when no state. */
+  zone: z.string().nullable(),
+  /** Camera row id. Null when no state. */
+  cameraId: z.number().int().nullable(),
+  /** Milliseconds since the last sighting. Null when no state. */
+  sinceMs: z.number().int().nonnegative().nullable(),
+  /**
+   * True when there is no state, or last sighting is older than 60 seconds
+   * (Remy is probably napping somewhere off-camera).
+   */
+  stale: z.boolean(),
+});
+export type PetCurrentStatusDTO = z.infer<typeof petCurrentStatusSchema>;
+
+const petRouter = router({
+  currentStatus: protectedProcedure
+    .input(z.void())
+    .output(petCurrentStatusSchema)
+    .query(() => {
+      const status = getPetStatus();
+      return {
+        activity: status.activity,
+        zone: status.zone,
+        cameraId: status.cameraId,
+        sinceMs: status.sinceMs !== null ? Math.round(status.sinceMs) : null,
+        stale: status.stale,
+      };
+    }),
+});
 
 // ---------------------------------------------------------------------------
 // badges.*
@@ -1223,6 +1329,7 @@ const adminRouter = router({
       snapshots_deleted: z.number().int().nonnegative(),
       timelapse_media_cleared: z.number().int().nonnegative(),
       audit_rows_deleted: z.number().int().nonnegative(),
+      clips_deleted: z.number().int().nonnegative(),
     }))
     .mutation(() => runRetentionJob()),
 
@@ -1363,6 +1470,7 @@ export const appRouter = router({
   cameras: camerasRouter,
   activity: activityRouter,
   stats: statsRouter,
+  pet: petRouter,
   badges: badgesRouter,
   users: usersRouter,
   audit: auditRouter,
@@ -1381,6 +1489,14 @@ export type AppRouter = typeof appRouter;
 function startOfLocalDay(d: Date): number {
   const copy = new Date(d);
   copy.setHours(0, 0, 0, 0);
+  return copy.getTime();
+}
+
+/** Start of the current week in local time (Sunday = 0). */
+function startOfLocalWeek(d: Date): number {
+  const copy = new Date(d);
+  copy.setHours(0, 0, 0, 0);
+  copy.setDate(copy.getDate() - copy.getDay());
   return copy.getTime();
 }
 
