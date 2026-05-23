@@ -331,38 +331,65 @@ detects an iOS browser that isn't running standalone.
 **VAPID keys** are generated on first boot and stored in the SQLite
 `settings` table — you don't need to configure anything in `.env`.
 
-### Wheel odometer
+### Wheel odometer — counting rotations & distance
 
-**What it does.** Counts actual wheel rotations by watching for a
-high-contrast mark crossing a fixed line in the camera frame. The
-narrator multiplies rotations by the wheel's circumference to get
-meters, attaches that to the wheel diary entry, and the StatsStrip
-shows cumulative distance for the week. Three lifetime distance
-badges unlock at 1 mile, marathon, and 100 miles.
+**What it does.** Counts real wheel rotations *optically* and converts them to
+distance. You put one high-contrast mark on the wheel rim; the backend watches a
+thin horizontal band of the camera frame where that mark passes and counts each
+pass as one rotation. Distance is just circumference × rotations:
 
-**How to enable.**
-1. **Stick a piece of dark gaffer tape** (or electrical tape, or even
-   a Sharpie blob) on the rim of the wheel. About 1–2 cm wide. This
-   is the only physical change you'll make.
-2. Open Settings → Cameras → the wheel camera → **Wheel odometer**
-   section.
-3. Toggle "Enable wheel odometer" on.
-4. Confirm **Wheel diameter (mm)** matches your wheel (default 152mm
-   = 6"; measure across the wheel's outer rim).
-5. Adjust **Detection band Y position** so the horizontal red line
-   sits across the wheel rim where the tape passes.
-6. Hit **Test detection**. The cropped band image appears; you'll
-   see "Tape visible" once your tape passes through. If the ratio
-   stays low, drop the **Dark threshold** slider; if it stays high
-   even without the tape, raise it.
-7. Save. From the next wheel session onward, the diary cards will
-   carry an `~0.15 mi` note.
+```
+metres = rotations × π × wheel_diameter_mm ÷ 1000
+```
 
-**Privacy / cost.** Zero. Detection runs locally on the Mac Mini
-against the camera's RTSP feed — no frames leave your network.
+The narrator attaches each session's distance to that wheel diary entry; the
+StatsStrip shows cumulative distance (today / this week, in your chosen units);
+and three lifetime badges unlock at 1 mile, a marathon, and 100 miles.
 
-**If the toggle is off** per camera, the feature is silent. Diary
-entries keep working without distance numbers.
+**How the counting works.** When the hamster enters the **wheel zone** (so that
+zone must be drawn — see [SETUP_MAC_MINI §8.5](./docs/SETUP_MAC_MINI.md)), the
+backend opens a session: samples the camera's RTSP at 10 fps, crops to the
+configured band, and runs a debounced state machine — `LIGHT → DARK` (mark
+entered the band) `→ LIGHT` (mark left) = **one rotation** (an 80 ms / 3-frame
+debounce rejects flicker). When the hamster leaves the wheel the session closes
+and the distance lands on the diary entry. Sessions auto-stop after 2 h.
+
+**Requirements.** The backend needs (a) `ffmpeg` available, and (b) a camera
+RTSP source it can reach. See the **Known gap** at the bottom of this section —
+both moved under recent refactors and need a one-time fix to re-enable this.
+
+**Setup.**
+1. **Mark the wheel** — ~1–2 cm of dark gaffer/electrical tape (or a Sharpie
+   blob) on the rim, one high-contrast mark. The only physical change.
+2. **Draw the wheel zone** for that camera (SETUP_MAC_MINI §8.5) — sessions
+   trigger on wheel-zone entry.
+3. Settings → Cameras → the wheel camera → **Wheel odometer**.
+4. Toggle **Enable wheel odometer** on.
+5. **Wheel diameter (mm)** — match your wheel (default 152 = 6"; measure the
+   outer rim — this is what converts rotations to distance).
+6. **Detection band Y position (%)** — slide the band over the rim arc where the
+   tape passes; **band height (%)** (default 10) — keep it thin so only the tape
+   darkens it.
+7. **Dark threshold (%)** (default 50) — a frame reads "mark present" when its
+   band is darker than `255 × (1 − threshold/100)`.
+8. **Test detection** — grabs one frame, shows the cropped band + its dark-pixel
+   ratio. With the tape sitting in the band the ratio should jump above the
+   threshold ("Tape visible"); without it, stay low. Tune band/threshold until
+   that's clean, then **Save**. From the next wheel session, diary cards carry a
+   distance note and the StatsStrip distance climbs.
+
+**Privacy / cost.** Zero — detection runs locally against the camera feed; no
+frames leave your network. **Per camera, off by default** — disabled cameras are
+silent and the diary still works without distance numbers.
+
+> **⚠️ Known gap (introduced by the Docker + edge-H264 migrations).** This
+> feature — and **Send-a-Clip** and the **nightly time-lapse**, which also shell
+> out to `ffmpeg` — needs two fixes to run in the current container deployment:
+> (1) the `hamster-app` image (`app/Dockerfile`, `node:24-slim`) doesn't bundle
+> `ffmpeg`; (2) the per-camera RTSP field (`stream_url`) was emptied when cameras
+> moved to a go2rtc `live_src`, so the odometer's `ffmpeg -i` has no source. Fix:
+> add `ffmpeg` to the runtime image, and source the stream from the go2rtc relay
+> (`rtsp://frigate:8554/<live_src>`) instead of `stream_url`.
 
 ### Send-a-Clip email sharing
 
