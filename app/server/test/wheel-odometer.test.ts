@@ -188,6 +188,9 @@ beforeEach(() => {
   process.env['STORAGE_PATH'] = workdir;
   process.env['ZYPHR_API_KEY'] = 'zy_test_dummy';
   process.env['ZYPHR_APP_SECRET'] = 'zy_test_dummy_secret';
+  // The odometer derives its RTSP source from FRIGATE_URL's host + the camera's
+  // go2rtc live_src (rtsp://<host>:8554/<live_src>).
+  process.env['FRIGATE_URL'] = 'http://frigate:5000';
 
   currentSpawnMock = vi.fn(() => makeFakeProc());
   vi.doMock('node:child_process', () => ({
@@ -211,6 +214,7 @@ async function seedWheelCamera(enabled: boolean = true): Promise<number> {
     name: 'wheel-cam',
     emoji: '🎡',
     stream_url: 'rtsp://fake/stream',
+    live_src: 'wheel_cam',
     enabled: true,
     zones: ['wheel'],
     wheel_mark_enabled: enabled,

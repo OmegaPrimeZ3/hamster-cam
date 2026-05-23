@@ -99,6 +99,14 @@ RUN cp -r /repo/app/server/dist/. /prod/dist/
 # -----------------------------------------------------------------------
 FROM node:24-bookworm-slim AS runtime
 
+# ffmpeg — required at runtime by three backend features that shell out to it:
+# the wheel odometer (optical rotation counting), Send-a-Clip (recording-window
+# extraction), and the nightly time-lapse (snapshot stitching). Install as root
+# (before the USER switch below); --no-install-recommends keeps it lean.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Run as a non-root user. The default `node` user (uid 1000) is already
 # present in node images. We use it rather than creating a new one so the
 # uid is predictable and documented (see compose `user:` in docker-compose.yml).

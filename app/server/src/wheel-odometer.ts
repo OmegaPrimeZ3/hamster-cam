@@ -13,6 +13,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import type { Readable } from 'node:stream';
 
 import * as db from './db.js';
+import { getConfig } from './config.js';
 import { childLogger } from './logger.js';
 
 const log = childLogger('wheel-odometer');
@@ -27,6 +28,21 @@ const SAMPLE_FPS = 10;
 const DEBOUNCE_FRAMES = 3;
 /** Safety cut-off — auto-kill a session after 2 hours. */
 const MAX_SESSION_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * Build the RTSP URL the odometer reads frames from. Cameras are identified by
+ * their go2rtc stream name (`live_src`); Frigate's embedded go2rtc relays each
+ * camera's H264 over RTSP on :8554, reachable on the compose network at the
+ * same host as FRIGATE_URL (e.g. rtsp://frigate:8554/hamster_cam_1). Returns
+ * null if the camera has no live_src or FRIGATE_URL is unset. (Replaces the
+ * old per-camera stream_url, which the live_src migration emptied.)
+ */
+function wheelRtspUrl(liveSrc: string | null): string | null {
+  if (!liveSrc) return null;
+  const cfg = getConfig();
+  if (!cfg.FRIGATE_URL) return null;
+  return `rtsp://${new URL(cfg.FRIGATE_URL).hostname}:8554/${liveSrc}`;
+}
 
 // ---------------------------------------------------------------------------
 // PGM streaming parser
@@ -213,12 +229,18 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
   if (camera.wheel_mark_enabled !== 1) return;
 
   const {
-    stream_url,
+    live_src,
     wheel_diameter_mm: diameterMm,
     wheel_band_y_pct: bandY,
     wheel_band_height_pct: bandH,
     wheel_threshold_pct: thresholdPct,
   } = camera;
+
+  const rtspUrl = wheelRtspUrl(live_src);
+  if (!rtspUrl) {
+    log.warn({ cameraId, live_src }, 'wheel-odometer: no live_src / FRIGATE_URL — cannot start session');
+    return;
+  }
 
   const counter = new RotationCounter(thresholdPct);
   const parser = new PgmParser((mean) => {
@@ -235,7 +257,7 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
   // stdout and stderr are Readable instances in all cases.
   const rawProc = spawn('ffmpeg', [
     '-rtsp_transport', 'tcp',
-    '-i', stream_url,
+    '-i', rtspUrl,
     '-vf', `crop=iw:ih*${bandH}/100:0:ih*${bandY}/100,format=gray`,
     '-vsync', 'vfr',
     '-r', String(SAMPLE_FPS),
@@ -283,7 +305,7 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
     diameterMm,
   });
 
-  log.info({ cameraId, stream_url, bandY, bandH, thresholdPct }, 'wheel session started');
+  log.info({ cameraId, rtspUrl, bandY, bandH, thresholdPct }, 'wheel session started');
 }
 
 /**
@@ -315,7 +337,9 @@ export async function testWheelDetection(cameraId: number): Promise<
   const camera = db.getCameraById(cameraId);
   if (!camera) return { error: `camera ${cameraId} not found` };
 
-  const { stream_url, wheel_band_y_pct: bandY, wheel_band_height_pct: bandH, wheel_threshold_pct: thresholdPct } = camera;
+  const { live_src, wheel_band_y_pct: bandY, wheel_band_height_pct: bandH, wheel_threshold_pct: thresholdPct } = camera;
+  const rtspUrl = wheelRtspUrl(live_src);
+  if (!rtspUrl) return { error: 'camera has no go2rtc live_src configured' };
 
   return new Promise((resolve) => {
     // Capture exactly one frame as grayscale PGM, then convert to PNG via a
@@ -324,7 +348,7 @@ export async function testWheelDetection(cameraId: number): Promise<
     // Step 1: grab one PGM frame from the stream.
     const grabProc = spawn('ffmpeg', [
       '-rtsp_transport', 'tcp',
-      '-i', stream_url,
+      '-i', rtspUrl,
       '-vf', `crop=iw:ih*${bandH}/100:0:ih*${bandY}/100,format=gray`,
       '-vframes', '1',
       '-f', 'image2pipe',
