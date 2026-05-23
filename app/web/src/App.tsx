@@ -16,7 +16,9 @@ import { Routes, Route } from 'react-router-dom';
 import { AuthGate } from './components/AuthGate';
 import { Login } from './components/Login';
 import { Header } from './components/Header';
+import { LiveStatus } from './components/LiveStatus';
 import { StatsStrip } from './components/StatsStrip';
+import { WheelRecordsCard } from './components/WheelRecordsCard';
 import { CameraGrid } from './components/CameraGrid';
 import { Diary } from './components/Diary';
 import { BadgePopover } from './components/BadgePopover';
@@ -97,7 +99,9 @@ function AppShell(): JSX.Element {
       />
 
       <main className="hc-main" id="main">
+        <LiveStatus petName={settings.data?.pet_name ?? ''} />
         <StatsStrip />
+        <WheelRecordsCard />
         <CameraGrid
           onAdminOpenCameras={isAdmin ? () => {
             setSettingsTab('cameras');

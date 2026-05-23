@@ -89,6 +89,74 @@ export function isZoneActivity(value: string): value is ZoneActivity {
   return (ZONE_ACTIVITIES as readonly string[]).includes(value);
 }
 
+// ---------------------------------------------------------------------------
+// Live-status line — "Where's Remy right now?"
+// Maps the pet.currentStatus activity value to a kid-friendly emoji + phrase.
+// The caller interpolates the pet name. When stale, pass `stale: true` and
+// optionally the last-known activity + sinceMs for the fallback line.
+// ---------------------------------------------------------------------------
+
+export type LiveActivity =
+  | 'wheel' | 'food' | 'water' | 'bathroom'
+  | 'resting' | 'tunnel' | 'exploring' | 'hiding';
+
+interface StatusLineOptions {
+  petName: string;
+  activity: LiveActivity | null;
+  stale: boolean;
+  sinceMs: number | null;
+}
+
+const ACTIVITY_LINES: Record<LiveActivity, { emoji: string; phrase: (pet: string) => string }> = {
+  wheel:     { emoji: '🎡', phrase: (p) => `${p} is running on the wheel!` },
+  food:      { emoji: '🥕', phrase: (p) => `${p} is having a snack` },
+  water:     { emoji: '💧', phrase: (p) => `${p} is sipping water` },
+  bathroom:  { emoji: '🚽', phrase: (p) => `${p} is using the potty` },
+  resting:   { emoji: '😴', phrase: (p) => `${p} is curled up napping` },
+  tunnel:    { emoji: '🌀', phrase: (p) => `${p} is exploring the tunnel` },
+  exploring: { emoji: '🐹', phrase: (p) => `${p} is pottering about` },
+  hiding:    { emoji: '🫣', phrase: (p) => `${p} is hiding out` },
+};
+
+/** Formats a sinceMs value into a short human label, e.g. "4 min ago". */
+function formatSinceMs(ms: number): string {
+  const min = Math.round(ms / 60_000);
+  if (min < 1) return 'just now';
+  return min === 1 ? '1 min ago' : `${min} min ago`;
+}
+
+export interface StatusLine {
+  emoji: string;
+  text: string;
+}
+
+export function currentStatusLine({
+  petName,
+  activity,
+  stale,
+  sinceMs,
+}: StatusLineOptions): StatusLine {
+  const name = petName.trim() || 'Your pet';
+
+  if (!stale && activity !== null) {
+    const entry = ACTIVITY_LINES[activity];
+    return { emoji: entry.emoji, text: entry.phrase(name) };
+  }
+
+  // Stale — prefer last-known fallback when we have one.
+  if (activity !== null && sinceMs !== null) {
+    const entry = ACTIVITY_LINES[activity];
+    const ago = formatSinceMs(sinceMs);
+    return {
+      emoji: entry.emoji,
+      text: `${name} was last at the ${activity} · ${ago}`,
+    };
+  }
+
+  // Nothing known — quiet-time fallback.
+  return { emoji: '😴', text: `${name} is having quiet time` };
+}
+
 interface ZoneVocab {
   /** Display label for the camera pill (Title Case). */
   label: string;
