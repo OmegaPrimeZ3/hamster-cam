@@ -49,3 +49,9 @@ Thumbs.db
 __pycache__/
 *.pyc
 .venv/
+
+# pet-model pipeline: never commit model weights/datasets/exports if a misconfigured
+# work_dir lands them in-tree (the pipeline writes these OUTSIDE the repo by default).
+*.onnx
+*.pt
+/scripts/pet-model/pets/*.local.yaml

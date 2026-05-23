@@ -1,0 +1,49 @@
+# Hamster detection model for the remy-hamster Frigate stack.
+# See docs/HAMSTER_MODEL_PLAN.md §2 for the dataset review.
+#
+# Run:
+#   export ROBOFLOW_API_KEY=rf_xxx
+#   ./scripts/pet-model/run.sh scripts/pet-model/pets/hamster.yaml
+
+class_name: hamster
+work_dir: ~/pet-models/hamster
+
+# The 3 largest public hamster sets from Roboflow Universe (runbook §2),
+# merged + remapped to a single `hamster` class.
+#
+# Slug existence confirmed on Roboflow Universe:
+#   hamsterhams/hamsters-vohzn  ~223 imgs, CC BY 4.0, classes grayhamster/spotted/wheel
+#   nathan-cqd2g/hamster-detection ~112 imgs (versions seen up to v3)
+#   test-pq3k6/hamster-0ip1u    ~100 imgs (hosted model at v2)
+#
+# IMPORTANT: the SDK download needs the EXACT version that exists. The version
+# numbers below are best-known guesses; the pipeline FAILS LOUDLY with the
+# offending slug if a version 404s. To get the canonical version, open the
+# dataset on Universe -> "Download Dataset" -> format "YOLOv8" and read the
+# rf.workspace("..").project("..").version(N) snippet, then set N here.
+datasets:
+  - workspace: hamsterhams
+    project: hamsters-vohzn
+    version: 1
+  - workspace: nathan-cqd2g
+    project: hamster-detection
+    version: 3
+  - workspace: test-pq3k6
+    project: hamster-0ip1u
+    version: 2
+
+base_model: yolov9t.pt
+imgsz: 320
+epochs: 120
+batch: 32
+patience: 30
+device: mps
+val_split: 0.20
+
+frigate:
+  min_score: 0.50
+  threshold: 0.60
+
+gates:
+  min_train_images: 350
+  min_map50: 0.85

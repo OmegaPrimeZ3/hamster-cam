@@ -1,0 +1,50 @@
+# Pet-model pipeline config — TEMPLATE.
+#
+# Copy this to `pets/<pet>.yaml` (e.g. pets/cat.yaml) and fill it in, then run:
+#   export ROBOFLOW_API_KEY=rf_xxx
+#   ./scripts/pet-model/run.sh scripts/pet-model/pets/<pet>.yaml
+#
+# Every field below is consumed by build_dataset.py / train_export.py. The
+# pipeline reads ONLY this file — you should never have to edit the Python.
+
+# Single class name the model detects. All Roboflow labels (whatever they are
+# called upstream) get remapped to class id 0 == this name.
+class_name: pet
+
+# Where large artifacts live (venv, datasets, runs, weights, onnx). MUST be
+# outside the git repo. ~ is expanded. Default convention: ~/pet-models/<pet>.
+work_dir: ~/pet-models/pet
+
+# Roboflow Universe datasets to merge. Find them at
+# https://universe.roboflow.com/search?q=class%3A<pet> — open a dataset, click
+# "Download Dataset", choose format "YOLOv8", and read the slug from the snippet:
+#   rf.workspace("<workspace>").project("<project>").version(<version>)
+# List as many as you like; the pipeline merges + dedupes + remaps them all.
+datasets:
+  - workspace: some-workspace
+    project: some-project
+    version: 1
+  # - workspace: another-workspace
+  #   project: another-project
+  #   version: 2
+
+# --- Training knobs (defaults are tuned for Frigate/OpenVINO at 320px) ---
+base_model: yolov9t.pt   # tiny. Bump to yolov9s.pt if Gate B mAP50 < 0.85.
+imgsz: 320               # Frigate yolo-generic input. Keep 320 unless you know better.
+epochs: 120
+batch: 32
+patience: 30
+device: mps              # Apple Silicon. Use 'cpu' or '0' (CUDA) elsewhere.
+
+# Train/val split fraction used for the merged dataset.
+val_split: 0.20
+
+# --- Frigate deploy targets (printed in the final config snippet) ---
+frigate:
+  min_score: 0.50
+  threshold: 0.60
+
+# --- Gates (from the runbook). The pipeline enforces these. ---
+gates:
+  min_train_images: 350   # Gate A
+  min_map50: 0.85         # Gate B
