@@ -121,6 +121,21 @@ interface LastSeen {
   at: number;
 }
 
+/**
+ * Tracks the pet's current activity at the activity level (not per-camera).
+ * `cameras` is the set of cameras currently reporting this activity; the
+ * activity only ends when this set empties. `odomCameraId` is the camera id
+ * whose wheel session is running (null if odometry is not active for this
+ * activity).
+ */
+interface ActiveActivity {
+  kind: Activity;
+  cameras: Set<string>;
+  startedAt: number;
+  /** Camera id whose wheel odometer session is running, or null. */
+  odomCameraId: number | null;
+}
+
 interface PendingEnd {
   event: FrigateEvent;
   activity: Activity;
@@ -128,6 +143,8 @@ interface PendingEnd {
   at: number;
   /** ms since epoch the object first appeared. */
   startedAt: number;
+  /** Camera id whose odometer was running, so flushPending can end the right session. */
+  odomCameraId: number | null;
   /** Timer that, if it fires, flushes the pending end as a standalone entry. */
   timer: NodeJS.Timeout;
 }
@@ -142,16 +159,20 @@ interface RecentEventEntry {
 
 const RECENT_RING_SIZE = 20;
 
-const state = new Map<string, {
+interface PetState {
   lastSeen: LastSeen | null;
   pending: PendingEnd | null;
-}>();
+  /** Activity-level dedup: the single ongoing activity across all cameras. */
+  activeActivity: ActiveActivity | null;
+}
+
+const state = new Map<string, PetState>();
 const recentByPet = new Map<string, RecentEventEntry[]>();
 
-function getOrInitPetState(pet: string): { lastSeen: LastSeen | null; pending: PendingEnd | null } {
+function getOrInitPetState(pet: string): PetState {
   let s = state.get(pet);
   if (!s) {
-    s = { lastSeen: null, pending: null };
+    s = { lastSeen: null, pending: null, activeActivity: null };
     state.set(pet, s);
   }
   return s;
@@ -259,6 +280,11 @@ function cameraIdByName(name: string): number | null {
   return found?.id ?? null;
 }
 
+function isCameraWheelEnabled(cameraId: number): boolean {
+  const cam = db.getCameraById(cameraId);
+  return cam?.wheel_mark_enabled === 1;
+}
+
 function formatDuration(durationMs: number): string {
   const totalSec = Math.max(0, Math.round(durationMs / 1000));
   if (totalSec < 60) return `${totalSec}s`;
@@ -364,7 +390,9 @@ async function flushPending(
     camera: pending.event.before.camera,
   };
   if (pending.activity === 'wheel') {
-    const camId = cameraIdByName(pending.event.before.camera);
+    // Use the stored odomCameraId — it is the camera whose session is actually
+    // running (may differ from event.before.camera in multi-camera scenarios).
+    const camId = pending.odomCameraId;
     if (camId !== null) {
       try {
         const metres = endWheelSession(camId);
@@ -398,6 +426,19 @@ async function flushPending(
 /**
  * Process one MQTT-delivered Frigate event. May emit zero, one, or two diary
  * entries: e.g. flushing a pending end the moment a transition gets resolved.
+ *
+ * Multi-camera dedup invariants:
+ *  1. At most ONE active wheel odometer session per pet at any time.
+ *  2. Simultaneous same-activity across cameras → ONE diary entry.
+ *  3. Sequential cross-camera A→B transitions still produce one transition entry.
+ *  4. Single-camera behavior is unchanged.
+ *
+ * The per-pet `activeActivity` field is the source of truth for invariants 1&2.
+ * A `new` event joins the existing activity when the activity kind matches;
+ * it only starts a fresh activity (and possibly a new odometer session) when
+ * the activity is different or there is no current activity. An `end` event
+ * removes the camera from the activity set; only when the set empties does the
+ * pending-end / transition-window logic run.
  */
 export async function handleFrigateEvent(
   event: FrigateEvent,
@@ -429,7 +470,39 @@ export async function handleFrigateEvent(
   const written: db.DiaryEntryRow[] = [];
 
   if (event.type === 'new') {
-    // A new appearance — possibly the second leg of a transition.
+    const activity = classifyActivity(event.after);
+    petState.lastSeen = { camera: cameraName, zone, at: nowMs };
+
+    // -----------------------------------------------------------------------
+    // Check if the pet is already doing this same activity on another camera.
+    // If so, just add this camera to the set — no new session, no new entry.
+    // -----------------------------------------------------------------------
+    if (petState.activeActivity && petState.activeActivity.kind === activity) {
+      petState.activeActivity.cameras.add(cameraName);
+
+      // Edge case: if the existing activity has no odometer running yet (the
+      // first camera that claimed it had wheel_mark_enabled=0) but this camera
+      // has it enabled, start the session now on this camera.
+      if (activity === 'wheel' && petState.activeActivity.odomCameraId === null) {
+        const camId = cameraIdByName(cameraName);
+        if (camId !== null) {
+          try {
+            startWheelSession(camId, petState.activeActivity.startedAt);
+            if (isCameraWheelEnabled(camId)) {
+              petState.activeActivity.odomCameraId = camId;
+            }
+          } catch (err) {
+            void err;
+          }
+        }
+      }
+      return written;
+    }
+
+    // -----------------------------------------------------------------------
+    // Different activity (or no current activity): this is a genuine start.
+    // First check if this 'new' resolves a pending transition.
+    // -----------------------------------------------------------------------
     const pending = petState.pending;
     if (
       pending &&
@@ -438,7 +511,7 @@ export async function handleFrigateEvent(
     ) {
       clearTimeout(pending.timer);
       petState.pending = null;
-      // Cancel the standalone-flush; emit a transition instead.
+      petState.activeActivity = null;
       const dwellMs = pending.at - pending.startedAt;
       if (dwellMs >= tuning.minDwellMs) {
         const fromZone = classifyActivity(pending.event.before);
@@ -464,21 +537,30 @@ export async function handleFrigateEvent(
         written.push(entry);
       }
     }
-    petState.lastSeen = { camera: cameraName, zone, at: nowMs };
 
-    // Start wheel odometry when this camera is watching the wheel zone.
-    const activity = classifyActivity(event.after);
+    // Start a new activity tracker for this pet.
+    let odomCameraId: number | null = null;
     if (activity === 'wheel') {
       const camId = cameraIdByName(cameraName);
       if (camId !== null) {
         try {
           startWheelSession(camId, nowMs);
+          if (isCameraWheelEnabled(camId)) {
+            odomCameraId = camId;
+          }
         } catch (err) {
           // Never block the narrator path for odometry errors.
           void err;
         }
       }
     }
+
+    petState.activeActivity = {
+      kind: activity,
+      cameras: new Set([cameraName]),
+      startedAt: nowMs,
+      odomCameraId,
+    };
 
     return written;
   }
@@ -488,20 +570,41 @@ export async function handleFrigateEvent(
     return written;
   }
 
-  // event.type === 'end' — buffer briefly to see if a different-camera 'new'
-  // arrives. If yes, that branch above emits a transition; otherwise the
-  // timer below flushes a standalone entry.
+  // -------------------------------------------------------------------------
+  // event.type === 'end'
+  // Remove this camera from the active-activity set. Only proceed to the
+  // pending-end / flush logic when all cameras have ended this activity.
+  // -------------------------------------------------------------------------
+  if (petState.activeActivity) {
+    petState.activeActivity.cameras.delete(cameraName);
+    if (petState.activeActivity.cameras.size > 0) {
+      // Other cameras are still reporting the same activity — not done yet.
+      petState.lastSeen = { camera: cameraName, zone, at: nowMs };
+      return written;
+    }
+    // All cameras ended; fall through to the pending-end logic below.
+    // The odomCameraId from the active activity is what we need for flush.
+  }
+
+  // Buffer the end briefly to see if a different-camera 'new' arrives (that
+  // would be a A→B transition rather than a genuine stop).
   if (petState.pending) {
     // Flush whatever was pending first — defensive against rapid-fire ends.
     const flushed = await flushPending(petKey, petState.pending, deps);
     if (flushed) written.push(flushed);
   }
   const activity = classifyActivity(event.after);
+  // Carry the odomCameraId from the activity tracker into the pending object
+  // so flushPending ends the right session.
+  const odomCameraId = petState.activeActivity?.odomCameraId ?? null;
+  petState.activeActivity = null;
+
   const pending: PendingEnd = {
     event,
     activity,
     at: occurredAtMs,
     startedAt: startMs,
+    odomCameraId,
     // Placeholder; assigned below.
     timer: undefined as unknown as NodeJS.Timeout,
   };
@@ -534,7 +637,7 @@ export async function flushPendingEntries(): Promise<db.DiaryEntryRow[]> {
 
 /** Reset all in-memory state (used by tests). */
 export function resetNarratorState(): void {
-  for (const [, s] of state) {
+  for (const s of state.values()) {
     if (s.pending) clearTimeout(s.pending.timer);
   }
   state.clear();
