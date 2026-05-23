@@ -342,17 +342,77 @@ published to the LAN only. Never forward port 5000 at your router.
 > 5000. Disable it via System Settings → General → AirDrop & Handoff →
 > turn off "AirPlay Receiver." Ubuntu has nothing on 5000 by default.
 
-### 8.5 — Define zones
+### 8.5 — Define zones (these drive the diary)
 
-Draw rectangular zones over the wheel, food bowl, and water bottle using
-Frigate's built-in zone editor (Frigate UI → camera → Edit Config). The
-zone names must match what the narrator looks for in
-`app/server/src/narratives.ts` (`wheel`, `food`, `water`, etc.). Save,
-then restart Frigate to apply:
+A **zone** is a named region of a camera frame. When the pet is detected
+inside one, the backend's narrator turns it into a diary entry — and the
+**zone name decides the activity**. Names are matched (case-insensitively,
+as substrings) by `matchKeyword` in `app/server/src/narrator.ts`:
+
+| Zone name (any of these substrings) | Diary activity |
+|---|---|
+| `wheel` | running on the wheel |
+| `food`, `bowl`, `feed` | eating |
+| `water`, `drink` | drinking |
+| `bathroom`, `potty`, `litter`, `toilet` | bathroom |
+| `bed`, `nest`, `sleep`, `rest` | resting |
+| `tunnel`, `tube`, `pipe` | in the tunnel |
+| `hide`, `cave`, `burrow` | hiding |
+| anything else | exploring (still emits a friendly entry) |
+
+So name a zone `wheel`, `food`, `water`, `bathroom`, `bed`, `tunnel`, or
+`hide` to get the matching activity; any other name falls through to
+"exploring". Zones live per-camera in `frigate-config.yml` under each
+camera's `zones:` block.
+
+**Option A — Frigate's web zone editor (easiest for getting the shape right):**
+
+1. Open the Frigate UI on the LAN: `http://<mac-mini-ip>:5000`.
+2. Go to **Settings → Mask & Zone editor**, pick the camera, click **Add
+   Zone**, and draw a polygon over the cage feature (wheel, bowl, etc.).
+3. Name it exactly one of the keywords above (e.g. `wheel`) and **Save** —
+   Frigate prints the generated `coordinates` for that zone.
+4. Copy those coordinates into the matching camera's `zones:` block in
+   **`frigate-config.yml`** (the host copy is authoritative — see "Apply"
+   below). Don't rely on Frigate's in-container edit alone; persist it to
+   `frigate-config.yml` so a redeploy doesn't lose it.
+
+**Option B — hand-edit `frigate-config.yml`:**
+
+Add a named zone under the camera. `coordinates` is a single comma-
+separated list of `x,y` points (≥3) as **fractions of the frame** —
+`0,0` is top-left, `1,1` is bottom-right:
+
+```yaml
+cameras:
+  hamster_cam_1:
+    # ...inputs / detect...
+    zones:
+      wheel:
+        coordinates: 0.05,0.10,0.45,0.10,0.45,0.55,0.05,0.55   # a box
+      food:
+        coordinates: 0.55,0.10,0.95,0.10,0.95,0.45,0.55,0.45
+```
+
+**Apply the change.** `frigate-config.yml` is host-authoritative, so back
+it up and edit the host copy directly, or push the repo's copy with
+`./deploy.sh --sync-frigate-config` (it backs the remote up first). Then
+reload Frigate:
 
 ```sh
-docker compose restart frigate
+cd /opt/hamster-cam
+cp frigate-config.yml "frigate-config.yml.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+# ...edit zones...
+docker compose restart frigate            # re-reads the config file
 ```
+
+> A plain `restart` re-reads the config file. If you *also* changed an
+> env-substituted value (e.g. `{FRIGATE_RTSP_PASSWORD}`), recreate instead:
+> `docker compose up -d --force-recreate frigate`.
+
+**Verify:** in the Frigate UI, trigger motion inside the zone (or watch
+the debug view) and confirm the zone highlights; then check the app's
+diary shows the matching activity.
 
 ### 8.6 — Detection model
 
