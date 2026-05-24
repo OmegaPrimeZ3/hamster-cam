@@ -10,8 +10,9 @@
 // already fires.
 
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronUp, Loader2, Eye, EyeOff } from 'lucide-react';
 import { trpc } from '../trpc';
+import { LiveStream } from './LiveStream';
 import type { DistanceUnit } from '../lib/trpc-extensions';
 
 // -----------------------------------------------------------------------
@@ -39,6 +40,13 @@ export interface WheelOdometerSectionProps {
   config: WheelConfig;
   onChange: (next: WheelConfig) => void;
   distanceUnit?: DistanceUnit;
+  /**
+   * go2rtc stream name for this camera. When provided, a "Targeting feed"
+   * toggle is available so the user can overlay the detection band on the live
+   * stream while dragging the sliders. Absent (or null) for brand-new cameras
+   * that have not been saved yet — in that case the button is hidden.
+   */
+  liveSrc?: string | null;
 }
 
 // -----------------------------------------------------------------------
@@ -49,8 +57,11 @@ export function WheelOdometerSection({
   cameraId,
   config,
   onChange,
+  liveSrc,
 }: WheelOdometerSectionProps): JSX.Element {
-  const [open, setOpen] = useState(false);
+  // Change A: expand by default.
+  const [open, setOpen] = useState(true);
+  const [targetingOpen, setTargetingOpen] = useState(false);
   const testMutation = trpc.cameras.testWheelDetection.useMutation();
 
   function set<K extends keyof WheelConfig>(key: K, value: WheelConfig[K]): void {
@@ -64,6 +75,9 @@ export function WheelOdometerSection({
       : null;
   const darkPct =
     result != null ? Math.round(result.darkPixelRatio * 100) : null;
+
+  // Only show the targeting feed toggle when a saved stream source exists.
+  const canTarget = liveSrc != null && liveSrc.length > 0;
 
   return (
     <div
@@ -220,6 +234,107 @@ export function WheelOdometerSection({
               mistaken for the tape.
             </HelpText>
           </FieldRow>
+
+          {/* ---- Targeting feed toggle ---- */}
+          {canTarget && (
+            <FieldRow>
+              <button
+                type="button"
+                className="hc-btn"
+                onClick={() => setTargetingOpen((v) => !v)}
+                aria-expanded={targetingOpen}
+                aria-controls="wheel-targeting-feed"
+                style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+              >
+                {targetingOpen ? (
+                  <>
+                    <EyeOff aria-hidden size={14} />
+                    Hide targeting feed
+                  </>
+                ) : (
+                  <>
+                    <Eye aria-hidden size={14} />
+                    Targeting feed
+                  </>
+                )}
+              </button>
+              <HelpText>
+                Watch the live stream with the detection band overlaid. Drag the
+                sliders above to position it over the tape spot on the wheel.
+              </HelpText>
+            </FieldRow>
+          )}
+
+          {/* ---- Live targeting feed with band overlay ---- */}
+          {canTarget && targetingOpen && (
+            <div
+              id="wheel-targeting-feed"
+              style={{
+                position: 'relative',
+                width: '100%',
+                // 16:9 aspect ratio container; the LiveStream fills it.
+                aspectRatio: '16 / 9',
+                borderRadius: 10,
+                overflow: 'hidden',
+                background: '#000',
+                border: '1px solid var(--border)',
+              }}
+            >
+              <LiveStream
+                liveSrc={liveSrc}
+                style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
+              />
+
+              {/* Detection band overlay — top-anchored, matches backend crop geometry:
+                  crop=iw:ih*bandH/100:0:ih*bandY/100 */}
+              <div
+                aria-hidden
+                data-testid="targeting-band-overlay"
+                style={{
+                  position: 'absolute',
+                  left: 0,
+                  right: 0,
+                  top: `${config.wheel_band_y_pct}%`,
+                  height: `${config.wheel_band_height_pct}%`,
+                  background: 'color-mix(in srgb, var(--accent, #f59e0b) 28%, transparent)',
+                  border: '2px solid var(--accent, #f59e0b)',
+                  boxSizing: 'border-box',
+                  pointerEvents: 'none',
+                }}
+              >
+                {/* Centre line within the band */}
+                <div
+                  style={{
+                    position: 'absolute',
+                    left: 0,
+                    right: 0,
+                    top: '50%',
+                    height: 1,
+                    background: 'var(--accent, #f59e0b)',
+                    opacity: 0.7,
+                    transform: 'translateY(-50%)',
+                  }}
+                />
+                {/* Label */}
+                <span
+                  style={{
+                    position: 'absolute',
+                    top: 2,
+                    left: 6,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: 'var(--accent, #f59e0b)',
+                    letterSpacing: '0.04em',
+                    textTransform: 'uppercase',
+                    textShadow: '0 1px 3px rgba(0,0,0,0.8)',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  detection band
+                </span>
+              </div>
+            </div>
+          )}
 
           {/* Test detection */}
           <FieldRow>

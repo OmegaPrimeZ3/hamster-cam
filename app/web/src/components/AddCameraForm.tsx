@@ -226,6 +226,7 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
           cameraId={existing.id}
           config={wheelConfig}
           onChange={setWheelConfig}
+          liveSrc={existing.live_src}
         />
       )}
 
