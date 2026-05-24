@@ -19,15 +19,19 @@
 #   -input_format mjpeg  ← IMX462 ships hardware MJPEG over USB (raw YUV at 720p
 #                          would exceed USB 2.0 bandwidth). Decoded on-Pi before
 #                          re-encode. Confirm formats: `v4l2-ctl --list-formats-ext`.
-#   -framerate 30        ← the IMX462 only advertises 30fps discrete at every
-#                          resolution, so it captures 30 regardless. H264's tiny
-#                          footprint means 30fps is affordable now.
+#   -framerate 15        ← lowered from 30 to cut the per-frame MJPEG decode load
+#                          (~1 CPU core at 30fps) that was starving the Pi Zero 2 W
+#                          and tripping reboots. CAVEAT: the camera only advertises
+#                          30fps discrete (`v4l2-ctl --list-formats-ext`), so it may
+#                          ignore this and still deliver 30 — verify the real CPU
+#                          drop on-device. If unchanged, drop -video_size to 640x480
+#                          instead (decode cost scales with pixels).
 #   -video_size 1280x720 ← 720p H264 ≈ 3 Mbps. 1080x1920 (~4-5 Mbps) is also
 #                          viable on this radio if you want it; bump -b:v with it.
 #   -c:v h264_v4l2m2m    ← the HARDWARE encoder. Do NOT use libx264 (the A53
 #                          can't do it realtime). Needs -pix_fmt yuv420p (the
 #                          encoder wants YU12).
-#   -b:v 3M / -g 30      ← target bitrate / keyframe every 1s. Raise -b:v if the
+#   -b:v 3M / -g 15      ← target bitrate / keyframe every 1s (-g tracks fps). Raise -b:v if the
 #                          VideoCore IV encoder (an old block — softer than x264)
 #                          looks too blocky; lower it for more radio headroom.
 #
@@ -69,4 +73,4 @@ log:
 # `-f rtsp` → profile None (live view dead); `-f mpegts -` → profile High.
 streams:
   camera:
-    - exec:ffmpeg -hide_banner -loglevel warning -f v4l2 -input_format mjpeg -framerate 30 -video_size 1280x720 -i /dev/video0 -c:v h264_v4l2m2m -b:v 3M -g 30 -pix_fmt yuv420p -f mpegts -
+    - exec:ffmpeg -hide_banner -loglevel warning -f v4l2 -input_format mjpeg -framerate 15 -video_size 1280x720 -i /dev/video0 -c:v h264_v4l2m2m -b:v 3M -g 15 -pix_fmt yuv420p -f mpegts -
