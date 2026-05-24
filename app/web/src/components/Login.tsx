@@ -8,7 +8,7 @@
 // - On success, navigates to the path the user originally requested (kept in
 //   location.state.from), defaulting to "/"
 
-import { FormEvent, useState } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
@@ -16,6 +16,15 @@ import { LoginError } from './LoginError';
 import { MfaChallenge } from './MfaChallenge';
 import { Mascot } from './Mascot';
 import { readCachedBrand, writeCachedBrand } from '../lib/brandCache';
+import { trpc } from '../trpc';
+import {
+  PaletteName,
+  ThemeModeSetting,
+  applyTheme,
+  resolveMode,
+  persist,
+  systemPrefersDark,
+} from '../theme';
 
 // Re-export so callers that previously imported from Login.tsx keep working.
 export { readCachedBrand, writeCachedBrand };
@@ -34,13 +43,42 @@ export function Login(): JSX.Element {
   const location = useLocation();
   const fallback = (location.state as LocationState | null)?.from ?? '/';
 
-  // PLAN §5.4 calls for "{PetName} Cam!" branding on Login — but settings is
-  // a protected procedure, so unauthed users get the generic title. After
-  // first sign-in the AuthGate refetches settings; the splash on subsequent
-  // signs-out still shows the pet name via the localStorage cache below.
+  // publicBrand is unauthenticated — safe to call pre-login. Used to show the
+  // configured pet name/emoji on a cold first load (before localStorage cache
+  // is populated). If it fails or is still loading, fall back to cache → generic.
+  const publicBrand = trpc.settings.publicBrand.useQuery(undefined, {
+    retry: 1,
+    staleTime: 60_000,
+  });
+
+  // Write through to the brand cache as soon as we have a real configured name
+  // so the post-login app shell paints instantly (it reads the same cache).
+  useEffect(() => {
+    if (!publicBrand.data) return;
+    const { pet_name, pet_emoji, theme, theme_mode } = publicBrand.data;
+    const resolvedName = pet_name ?? '';
+    const resolvedEmoji = pet_emoji ?? '🐾';
+    writeCachedBrand({ petName: resolvedName, petEmoji: resolvedEmoji });
+
+    // Apply the theme to the login splash so the colors match what the user
+    // configured — only when the data is a valid known palette.
+    const palette = theme as PaletteName;
+    const mode: ThemeModeSetting = theme_mode;
+    const resolved = resolveMode(mode, systemPrefersDark());
+    applyTheme({ palette, mode: resolved });
+    persist(palette, mode);
+  }, [publicBrand.data]);
+
+  // Branding priority: publicBrand (live, any device) → cache → generic.
   const cached = readCachedBrand();
-  const petName = cached.petName;
-  const petEmoji = cached.petEmoji;
+  const petName =
+    (publicBrand.data?.pet_name ?? '') ||
+    cached.petName ||
+    '';
+  const petEmoji =
+    (publicBrand.data?.pet_emoji ?? '') ||
+    (cached.petEmoji !== '🐾' ? cached.petEmoji : '') ||
+    '🐾';
   const title = petName ? `${petName} Cam!` : 'Pet Cam!';
 
   const [email, setEmail] = useState('');

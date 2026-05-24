@@ -1,16 +1,107 @@
 // app/web/test/Login.test.tsx
 //
 // Covers: happy-path login, wrong-creds inline error, MFA-required morph,
-// rate-limit (429) message.
+// rate-limit (429) message, publicBrand branding on cold first load.
 
-import { describe, expect, it } from 'vitest';
+import { ReactNode } from 'react';
+import { describe, expect, it, beforeEach } from 'vitest';
 import userEvent from '@testing-library/user-event';
-import { screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router-dom';
 import { http, HttpResponse, server } from './msw/server';
+import { mockQuery } from './msw/trpc-mock';
 import { renderWithProviders } from './test-utils';
+import { trpc, makeTrpcClient } from '../src/trpc';
 import { Login } from '../src/components/Login';
+import { BRAND_CACHE_KEY } from '../src/lib/brandCache';
+
+// tRPC queries fired inside components error in jsdom due to an AbortSignal
+// incompatibility with httpBatchLink (documented in Header.test.tsx). For the
+// publicBrand test we bypass the network layer by pre-seeding the React Query
+// cache directly — same technique as the "live settings wins" Header test.
+// The tRPC key for settings.publicBrand is [['settings','publicBrand'],{type:'query'}].
+function renderLoginWithPublicBrand(
+  publicBrandData: {
+    pet_name: string | null;
+    pet_emoji: string | null;
+    theme: string;
+    theme_mode: 'light' | 'dark' | 'auto';
+  },
+): void {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+  });
+  queryClient.setQueryData(
+    [['settings', 'publicBrand'], { type: 'query' }],
+    publicBrandData,
+  );
+  const trpcClient = makeTrpcClient();
+  function Wrapper({ children }: { children: ReactNode }): JSX.Element {
+    return (
+      <trpc.Provider client={trpcClient} queryClient={queryClient}>
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={['/login']}>
+            {children}
+          </MemoryRouter>
+        </QueryClientProvider>
+      </trpc.Provider>
+    );
+  }
+  render(<Login />, { wrapper: Wrapper });
+}
 
 describe('Login', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // Register a default publicBrand mock for tests that use renderWithProviders
+    // (which hits the network layer). This prevents "unregistered procedure" 500s.
+    mockQuery('settings.publicBrand', () => ({
+      pet_name: null,
+      pet_emoji: null,
+      theme: 'bubblegum',
+      theme_mode: 'light' as const,
+    }));
+  });
+
+  it('shows the publicBrand pet name when the query resolves on a cold first load', () => {
+    // Pre-seed the QueryClient with a real configured pet name so Login sees
+    // publicBrand.data immediately on first render (no network round-trip).
+    renderLoginWithPublicBrand({
+      pet_name: 'Remy',
+      pet_emoji: '🐹',
+      theme: 'bubblegum',
+      theme_mode: 'light',
+    });
+
+    // publicBrand.data is pre-seeded → title shows "Remy Cam!" on first paint.
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Remy Cam!');
+  });
+
+  it('falls back to "Pet Cam!" when publicBrand returns null pet_name and cache is empty', () => {
+    // Pre-seed with null name → generic fallback.
+    renderLoginWithPublicBrand({
+      pet_name: null,
+      pet_emoji: null,
+      theme: 'bubblegum',
+      theme_mode: 'light',
+    });
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Pet Cam!');
+  });
+
+  it('shows the cached pet name while publicBrand is still loading (not yet seeded)', () => {
+    // Populate cache before render.
+    localStorage.setItem(
+      BRAND_CACHE_KEY,
+      JSON.stringify({ petName: 'Nugget', petEmoji: '🐭' }),
+    );
+    // Use renderWithProviders — publicBrand query fires but errors in jsdom.
+    // The cache is read synchronously before the async query resolves,
+    // so "Nugget Cam!" shows immediately.
+    renderWithProviders(<Login />, { route: '/login' });
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Nugget Cam!');
+  });
+
   it('happy path: signs in and the success state replaces error UI', async () => {
     server.use(
       http.post('/auth/login', async () =>

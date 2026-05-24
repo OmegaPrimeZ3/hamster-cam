@@ -462,6 +462,29 @@ const settingsRouter = router({
       db.setSettings(kv);
       return parseSettingsKV(db.getSettings());
     }),
+
+  // settings.publicBrand — unauthenticated. Exposes ONLY the four branding
+  // fields the login splash needs to paint the right pet name + colors.
+  // SECURITY: output schema is exact and narrow — nothing else leaks.
+  publicBrand: publicProcedure
+    .input(z.void())
+    .output(
+      z.object({
+        pet_name: z.string().nullable(),
+        pet_emoji: z.string().nullable(),
+        theme: z.string(),
+        theme_mode: z.enum(['light', 'dark', 'auto']),
+      }),
+    )
+    .query(() => {
+      const s = parseSettingsKV(db.getSettings());
+      return {
+        pet_name: s.pet_name === '' ? null : s.pet_name,
+        pet_emoji: s.pet_emoji === '' ? null : s.pet_emoji,
+        theme: s.theme,
+        theme_mode: s.theme_mode,
+      };
+    }),
 });
 
 // ---------------------------------------------------------------------------

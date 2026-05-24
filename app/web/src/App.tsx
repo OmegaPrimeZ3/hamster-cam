@@ -25,6 +25,7 @@ import { BadgePopover } from './components/BadgePopover';
 import { SettingsDrawer, SettingsTabId } from './components/SettingsDrawer';
 import { OnboardingWizard } from './components/OnboardingWizard';
 import { ChangePasswordForm } from './components/ChangePasswordForm';
+import { Mascot } from './components/Mascot';
 import { trpc } from './trpc';
 import { useAuth } from './hooks/useAuth';
 import {
@@ -38,6 +39,10 @@ import {
 } from './theme';
 import { readCachedBrand, writeCachedBrand } from './lib/brandCache';
 import * as Dialog from '@radix-ui/react-dialog';
+
+// Safety timeout (ms) after which the loading splash gives up and renders the
+// real app — covers slow/offline backends so users never get stuck.
+const SETTINGS_SPLASH_TIMEOUT_MS = 8_000;
 
 export function App(): JSX.Element {
   return (
@@ -55,7 +60,9 @@ export function App(): JSX.Element {
   );
 }
 
-function AppShell(): JSX.Element {
+// Exported for unit testing — allows tests to render the shell directly
+// without fighting through AuthGate's redirect logic.
+export function AppShell(): JSX.Element {
   const { isAdmin } = useAuth();
   const utils = trpc.useUtils();
   const cachedBrand = useMemo(() => readCachedBrand(), []);
@@ -71,8 +78,19 @@ function AppShell(): JSX.Element {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTabId>('pet');
   const [changePwOpen, setChangePwOpen] = useState(false);
+  // Safety valve: after SETTINGS_SPLASH_TIMEOUT_MS the splash gives up and
+  // renders the real app, even if settings hasn't resolved.
+  const [settingsTimedOut, setSettingsTimedOut] = useState(false);
   // Track whether the page was hidden so we only invalidate on true resume.
   const wasHiddenRef = useRef(document.visibilityState === 'hidden');
+
+  // Start the splash timeout on mount; cancel it if settings resolves first.
+  useEffect(() => {
+    if (settings.data) return;
+    const id = setTimeout(() => setSettingsTimedOut(true), SETTINGS_SPLASH_TIMEOUT_MS);
+    return () => clearTimeout(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Theme reactivity — when settings.{theme, theme_mode} changes, apply.
   useEffect(() => {
@@ -111,6 +129,16 @@ function AppShell(): JSX.Element {
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [utils]);
+
+  // Show the loading splash while settings is still loading (and hasn't timed out).
+  // All hooks above run unconditionally every render — this early return is safe.
+  if (settings.isLoading && !settingsTimedOut) {
+    const splashName = cachedBrand.petName || '';
+    const message = splashName
+      ? `Getting ${splashName}'s camera ready…`
+      : 'Getting your camera ready…';
+    return <SettingsSplash message={message} />;
+  }
 
   // Run onboarding only for admins who haven't completed it yet.
   if (settings.data && isAdmin && !settings.data.onboarding_complete) {
@@ -153,6 +181,28 @@ function AppShell(): JSX.Element {
 
       <ChangePasswordDialog open={changePwOpen} onOpenChange={setChangePwOpen} />
     </div>
+  );
+}
+
+function SettingsSplash({ message }: { message: string }): JSX.Element {
+  return (
+    <main
+      role="status"
+      aria-live="polite"
+      style={{
+        minHeight: '100vh',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 16,
+        background: 'var(--bg)',
+        color: 'var(--text)',
+      }}
+    >
+      <Mascot pose="waving" size={72} ariaLabel="Loading" />
+      <p style={{ color: 'var(--text-muted)' }}>{message}</p>
+    </main>
   );
 }
 
