@@ -14,7 +14,7 @@
 // If camera.live_src is null the tile renders a "not configured" affordance
 // inside the live-state wrapper instead of a blank stream.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { Maximize2, AlertCircle } from 'lucide-react';
 import type { RouterOutputs } from '../trpc';
@@ -58,6 +58,9 @@ export function CameraTile({
 }: CameraTileProps): JSX.Element {
   const reduced = useReducedMotion();
   const [streamError, setStreamError] = useState(false);
+  // Track whether the document was hidden so we know to force a re-establish
+  // on visibility-restored. Stored in a ref to avoid triggering extra renders.
+  const wasHiddenRef = useRef(document.visibilityState === 'hidden');
 
   const effectiveNow = now ?? Date.now();
   let state: CameraTileState = tileStateFor(camera.last_frame_at, effectiveNow);
@@ -65,6 +68,21 @@ export function CameraTile({
 
   const handleStreamError = useCallback(() => {
     setStreamError(true);
+  }, []);
+
+  // Resume handling: when the PWA is brought back to the foreground after being
+  // backgrounded, reset the stream error so the LiveStream remounts and
+  // re-establishes the WebSocket. This makes reopening the app after hours
+  // behave like a fresh load without a manual reload.
+  useEffect(() => {
+    function handleVisibilityChange(): void {
+      if (document.visibilityState === 'visible' && wasHiddenRef.current) {
+        setStreamError(false);
+      }
+      wasHiddenRef.current = document.visibilityState === 'hidden';
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, []);
 
   // Retry loop: clear the error flag periodically so the stream can reconnect.

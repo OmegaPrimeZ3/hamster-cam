@@ -49,8 +49,14 @@ bootstrapTheme();
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      refetchOnWindowFocus: false,
-      retry: false,
+      // Retry transient failures with exponential backoff, capped at 30s.
+      // Three attempts cover the vast majority of cold-start races without
+      // hammering the server (backend sees ~24 req/s already).
+      retry: 3,
+      retryDelay: (attempt) => Math.min(1_000 * 2 ** attempt, 30_000),
+      // Self-heal when the user returns to the tab or regains connectivity.
+      refetchOnWindowFocus: true,
+      refetchOnReconnect: true,
     },
   },
 });

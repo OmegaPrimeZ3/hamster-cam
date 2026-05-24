@@ -107,31 +107,66 @@ export function LiveStream({
     }
     tryForwardVideoRef();
 
-    // Surface errors: listen on the host element for a custom error event that
-    // the VideoRTC class emits when its inner <video> fires an error and the WS
-    // is subsequently closed. We use a polling stall-check instead of relying on
-    // a custom event (the upstream class doesn't emit one) — watch the WS readyState
-    // via a simple interval: if the element stays in CONNECTING state for more
-    // than RECONNECT_TIMEOUT without going OPEN, surface onError.
+    // Stall detection: two failure modes are monitored.
     //
-    // Simpler alternative: listen to the inner video's error event once it's set.
+    // Mode A — cold-start hang: video.readyState stays 0 for >20s with no
+    // frames arriving (the existing check).
+    //
+    // Mode B — silent mid-stream freeze: the socket stays "open" but
+    // video.currentTime stops advancing. This goes unnoticed by browser error
+    // events because no error actually fires. We sample currentTime every
+    // ADVANCE_POLL_MS and fire onError if it fails to advance for
+    // ADVANCE_STALL_TIMEOUT_MS while the document is visible and the element
+    // should be playing (readyState >= HAVE_CURRENT_DATA and not paused/ended).
     let stallCheckId = 0;
     const STALL_TIMEOUT_MS = 20_000;
+    const ADVANCE_POLL_MS = 2_000;
+    const ADVANCE_STALL_TIMEOUT_MS = 12_000;
+
     const startTs = Date.now();
+    let lastCurrentTime: number | null = null;
+    let lastAdvanceTs: number = Date.now();
+
     stallCheckId = window.setInterval(() => {
       const vid = host.video;
-      // If video exists and has an error, fire callback.
+
+      // Mode A: explicit video decode error.
       if (vid && vid.error) {
         window.clearInterval(stallCheckId);
         onErrorRef.current?.();
         return;
       }
-      // If we haven't made progress in STALL_TIMEOUT_MS, surface an error.
+
+      // Mode A: never connected — readyState=0 (HAVE_NOTHING) for too long.
       if (Date.now() - startTs > STALL_TIMEOUT_MS && vid && vid.readyState === 0) {
         window.clearInterval(stallCheckId);
         onErrorRef.current?.();
+        return;
       }
-    }, 2000);
+
+      // Mode B: playing but frozen — currentTime not advancing.
+      // Only fire when the page is visible (don't punish background tabs) and
+      // the video element is in a state where it should be making progress
+      // (readyState >= HAVE_CURRENT_DATA=2, not paused, not ended).
+      if (
+        vid &&
+        document.visibilityState === 'visible' &&
+        !vid.paused &&
+        !vid.ended &&
+        vid.readyState >= 2
+      ) {
+        const ct = vid.currentTime;
+        if (lastCurrentTime === null || ct !== lastCurrentTime) {
+          // Time is advancing — reset the stall clock.
+          lastCurrentTime = ct;
+          lastAdvanceTs = Date.now();
+        } else if (Date.now() - lastAdvanceTs > ADVANCE_STALL_TIMEOUT_MS) {
+          // currentTime has not moved for ADVANCE_STALL_TIMEOUT_MS. Silent freeze.
+          window.clearInterval(stallCheckId);
+          onErrorRef.current?.();
+        }
+      }
+    }, ADVANCE_POLL_MS);
 
     return () => {
       cancelAnimationFrame(raf);

@@ -11,7 +11,7 @@
 //   - BadgePopover (global)
 //   - SettingsDrawer (admin-only)
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Routes, Route } from 'react-router-dom';
 import { AuthGate } from './components/AuthGate';
 import { Login } from './components/Login';
@@ -25,6 +25,7 @@ import { BadgePopover } from './components/BadgePopover';
 import { SettingsDrawer, SettingsTabId } from './components/SettingsDrawer';
 import { OnboardingWizard } from './components/OnboardingWizard';
 import { ChangePasswordForm } from './components/ChangePasswordForm';
+import { Mascot } from './components/Mascot';
 import { trpc } from './trpc';
 import { useAuth } from './hooks/useAuth';
 import {
@@ -36,8 +37,12 @@ import {
   resolveMode,
   systemPrefersDark,
 } from './theme';
-import { writeCachedBrand } from './components/Login';
+import { readCachedBrand, writeCachedBrand } from './lib/brandCache';
 import * as Dialog from '@radix-ui/react-dialog';
+
+// Safety timeout (ms) after which the loading splash gives up and renders the
+// real app — covers slow/offline backends so users never get stuck.
+const SETTINGS_SPLASH_TIMEOUT_MS = 8_000;
 
 export function App(): JSX.Element {
   return (
@@ -55,12 +60,37 @@ export function App(): JSX.Element {
   );
 }
 
-function AppShell(): JSX.Element {
+// Exported for unit testing — allows tests to render the shell directly
+// without fighting through AuthGate's redirect logic.
+export function AppShell(): JSX.Element {
   const { isAdmin } = useAuth();
-  const settings = trpc.settings.get.useQuery();
+  const utils = trpc.useUtils();
+  const cachedBrand = useMemo(() => readCachedBrand(), []);
+  // staleTime: treat a successful settings fetch as fresh for 60s so a
+  // tab-switch doesn't fire a redundant re-fetch every time.
+  // refetchInterval: if the initial fetch was missed or returned stale/error
+  // data, the query re-attempts every 60s in the background so the app
+  // self-heals without a manual page reload.
+  const settings = trpc.settings.get.useQuery(undefined, {
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTabId>('pet');
   const [changePwOpen, setChangePwOpen] = useState(false);
+  // Safety valve: after SETTINGS_SPLASH_TIMEOUT_MS the splash gives up and
+  // renders the real app, even if settings hasn't resolved.
+  const [settingsTimedOut, setSettingsTimedOut] = useState(false);
+  // Track whether the page was hidden so we only invalidate on true resume.
+  const wasHiddenRef = useRef(document.visibilityState === 'hidden');
+
+  // Start the splash timeout on mount; cancel it if settings resolves first.
+  useEffect(() => {
+    if (settings.data) return;
+    const id = setTimeout(() => setSettingsTimedOut(true), SETTINGS_SPLASH_TIMEOUT_MS);
+    return () => clearTimeout(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Theme reactivity — when settings.{theme, theme_mode} changes, apply.
   useEffect(() => {
@@ -83,6 +113,33 @@ function AppShell(): JSX.Element {
     });
   }, [settings.data]);
 
+  // Resume handling (Fix 3): when the PWA returns from background, invalidate
+  // the settings and cameras queries so they immediately refetch rather than
+  // waiting for the next scheduled interval. Combined with refetchOnWindowFocus
+  // in the QueryClient default options this covers both tab-switch and
+  // full app-backgrounding scenarios.
+  useEffect(() => {
+    function handleVisibilityChange(): void {
+      if (document.visibilityState === 'visible' && wasHiddenRef.current) {
+        void utils.settings.get.invalidate();
+        void utils.cameras.list.invalidate();
+      }
+      wasHiddenRef.current = document.visibilityState === 'hidden';
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [utils]);
+
+  // Show the loading splash while settings is still loading (and hasn't timed out).
+  // All hooks above run unconditionally every render — this early return is safe.
+  if (settings.isLoading && !settingsTimedOut) {
+    const splashName = cachedBrand.petName || '';
+    const message = splashName
+      ? `Getting ${splashName}'s camera ready…`
+      : 'Getting your camera ready…';
+    return <SettingsSplash message={message} />;
+  }
+
   // Run onboarding only for admins who haven't completed it yet.
   if (settings.data && isAdmin && !settings.data.onboarding_complete) {
     return <OnboardingWizard />;
@@ -99,7 +156,7 @@ function AppShell(): JSX.Element {
       />
 
       <main className="hc-main" id="main">
-        <LiveStatus petName={settings.data?.pet_name ?? ''} />
+        <LiveStatus petName={settings.data?.pet_name?.trim() || cachedBrand.petName} />
         <StatsStrip />
         <WheelRecordsCard />
         <CameraGrid
@@ -110,7 +167,7 @@ function AppShell(): JSX.Element {
         />
         <Diary
           readAloud={settings.data?.read_aloud ?? false}
-          petName={settings.data?.pet_name ?? ''}
+          petName={settings.data?.pet_name?.trim() || cachedBrand.petName}
         />
       </main>
 
@@ -124,6 +181,28 @@ function AppShell(): JSX.Element {
 
       <ChangePasswordDialog open={changePwOpen} onOpenChange={setChangePwOpen} />
     </div>
+  );
+}
+
+function SettingsSplash({ message }: { message: string }): JSX.Element {
+  return (
+    <main
+      role="status"
+      aria-live="polite"
+      style={{
+        minHeight: '100vh',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 16,
+        background: 'var(--bg)',
+        color: 'var(--text)',
+      }}
+    >
+      <Mascot pose="waving" size={72} ariaLabel="Loading" />
+      <p style={{ color: 'var(--text-muted)' }}>{message}</p>
+    </main>
   );
 }
 
