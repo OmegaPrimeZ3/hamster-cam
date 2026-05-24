@@ -14,6 +14,7 @@ import { Mascot, MascotPose } from './Mascot';
 import { UserMenu } from './UserMenu';
 import { RoleGuard } from './RoleGuard';
 import { useAuth } from '../hooks/useAuth';
+import { readCachedBrand } from '../lib/brandCache';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 type DiaryEntryDTO = RouterOutputs['activity']['today'][number];
@@ -41,8 +42,9 @@ export function Header({ onOpenSettings, onOpenChangePassword, activityHint }: H
   });
   const [statusOpen, setStatusOpen] = useState(false);
 
-  const petName = settings.data?.pet_name?.trim() ?? '';
-  const petEmoji = settings.data?.pet_emoji ?? '🐾';
+  const cached = useMemo(() => readCachedBrand(), []);
+  const petName = settings.data?.pet_name?.trim() || cached.petName;
+  const petEmoji = settings.data?.pet_emoji || cached.petEmoji;
   const title = petName ? `${petName} Cam!` : 'Pet Cam!';
   const { aggregate, perCamera } = useMemo(
     () => computeStatus(cameras.data ?? []),

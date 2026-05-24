@@ -11,7 +11,7 @@
 //   - BadgePopover (global)
 //   - SettingsDrawer (admin-only)
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Routes, Route } from 'react-router-dom';
 import { AuthGate } from './components/AuthGate';
 import { Login } from './components/Login';
@@ -36,7 +36,7 @@ import {
   resolveMode,
   systemPrefersDark,
 } from './theme';
-import { writeCachedBrand } from './components/Login';
+import { readCachedBrand, writeCachedBrand } from './lib/brandCache';
 import * as Dialog from '@radix-ui/react-dialog';
 
 export function App(): JSX.Element {
@@ -57,10 +57,22 @@ export function App(): JSX.Element {
 
 function AppShell(): JSX.Element {
   const { isAdmin } = useAuth();
-  const settings = trpc.settings.get.useQuery();
+  const utils = trpc.useUtils();
+  const cachedBrand = useMemo(() => readCachedBrand(), []);
+  // staleTime: treat a successful settings fetch as fresh for 60s so a
+  // tab-switch doesn't fire a redundant re-fetch every time.
+  // refetchInterval: if the initial fetch was missed or returned stale/error
+  // data, the query re-attempts every 60s in the background so the app
+  // self-heals without a manual page reload.
+  const settings = trpc.settings.get.useQuery(undefined, {
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTabId>('pet');
   const [changePwOpen, setChangePwOpen] = useState(false);
+  // Track whether the page was hidden so we only invalidate on true resume.
+  const wasHiddenRef = useRef(document.visibilityState === 'hidden');
 
   // Theme reactivity — when settings.{theme, theme_mode} changes, apply.
   useEffect(() => {
@@ -83,6 +95,23 @@ function AppShell(): JSX.Element {
     });
   }, [settings.data]);
 
+  // Resume handling (Fix 3): when the PWA returns from background, invalidate
+  // the settings and cameras queries so they immediately refetch rather than
+  // waiting for the next scheduled interval. Combined with refetchOnWindowFocus
+  // in the QueryClient default options this covers both tab-switch and
+  // full app-backgrounding scenarios.
+  useEffect(() => {
+    function handleVisibilityChange(): void {
+      if (document.visibilityState === 'visible' && wasHiddenRef.current) {
+        void utils.settings.get.invalidate();
+        void utils.cameras.list.invalidate();
+      }
+      wasHiddenRef.current = document.visibilityState === 'hidden';
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [utils]);
+
   // Run onboarding only for admins who haven't completed it yet.
   if (settings.data && isAdmin && !settings.data.onboarding_complete) {
     return <OnboardingWizard />;
@@ -99,7 +128,7 @@ function AppShell(): JSX.Element {
       />
 
       <main className="hc-main" id="main">
-        <LiveStatus petName={settings.data?.pet_name ?? ''} />
+        <LiveStatus petName={settings.data?.pet_name?.trim() || cachedBrand.petName} />
         <StatsStrip />
         <WheelRecordsCard />
         <CameraGrid
@@ -110,7 +139,7 @@ function AppShell(): JSX.Element {
         />
         <Diary
           readAloud={settings.data?.read_aloud ?? false}
-          petName={settings.data?.pet_name ?? ''}
+          petName={settings.data?.pet_name?.trim() || cachedBrand.petName}
         />
       </main>
 

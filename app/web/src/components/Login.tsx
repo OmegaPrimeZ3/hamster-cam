@@ -15,6 +15,10 @@ import { useAuth } from '../hooks/useAuth';
 import { LoginError } from './LoginError';
 import { MfaChallenge } from './MfaChallenge';
 import { Mascot } from './Mascot';
+import { readCachedBrand, writeCachedBrand } from '../lib/brandCache';
+
+// Re-export so callers that previously imported from Login.tsx keep working.
+export { readCachedBrand, writeCachedBrand };
 
 interface LocationState {
   from?: string;
@@ -22,37 +26,6 @@ interface LocationState {
 
 interface MfaState {
   challengeToken: string;
-}
-
-interface CachedBrand {
-  petName: string;
-  petEmoji: string;
-}
-
-const BRAND_CACHE_KEY = 'hc.brand';
-
-function readCachedBrand(): CachedBrand {
-  try {
-    if (typeof localStorage === 'undefined') return { petName: '', petEmoji: '🐾' };
-    const raw = localStorage.getItem(BRAND_CACHE_KEY);
-    if (!raw) return { petName: '', petEmoji: '🐾' };
-    const parsed = JSON.parse(raw) as Partial<CachedBrand>;
-    return {
-      petName: typeof parsed.petName === 'string' ? parsed.petName : '',
-      petEmoji: typeof parsed.petEmoji === 'string' && parsed.petEmoji ? parsed.petEmoji : '🐾',
-    };
-  } catch {
-    return { petName: '', petEmoji: '🐾' };
-  }
-}
-
-export function writeCachedBrand(brand: CachedBrand): void {
-  try {
-    if (typeof localStorage === 'undefined') return;
-    localStorage.setItem(BRAND_CACHE_KEY, JSON.stringify(brand));
-  } catch {
-    /* ignore quota errors */
-  }
 }
 
 export function Login(): JSX.Element {
