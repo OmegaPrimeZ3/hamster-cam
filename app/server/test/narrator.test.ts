@@ -442,4 +442,141 @@ describe('narrator multi-camera dedup', () => {
     vi.useRealTimers();
     vi.doUnmock('node:child_process');
   });
+
+  // -------------------------------------------------------------------------
+  // Concurrent different-activity displacement (Invariant 5)
+  // -------------------------------------------------------------------------
+
+  it('concurrent different activities dwell >= minDwell → standalone displaced entry written', async () => {
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000 });
+    resetNarratorState();
+    await seedCameras(); // wheel + food cameras
+
+    const t0 = 1_700_000_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Pet appears on the wheel camera — 'wheel' activity becomes active.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'wheel', zones: ['wheel'], startSec: 1_700_000_000 }),
+      deps,
+    );
+
+    // 5 seconds later, the food camera fires 'new' with a DIFFERENT activity
+    // while the wheel activity has NOT received an 'end'. This is the concurrent
+    // displacement case — 5000 ms dwell is above the 2000 ms minDwell threshold.
+    now = t0 + 5_000;
+    const written = await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'food', zones: ['food'] }),
+      deps,
+    );
+
+    // The displaced 'wheel' entry must be in the returned array.
+    expect(written.length).toBe(1);
+    expect(written[0]?.activity).toBe('wheel');
+
+    // And the DB should reflect exactly one entry so far (the standalone wheel).
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('wheel');
+  });
+
+  it('concurrent different activities dwell < minDwell → displaced entry discarded (fly-through)', async () => {
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000 });
+    resetNarratorState();
+    await seedCameras(); // wheel + food cameras
+
+    const t0 = 1_700_000_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Pet appears on the wheel camera — 'wheel' activity becomes active.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'wheel', zones: ['wheel'], startSec: 1_700_000_000 }),
+      deps,
+    );
+
+    // 500 ms later, food camera fires — dwell is 500 ms, below the 2000 ms threshold.
+    now = t0 + 500;
+    const written = await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'food', zones: ['food'] }),
+      deps,
+    );
+
+    // Fly-through: NO displaced entry emitted.
+    expect(written.length).toBe(0);
+
+    // Nothing in the DB either.
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+  });
+
+  it('concurrent displacement of wheel activity ends odometer session immediately', async () => {
+    // Mock child_process.spawn so no real ffmpeg runs.
+    const spawnMock = vi.fn(() => makeFakeProc());
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const db = await import('../src/db.js');
+
+    setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000 });
+    resetNarratorState();
+
+    // cam-a covers the wheel zone with odometry enabled; cam-b covers food.
+    // These cameras have different zones, so they classify different activities.
+    const camA = db.createCamera({
+      name: 'cam-a',
+      emoji: '🎡',
+      stream_url: 'rtsp://fake/a',
+      live_src: 'cam_a',
+      enabled: true,
+      zones: ['wheel'],
+      wheel_mark_enabled: true,
+      wheel_diameter_mm: 152.0,
+      wheel_band_y_pct: 50.0,
+      wheel_band_height_pct: 10.0,
+      wheel_threshold_pct: 50.0,
+    });
+    db.createCamera({
+      name: 'cam-b',
+      emoji: '🥕',
+      stream_url: 'rtsp://fake/b',
+      live_src: 'cam_b',
+      enabled: true,
+      zones: ['food'],
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_700_000_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // cam-a fires 'new' for wheel → odometer session starts.
+    await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
+    expect(_activeSessions.size).toBe(1);
+    expect(_activeSessions.has(camA.id)).toBe(true);
+
+    // 5s later, cam-b fires 'new' for food — displaces the wheel activity.
+    now = t0 + 5_000;
+    const written = await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-b', zones: ['food'] }), deps);
+
+    // Odometer session must be ended immediately — no leak.
+    expect(_activeSessions.size).toBe(0);
+
+    // Dwell was 5000 ms >= 2000 ms minDwell → standalone wheel entry emitted.
+    expect(written.length).toBe(1);
+    expect(written[0]?.activity).toBe('wheel');
+
+    vi.doUnmock('node:child_process');
+  });
 });

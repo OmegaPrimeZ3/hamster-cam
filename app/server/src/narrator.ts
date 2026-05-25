@@ -432,6 +432,11 @@ async function flushPending(
  *  2. Simultaneous same-activity across cameras → ONE diary entry.
  *  3. Sequential cross-camera A→B transitions still produce one transition entry.
  *  4. Single-camera behavior is unchanged.
+ *  5. Concurrent DIFFERENT activities on different cameras (overlapping detections):
+ *     the displaced activity is written as a STANDALONE entry (if its dwell meets
+ *     minDwellMs), its odometer session is always ended, and the new activity
+ *     starts cleanly. No transition entry is emitted because the displaced
+ *     activity never signalled it left — detections simply overlapped.
  *
  * The per-pet `activeActivity` field is the source of truth for invariants 1&2.
  * A `new` event joins the existing activity when the activity kind matches;
@@ -497,6 +502,65 @@ export async function handleFrigateEvent(
         }
       }
       return written;
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent different-activity displacement (Invariant 5).
+    //
+    // If there is an active activity of a DIFFERENT kind, two camera fields of
+    // view are overlapping at the same moment — e.g. cam1 still classifies
+    // 'wheel' while cam2 fires 'food'. We cannot wait for a 'end' that may
+    // never arrive (the detection sets simply overlapped). Instead:
+    //   a) Always end the displaced odometer session so no ffmpeg leak occurs.
+    //   b) If the displaced dwell meets minDwellMs, write a STANDALONE entry
+    //      for it (no transition — the activity never signalled departure).
+    //      If dwell is below the threshold, discard silently (fly-through).
+    //   c) Null out activeActivity so the new-activity start below is clean.
+    // -----------------------------------------------------------------------
+    const displaced = petState.activeActivity;
+    if (displaced !== null && displaced.kind !== activity) {
+      const displacedDwellMs = nowMs - displaced.startedAt;
+
+      // (a) Always end the odometer session for the displaced activity.
+      let displacedMetres: number | null = null;
+      if (displaced.odomCameraId !== null) {
+        try {
+          displacedMetres = endWheelSession(displaced.odomCameraId);
+        } catch (err) {
+          // Never let odometry errors block the narrator path.
+          void err;
+        }
+      }
+
+      // (b) Write a standalone entry when dwell is long enough.
+      if (displacedDwellMs >= tuning.minDwellMs) {
+        // Pick a representative camera from the displaced activity's set.
+        const representativeCamera = [...displaced.cameras][0] ?? cameraName;
+        const displacedDetails: Record<string, unknown> = { camera: representativeCamera };
+        if (displacedMetres !== null) {
+          displacedDetails['wheel_meters'] = displacedMetres;
+        }
+        const displacedEntry = writeEntry({
+          activity: displaced.kind,
+          occurredAt: nowMs,
+          cameraId: cameraIdByName(representativeCamera),
+          durationMs: displacedDwellMs,
+          fromCameraId: null,
+          toCameraId: null,
+          fromZone: null,
+          toZone: null,
+          details: displacedDetails,
+          rng: deps.rng,
+          pet: petName(),
+        });
+        await deps.onEntryWritten(displacedEntry);
+        written.push(displacedEntry);
+      }
+      // Fly-through (dwell below threshold): discard the displaced entry.
+      // The odometer was already ended above regardless of dwell.
+
+      // (c) Clear so the new-activity start block begins cleanly.
+      petState.activeActivity = null;
     }
 
     // -----------------------------------------------------------------------
