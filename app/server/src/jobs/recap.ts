@@ -19,7 +19,7 @@ const FETCH_TIMEOUT_MS = 20_000;
 
 export interface RecapRunResult {
   date: string;
-  skipped: false | 'no_api_key' | 'too_few_entries' | 'api_error';
+  skipped: false | 'disabled' | 'no_api_key' | 'too_few_entries' | 'api_error';
   diary_entry_id: number | null;
 }
 
@@ -43,6 +43,12 @@ export async function runRecapJob(
 
   const targetDate = date ?? new Date(nowFn());
   const isoDate = toIsoDate(targetDate);
+
+  const recapEnabledRaw = db.getSetting('recap_enabled');
+  if (recapEnabledRaw === 'false' || recapEnabledRaw === '0') {
+    logger.info({ job: 'recap', skipped: 'disabled' });
+    return { date: isoDate, skipped: 'disabled', diary_entry_id: null };
+  }
 
   if (!cfg.GEMINI_API_KEY) {
     logger.info({ job: 'recap', skipped: 'no_api_key' });

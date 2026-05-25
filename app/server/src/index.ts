@@ -6,7 +6,7 @@
 //   2. Run migrations on the configured DATABASE_PATH
 //   3. Build Fastify, mount tRPC + /auth/* + /health
 //   4. Start MQTT subscriber (best-effort; degrades to "no events" if broker absent)
-//   5. Schedule cron jobs: timelapse 23:55, retention 02:00, disk-watch 03:00
+//   5. Schedule cron jobs: timelapse 06:05, retention 02:00, disk-watch 03:00
 //   6. Listen on PORT, host 0.0.0.0
 //
 // Shutdown order on SIGTERM/SIGINT:
@@ -41,6 +41,7 @@ import { getDb, purgeExpiredSessions } from './db.js';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRecapJob } from './jobs/recap.js';
 import { runRetentionJob } from './jobs/retention.js';
+import { runSnapshotCaptureJob } from './jobs/snapshot-capture.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
 import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
@@ -396,10 +397,11 @@ export async function startRuntime(): Promise<RuntimeHandles> {
 
 function scheduleCronJobs(app: AppServer): ScheduledTask[] {
   const jobs: Array<{ name: string; spec: string; run: () => Promise<unknown> }> = [
-    { name: 'timelapse',  spec: '55 23 * * *', run: () => runTimelapseJob() },
-    { name: 'recap',      spec: '58 23 * * *', run: () => runRecapJob() },
-    { name: 'retention',  spec: '0 2 * * *',  run: () => runRetentionJob() },
-    { name: 'disk-watch', spec: '0 3 * * *',  run: () => runDiskWatchJob() },
+    { name: 'snapshot-capture', spec: '*/2 22,23,0-5 * * *', run: () => runSnapshotCaptureJob() },
+    { name: 'timelapse',        spec: '5 6 * * *',             run: () => runTimelapseJob() },
+    { name: 'recap',            spec: '58 23 * * *',          run: () => runRecapJob() },
+    { name: 'retention',        spec: '0 2 * * *',            run: () => runRetentionJob() },
+    { name: 'disk-watch',       spec: '0 3 * * *',            run: () => runDiskWatchJob() },
   ];
 
   const tasks: ScheduledTask[] = [];

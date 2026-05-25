@@ -186,6 +186,13 @@ export function PetSettings(): JSX.Element {
         onChange={(v) => update.mutate({ auto_rotate: v })}
       />
 
+      <Toggle
+        label="📖 AI Nightly Recap"
+        hint="A warm storybook summary of each day, written automatically."
+        checked={s.recap_enabled}
+        onChange={(v) => update.mutate({ recap_enabled: v })}
+      />
+
       <Field label="Account">
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
           <button type="button" className="hc-btn" onClick={() => setShowChangePw((v) => !v)}>
@@ -229,24 +236,33 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function Toggle({
+export function Toggle({
   label,
+  hint,
   checked,
   onChange,
 }: {
   label: string;
+  hint?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
 }): JSX.Element {
   return (
-    <label style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}>
+    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 12, cursor: 'pointer' }}>
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
-        style={{ width: 22, height: 22 }}
+        style={{ width: 22, height: 22, marginTop: hint ? 2 : 0, flexShrink: 0 }}
       />
-      <span>{label}</span>
+      <span>
+        {label}
+        {hint && (
+          <span style={{ display: 'block', fontSize: 13, opacity: 0.65, fontWeight: 400, marginTop: 2 }}>
+            {hint}
+          </span>
+        )}
+      </span>
     </label>
   );
 }
