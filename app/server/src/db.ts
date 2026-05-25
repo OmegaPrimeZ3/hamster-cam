@@ -62,6 +62,10 @@ export interface CameraRow {
   wheel_mark_enabled: 0 | 1;
   /** Physical wheel diameter in millimetres — used to convert rotations → metres. */
   wheel_diameter_mm: number;
+  /** Left edge of the ROI box as a percentage of frame width (0–100). */
+  wheel_band_x_pct: number;
+  /** ROI box width as a percentage of frame width (0–100). */
+  wheel_band_width_pct: number;
   /** Centre of the sampling band as a percentage of frame height (0–100). */
   wheel_band_y_pct: number;
   /** Sampling band height as a percentage of frame height (0–100). */
@@ -341,27 +345,31 @@ function statements(): Statements {
       INSERT INTO cameras (
         name, emoji, stream_url, live_src, position, enabled, created_at, zones,
         wheel_mark_enabled, wheel_diameter_mm,
+        wheel_band_x_pct, wheel_band_width_pct,
         wheel_band_y_pct, wheel_band_height_pct, wheel_threshold_pct
       )
       VALUES (
         @name, @emoji, @stream_url, @live_src, @position, @enabled, @created_at, @zones,
         @wheel_mark_enabled, @wheel_diameter_mm,
+        @wheel_band_x_pct, @wheel_band_width_pct,
         @wheel_band_y_pct, @wheel_band_height_pct, @wheel_threshold_pct
       )
     `),
     cameraUpdate: db.prepare(`
       UPDATE cameras
-         SET name                = @name,
-             emoji               = @emoji,
-             stream_url          = @stream_url,
-             live_src            = @live_src,
-             enabled             = @enabled,
-             zones               = @zones,
-             wheel_mark_enabled  = @wheel_mark_enabled,
-             wheel_diameter_mm   = @wheel_diameter_mm,
-             wheel_band_y_pct    = @wheel_band_y_pct,
+         SET name                  = @name,
+             emoji                 = @emoji,
+             stream_url            = @stream_url,
+             live_src              = @live_src,
+             enabled               = @enabled,
+             zones                 = @zones,
+             wheel_mark_enabled    = @wheel_mark_enabled,
+             wheel_diameter_mm     = @wheel_diameter_mm,
+             wheel_band_x_pct      = @wheel_band_x_pct,
+             wheel_band_width_pct  = @wheel_band_width_pct,
+             wheel_band_y_pct      = @wheel_band_y_pct,
              wheel_band_height_pct = @wheel_band_height_pct,
-             wheel_threshold_pct = @wheel_threshold_pct
+             wheel_threshold_pct   = @wheel_threshold_pct
        WHERE id = @id
     `),
     cameraDelete: db.prepare('DELETE FROM cameras WHERE id = ?'),
@@ -772,6 +780,8 @@ function decodeCameraRow(raw: unknown): CameraRow {
     zones,
     wheel_mark_enabled: r.wheel_mark_enabled === 1 ? 1 : 0,
     wheel_diameter_mm: typeof r.wheel_diameter_mm === 'number' ? r.wheel_diameter_mm : 152.0,
+    wheel_band_x_pct: typeof r.wheel_band_x_pct === 'number' ? r.wheel_band_x_pct : 0,
+    wheel_band_width_pct: typeof r.wheel_band_width_pct === 'number' ? r.wheel_band_width_pct : 100,
     wheel_band_y_pct: typeof r.wheel_band_y_pct === 'number' ? r.wheel_band_y_pct : 50.0,
     wheel_band_height_pct: typeof r.wheel_band_height_pct === 'number' ? r.wheel_band_height_pct : 10.0,
     wheel_threshold_pct: typeof r.wheel_threshold_pct === 'number' ? r.wheel_threshold_pct : 50.0,
@@ -799,6 +809,8 @@ export interface CreateCameraInput {
   zones?: string[];
   wheel_mark_enabled?: boolean;
   wheel_diameter_mm?: number;
+  wheel_band_x_pct?: number;
+  wheel_band_width_pct?: number;
   wheel_band_y_pct?: number;
   wheel_band_height_pct?: number;
   wheel_threshold_pct?: number;
@@ -818,6 +830,8 @@ export function createCamera(input: CreateCameraInput): CameraRow {
     zones: JSON.stringify(input.zones ?? []),
     wheel_mark_enabled: input.wheel_mark_enabled ? 1 : 0,
     wheel_diameter_mm: input.wheel_diameter_mm ?? 152.0,
+    wheel_band_x_pct: input.wheel_band_x_pct ?? 0,
+    wheel_band_width_pct: input.wheel_band_width_pct ?? 100,
     wheel_band_y_pct: input.wheel_band_y_pct ?? 50.0,
     wheel_band_height_pct: input.wheel_band_height_pct ?? 10.0,
     wheel_threshold_pct: input.wheel_threshold_pct ?? 50.0,
@@ -838,6 +852,8 @@ export interface UpdateCameraInput {
   zones?: string[];
   wheel_mark_enabled?: boolean;
   wheel_diameter_mm?: number;
+  wheel_band_x_pct?: number;
+  wheel_band_width_pct?: number;
   wheel_band_y_pct?: number;
   wheel_band_height_pct?: number;
   wheel_threshold_pct?: number;
@@ -864,6 +880,8 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
       ? (input.wheel_mark_enabled ? 1 : 0)
       : (existing?.wheel_mark_enabled ?? 0),
     wheel_diameter_mm: input.wheel_diameter_mm ?? existing?.wheel_diameter_mm ?? 152.0,
+    wheel_band_x_pct: input.wheel_band_x_pct ?? existing?.wheel_band_x_pct ?? 0,
+    wheel_band_width_pct: input.wheel_band_width_pct ?? existing?.wheel_band_width_pct ?? 100,
     wheel_band_y_pct: input.wheel_band_y_pct ?? existing?.wheel_band_y_pct ?? 50.0,
     wheel_band_height_pct: input.wheel_band_height_pct ?? existing?.wheel_band_height_pct ?? 10.0,
     wheel_threshold_pct: input.wheel_threshold_pct ?? existing?.wheel_threshold_pct ?? 50.0,

@@ -231,6 +231,8 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
   const {
     live_src,
     wheel_diameter_mm: diameterMm,
+    wheel_band_x_pct: bandX,
+    wheel_band_width_pct: bandW,
     wheel_band_y_pct: bandY,
     wheel_band_height_pct: bandH,
     wheel_threshold_pct: thresholdPct,
@@ -258,7 +260,7 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
   const rawProc = spawn('ffmpeg', [
     '-rtsp_transport', 'tcp',
     '-i', rtspUrl,
-    '-vf', `crop=iw:ih*${bandH}/100:0:ih*${bandY}/100,format=gray`,
+    '-vf', `crop=iw*${bandW}/100:ih*${bandH}/100:iw*${bandX}/100:ih*${bandY}/100,format=gray`,
     '-vsync', 'vfr',
     '-r', String(SAMPLE_FPS),
     '-f', 'image2pipe',
@@ -305,7 +307,7 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
     diameterMm,
   });
 
-  log.info({ cameraId, rtspUrl, bandY, bandH, thresholdPct }, 'wheel session started');
+  log.info({ cameraId, rtspUrl, bandX, bandW, bandY, bandH, thresholdPct }, 'wheel session started');
 }
 
 /**
@@ -337,7 +339,14 @@ export async function testWheelDetection(cameraId: number): Promise<
   const camera = db.getCameraById(cameraId);
   if (!camera) return { error: `camera ${cameraId} not found` };
 
-  const { live_src, wheel_band_y_pct: bandY, wheel_band_height_pct: bandH, wheel_threshold_pct: thresholdPct } = camera;
+  const {
+    live_src,
+    wheel_band_x_pct: bandX,
+    wheel_band_width_pct: bandW,
+    wheel_band_y_pct: bandY,
+    wheel_band_height_pct: bandH,
+    wheel_threshold_pct: thresholdPct,
+  } = camera;
   const rtspUrl = wheelRtspUrl(live_src);
   if (!rtspUrl) return { error: 'camera has no go2rtc live_src configured' };
 
@@ -349,7 +358,7 @@ export async function testWheelDetection(cameraId: number): Promise<
     const grabProc = spawn('ffmpeg', [
       '-rtsp_transport', 'tcp',
       '-i', rtspUrl,
-      '-vf', `crop=iw:ih*${bandH}/100:0:ih*${bandY}/100,format=gray`,
+      '-vf', `crop=iw*${bandW}/100:ih*${bandH}/100:iw*${bandX}/100:ih*${bandY}/100,format=gray`,
       '-vframes', '1',
       '-f', 'image2pipe',
       '-vcodec', 'pgm',

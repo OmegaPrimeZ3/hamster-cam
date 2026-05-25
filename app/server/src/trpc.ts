@@ -244,6 +244,10 @@ const cameraSchema = z.object({
   wheel_mark_enabled: z.boolean(),
   /** Physical wheel diameter in millimetres. */
   wheel_diameter_mm: z.number(),
+  /** Left edge of the ROI box as % of frame width (0–100). */
+  wheel_band_x_pct: z.number(),
+  /** ROI box width as % of frame width (0–100). */
+  wheel_band_width_pct: z.number(),
   /** Centre of the sampling band as % of frame height (0–100). */
   wheel_band_y_pct: z.number(),
   /** Sampling band height as % of frame height (0–100). */
@@ -332,6 +336,8 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
     last_frame_at: lastFrameAt,
     wheel_mark_enabled: row.wheel_mark_enabled === 1,
     wheel_diameter_mm: row.wheel_diameter_mm,
+    wheel_band_x_pct: row.wheel_band_x_pct,
+    wheel_band_width_pct: row.wheel_band_width_pct,
     wheel_band_y_pct: row.wheel_band_y_pct,
     wheel_band_height_pct: row.wheel_band_height_pct,
     wheel_threshold_pct: row.wheel_threshold_pct,
@@ -585,6 +591,8 @@ const camerasRouter = router({
       // Wheel odometer — optional; existing values are preserved when omitted.
       wheel_mark_enabled: z.boolean().optional(),
       wheel_diameter_mm: z.number().positive().optional(),
+      wheel_band_x_pct: z.number().min(0).max(100).optional(),
+      wheel_band_width_pct: z.number().min(0.1).max(100).optional(),
       wheel_band_y_pct: z.number().min(0).max(100).optional(),
       wheel_band_height_pct: z.number().min(0.1).max(100).optional(),
       wheel_threshold_pct: z.number().min(0).max(100).optional(),
@@ -606,6 +614,8 @@ const camerasRouter = router({
         zones: input.zones,
         ...(input.wheel_mark_enabled !== undefined && { wheel_mark_enabled: input.wheel_mark_enabled }),
         ...(input.wheel_diameter_mm !== undefined && { wheel_diameter_mm: input.wheel_diameter_mm }),
+        ...(input.wheel_band_x_pct !== undefined && { wheel_band_x_pct: input.wheel_band_x_pct }),
+        ...(input.wheel_band_width_pct !== undefined && { wheel_band_width_pct: input.wheel_band_width_pct }),
         ...(input.wheel_band_y_pct !== undefined && { wheel_band_y_pct: input.wheel_band_y_pct }),
         ...(input.wheel_band_height_pct !== undefined && { wheel_band_height_pct: input.wheel_band_height_pct }),
         ...(input.wheel_threshold_pct !== undefined && { wheel_threshold_pct: input.wheel_threshold_pct }),

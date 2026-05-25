@@ -59,6 +59,8 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
   const [wheelConfig, setWheelConfig] = useState<WheelConfig>({
     wheel_mark_enabled: existingExt?.wheel_mark_enabled ?? WHEEL_CONFIG_DEFAULTS.wheel_mark_enabled,
     wheel_diameter_mm: existingExt?.wheel_diameter_mm ?? WHEEL_CONFIG_DEFAULTS.wheel_diameter_mm,
+    wheel_band_x_pct: existingExt?.wheel_band_x_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_band_x_pct,
+    wheel_band_width_pct: existingExt?.wheel_band_width_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_band_width_pct,
     wheel_band_y_pct: existingExt?.wheel_band_y_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_band_y_pct,
     wheel_band_height_pct: existingExt?.wheel_band_height_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_band_height_pct,
     wheel_threshold_pct: existingExt?.wheel_threshold_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_threshold_pct,

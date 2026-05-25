@@ -3,7 +3,8 @@
 // Covers:
 //   (a) Section is open by default (Change A).
 //   (b) Targeting feed button appears only when liveSrc is provided.
-//   (c) Band overlay top/height styles track wheel_band_y_pct / wheel_band_height_pct.
+//   (c) Box overlay geometry (top/height/left/width) tracks all four config fields.
+//   (d) X/width sliders fire onChange with updated values.
 //
 // Strategy: WheelOdometerSection calls trpc.cameras.testWheelDetection.useMutation()
 // internally. renderWithProviders wraps the tree in the tRPC + React Query providers
@@ -13,7 +14,7 @@
 // we control that through user events; the custom element is stubbed the same way
 // LiveStream.test.tsx does it to prevent jsdom from throwing.
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, fireEvent } from '@testing-library/react';
 import { renderWithProviders } from './test-utils';
 import {
@@ -45,13 +46,14 @@ beforeEach(() => {
 function renderSection(
   configOverrides: Partial<WheelConfig> = {},
   liveSrc?: string | null,
+  onChange?: (next: WheelConfig) => void,
 ): void {
   const config: WheelConfig = { ...WHEEL_CONFIG_DEFAULTS, ...configOverrides };
   renderWithProviders(
     <WheelOdometerSection
       cameraId={42}
       config={config}
-      onChange={() => {}}
+      onChange={onChange ?? (() => {})}
       liveSrc={liveSrc}
     />,
   );
@@ -154,5 +156,55 @@ describe('WheelOdometerSection — band overlay geometry', () => {
     const btn = screen.getByRole('button', { name: /targeting feed/i });
     fireEvent.click(btn);
     expect(screen.getByRole('button', { name: /hide targeting feed/i })).toBeInTheDocument();
+  });
+
+  it('overlay left reflects wheel_band_x_pct=20', () => {
+    renderSection({ wheel_band_x_pct: 20, wheel_band_width_pct: 40 }, 'hamster_cam_1');
+    fireEvent.click(screen.getByRole('button', { name: /targeting feed/i }));
+    expect(screen.getByTestId('targeting-band-overlay')).toHaveStyle({ left: '20%' });
+  });
+
+  it('overlay width reflects wheel_band_width_pct=40', () => {
+    renderSection({ wheel_band_x_pct: 20, wheel_band_width_pct: 40 }, 'hamster_cam_1');
+    fireEvent.click(screen.getByRole('button', { name: /targeting feed/i }));
+    expect(screen.getByTestId('targeting-band-overlay')).toHaveStyle({ width: '40%' });
+  });
+
+  it('overlay left reflects wheel_band_x_pct=0 (default full-width)', () => {
+    renderSection({ wheel_band_x_pct: 0, wheel_band_width_pct: 100 }, 'hamster_cam_1');
+    fireEvent.click(screen.getByRole('button', { name: /targeting feed/i }));
+    const overlay = screen.getByTestId('targeting-band-overlay');
+    expect(overlay).toHaveStyle({ left: '0%', width: '100%' });
+  });
+
+  it('overlay label reads "detection box"', () => {
+    renderSection({}, 'hamster_cam_1');
+    fireEvent.click(screen.getByRole('button', { name: /targeting feed/i }));
+    const overlay = screen.getByTestId('targeting-band-overlay');
+    expect(overlay.textContent?.toLowerCase()).toContain('detection box');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (d) X/width sliders fire onChange with updated values
+// ---------------------------------------------------------------------------
+
+describe('WheelOdometerSection — X/width slider onChange', () => {
+  it('X slider fires onChange with updated wheel_band_x_pct', () => {
+    const handler = vi.fn();
+    renderSection({ wheel_band_x_pct: 10 }, undefined, handler);
+    const slider = screen.getByRole('slider', { name: /detection box x position/i });
+    fireEvent.change(slider, { target: { value: '25' } });
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler.mock.calls[0]?.[0]).toMatchObject({ wheel_band_x_pct: 25 });
+  });
+
+  it('width slider fires onChange with updated wheel_band_width_pct', () => {
+    const handler = vi.fn();
+    renderSection({ wheel_band_width_pct: 80 }, undefined, handler);
+    const slider = screen.getByRole('slider', { name: /detection box width/i });
+    fireEvent.change(slider, { target: { value: '50' } });
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler.mock.calls[0]?.[0]).toMatchObject({ wheel_band_width_pct: 50 });
   });
 });
