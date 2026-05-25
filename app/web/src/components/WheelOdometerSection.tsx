@@ -22,6 +22,8 @@ import type { DistanceUnit } from '../lib/trpc-extensions';
 export interface WheelConfig {
   wheel_mark_enabled: boolean;
   wheel_diameter_mm: number;
+  wheel_band_x_pct: number;
+  wheel_band_width_pct: number;
   wheel_band_y_pct: number;
   wheel_band_height_pct: number;
   wheel_threshold_pct: number;
@@ -30,6 +32,8 @@ export interface WheelConfig {
 export const WHEEL_CONFIG_DEFAULTS: WheelConfig = {
   wheel_mark_enabled: false,
   wheel_diameter_mm: 152,
+  wheel_band_x_pct: 0,
+  wheel_band_width_pct: 100,
   wheel_band_y_pct: 50,
   wheel_band_height_pct: 10,
   wheel_threshold_pct: 50,
@@ -151,7 +155,10 @@ export function WheelOdometerSection({
             </label>
             <HelpText>
               Stick a piece of dark tape on the wheel rim. We&rsquo;ll count how often it
-              passes across the line below.
+              passes through the detection box below. If the camera sees the wheel at an
+              angle, drag a small box over the one spot on the rim where the tape passes
+              &mdash; ideally near the left or right edge of the wheel, where the tape
+              crosses just once per turn.
             </HelpText>
           </FieldRow>
 
@@ -176,10 +183,46 @@ export function WheelOdometerSection({
             />
           </FieldRow>
 
-          {/* Band Y position */}
+          {/* Box X position */}
+          <FieldRow>
+            <label className="hc-label" htmlFor="wheel-band-x">
+              Detection box X position — {config.wheel_band_x_pct}%
+            </label>
+            <input
+              id="wheel-band-x"
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={config.wheel_band_x_pct}
+              onChange={(e) => set('wheel_band_x_pct', parseInt(e.target.value, 10))}
+              style={{ width: '100%' }}
+            />
+          </FieldRow>
+
+          {/* Box width */}
+          <FieldRow>
+            <label className="hc-label" htmlFor="wheel-band-width">
+              Detection box width — {config.wheel_band_width_pct}%
+            </label>
+            <input
+              id="wheel-band-width"
+              type="range"
+              min={1}
+              max={100}
+              step={1}
+              value={config.wheel_band_width_pct}
+              onChange={(e) =>
+                set('wheel_band_width_pct', parseInt(e.target.value, 10))
+              }
+              style={{ width: '100%' }}
+            />
+          </FieldRow>
+
+          {/* Box Y position */}
           <FieldRow>
             <label className="hc-label" htmlFor="wheel-band-y">
-              Detection band Y position — {config.wheel_band_y_pct}%
+              Detection box Y position — {config.wheel_band_y_pct}%
             </label>
             <input
               id="wheel-band-y"
@@ -193,10 +236,10 @@ export function WheelOdometerSection({
             />
           </FieldRow>
 
-          {/* Band height */}
+          {/* Box height */}
           <FieldRow>
             <label className="hc-label" htmlFor="wheel-band-height">
-              Detection band height — {config.wheel_band_height_pct}%
+              Detection box height — {config.wheel_band_height_pct}%
             </label>
             <input
               id="wheel-band-height"
@@ -259,8 +302,10 @@ export function WheelOdometerSection({
                 )}
               </button>
               <HelpText>
-                Watch the live stream with the detection band overlaid. Drag the
-                sliders above to position it over the tape spot on the wheel.
+                Watch the live stream with the detection box overlaid. Drag the
+                sliders above to position it over the tape spot on the wheel. For
+                angled cameras, make the box small and place it where the tape
+                crosses once per spin.
               </HelpText>
             </FieldRow>
           )}
@@ -285,15 +330,15 @@ export function WheelOdometerSection({
                 style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
               />
 
-              {/* Detection band overlay — top-anchored, matches backend crop geometry:
-                  crop=iw:ih*bandH/100:0:ih*bandY/100 */}
+              {/* Detection box overlay — matches backend crop geometry:
+                  crop=iw*W/100:ih*H/100:iw*X/100:ih*Y/100 */}
               <div
                 aria-hidden
                 data-testid="targeting-band-overlay"
                 style={{
                   position: 'absolute',
-                  left: 0,
-                  right: 0,
+                  left: `${config.wheel_band_x_pct}%`,
+                  width: `${config.wheel_band_width_pct}%`,
                   top: `${config.wheel_band_y_pct}%`,
                   height: `${config.wheel_band_height_pct}%`,
                   background: 'color-mix(in srgb, var(--accent, #f59e0b) 28%, transparent)',
@@ -302,7 +347,7 @@ export function WheelOdometerSection({
                   pointerEvents: 'none',
                 }}
               >
-                {/* Centre line within the band */}
+                {/* Crosshair at the centre of the box */}
                 <div
                   style={{
                     position: 'absolute',
@@ -313,6 +358,18 @@ export function WheelOdometerSection({
                     background: 'var(--accent, #f59e0b)',
                     opacity: 0.7,
                     transform: 'translateY(-50%)',
+                  }}
+                />
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    bottom: 0,
+                    left: '50%',
+                    width: 1,
+                    background: 'var(--accent, #f59e0b)',
+                    opacity: 0.7,
+                    transform: 'translateX(-50%)',
                   }}
                 />
                 {/* Label */}
@@ -330,7 +387,7 @@ export function WheelOdometerSection({
                     whiteSpace: 'nowrap',
                   }}
                 >
-                  detection band
+                  detection box
                 </span>
               </div>
             </div>

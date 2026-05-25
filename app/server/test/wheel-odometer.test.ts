@@ -208,7 +208,13 @@ afterEach(async () => {
   rmSync(workdir, { recursive: true, force: true });
 });
 
-async function seedWheelCamera(enabled: boolean = true): Promise<number> {
+async function seedWheelCamera(
+  enabled: boolean = true,
+  extra: Partial<{
+    wheel_band_x_pct: number;
+    wheel_band_width_pct: number;
+  }> = {},
+): Promise<number> {
   const db = await import('../src/db.js');
   const cam = db.createCamera({
     name: 'wheel-cam',
@@ -219,6 +225,8 @@ async function seedWheelCamera(enabled: boolean = true): Promise<number> {
     zones: ['wheel'],
     wheel_mark_enabled: enabled,
     wheel_diameter_mm: 152.0,
+    wheel_band_x_pct: extra.wheel_band_x_pct ?? 0,
+    wheel_band_width_pct: extra.wheel_band_width_pct ?? 100,
     wheel_band_y_pct: 50.0,
     wheel_band_height_pct: 10.0,
     wheel_threshold_pct: 50.0,
@@ -313,5 +321,109 @@ describe('wheel session lifecycle', () => {
     endWheelSession(camId);
     expect(session?.proc.kill).toHaveBeenCalledWith('SIGTERM');
     expect(_activeSessions.has(camId)).toBe(false);
+  });
+
+  it('ffmpeg crop filter uses full rectangle: iw*W/100:ih*H/100:iw*X/100:ih*Y/100', async () => {
+    // Camera with a non-default x + width so the crop string is unambiguous.
+    const camId = await seedWheelCamera(true, { wheel_band_x_pct: 25, wheel_band_width_pct: 50 });
+    const { startWheelSession } = await import('../src/wheel-odometer.js');
+
+    startWheelSession(camId, Date.now());
+
+    expect(currentSpawnMock).toHaveBeenCalledTimes(1);
+    const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
+    const vfIdx = args.indexOf('-vf');
+    expect(vfIdx).toBeGreaterThanOrEqual(0);
+    // bandX=25, bandW=50, bandY=50, bandH=10
+    expect(args[vfIdx + 1]).toBe('crop=iw*50/100:ih*10/100:iw*25/100:ih*50/100,format=gray');
+  });
+
+  it('ffmpeg crop defaults to full-width when x=0 width=100 (backward compat)', async () => {
+    // Default camera: x_pct=0, width_pct=100 — replicates old full-width strip.
+    const camId = await seedWheelCamera();
+    const { startWheelSession } = await import('../src/wheel-odometer.js');
+
+    startWheelSession(camId, Date.now());
+
+    const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
+    const vfIdx = args.indexOf('-vf');
+    expect(args[vfIdx + 1]).toBe('crop=iw*100/100:ih*10/100:iw*0/100:ih*50/100,format=gray');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROI box — DB round-trip tests (create / update with defaults).
+// ---------------------------------------------------------------------------
+
+describe('wheel_band_x_pct / wheel_band_width_pct DB round-trip', () => {
+  it('createCamera defaults x_pct=0 and width_pct=100 when not supplied', async () => {
+    const db = await import('../src/db.js');
+    const cam = db.createCamera({
+      name: 'default-box-cam',
+      emoji: '📷',
+      stream_url: '',
+      enabled: true,
+    });
+    expect(cam.wheel_band_x_pct).toBe(0);
+    expect(cam.wheel_band_width_pct).toBe(100);
+  });
+
+  it('createCamera stores explicit x_pct and width_pct values', async () => {
+    const db = await import('../src/db.js');
+    const cam = db.createCamera({
+      name: 'roi-box-cam',
+      emoji: '📷',
+      stream_url: '',
+      enabled: true,
+      wheel_band_x_pct: 30,
+      wheel_band_width_pct: 40,
+    });
+    expect(cam.wheel_band_x_pct).toBe(30);
+    expect(cam.wheel_band_width_pct).toBe(40);
+  });
+
+  it('updateCamera preserves existing x_pct / width_pct when omitted from input', async () => {
+    const db = await import('../src/db.js');
+    const created = db.createCamera({
+      name: 'preserve-box-cam',
+      emoji: '📷',
+      stream_url: '',
+      enabled: true,
+      wheel_band_x_pct: 15,
+      wheel_band_width_pct: 60,
+    });
+    const updated = db.updateCamera({
+      id: created.id,
+      name: created.name,
+      emoji: created.emoji,
+      stream_url: created.stream_url,
+      enabled: true,
+      // wheel_band_x_pct and wheel_band_width_pct intentionally omitted.
+    });
+    expect(updated?.wheel_band_x_pct).toBe(15);
+    expect(updated?.wheel_band_width_pct).toBe(60);
+  });
+
+  it('updateCamera applies new x_pct / width_pct values', async () => {
+    const db = await import('../src/db.js');
+    const created = db.createCamera({
+      name: 'update-box-cam',
+      emoji: '📷',
+      stream_url: '',
+      enabled: true,
+      wheel_band_x_pct: 0,
+      wheel_band_width_pct: 100,
+    });
+    const updated = db.updateCamera({
+      id: created.id,
+      name: created.name,
+      emoji: created.emoji,
+      stream_url: created.stream_url,
+      enabled: true,
+      wheel_band_x_pct: 20,
+      wheel_band_width_pct: 55,
+    });
+    expect(updated?.wheel_band_x_pct).toBe(20);
+    expect(updated?.wheel_band_width_pct).toBe(55);
   });
 });

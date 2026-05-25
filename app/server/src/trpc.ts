@@ -244,6 +244,10 @@ const cameraSchema = z.object({
   wheel_mark_enabled: z.boolean(),
   /** Physical wheel diameter in millimetres. */
   wheel_diameter_mm: z.number(),
+  /** Left edge of the ROI box as % of frame width (0–100). */
+  wheel_band_x_pct: z.number(),
+  /** ROI box width as % of frame width (0–100). */
+  wheel_band_width_pct: z.number(),
   /** Centre of the sampling band as % of frame height (0–100). */
   wheel_band_y_pct: z.number(),
   /** Sampling band height as % of frame height (0–100). */
@@ -332,6 +336,8 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
     last_frame_at: lastFrameAt,
     wheel_mark_enabled: row.wheel_mark_enabled === 1,
     wheel_diameter_mm: row.wheel_diameter_mm,
+    wheel_band_x_pct: row.wheel_band_x_pct,
+    wheel_band_width_pct: row.wheel_band_width_pct,
     wheel_band_y_pct: row.wheel_band_y_pct,
     wheel_band_height_pct: row.wheel_band_height_pct,
     wheel_threshold_pct: row.wheel_threshold_pct,
@@ -585,6 +591,8 @@ const camerasRouter = router({
       // Wheel odometer — optional; existing values are preserved when omitted.
       wheel_mark_enabled: z.boolean().optional(),
       wheel_diameter_mm: z.number().positive().optional(),
+      wheel_band_x_pct: z.number().min(0).max(100).optional(),
+      wheel_band_width_pct: z.number().min(0.1).max(100).optional(),
       wheel_band_y_pct: z.number().min(0).max(100).optional(),
       wheel_band_height_pct: z.number().min(0.1).max(100).optional(),
       wheel_threshold_pct: z.number().min(0).max(100).optional(),
@@ -606,6 +614,8 @@ const camerasRouter = router({
         zones: input.zones,
         ...(input.wheel_mark_enabled !== undefined && { wheel_mark_enabled: input.wheel_mark_enabled }),
         ...(input.wheel_diameter_mm !== undefined && { wheel_diameter_mm: input.wheel_diameter_mm }),
+        ...(input.wheel_band_x_pct !== undefined && { wheel_band_x_pct: input.wheel_band_x_pct }),
+        ...(input.wheel_band_width_pct !== undefined && { wheel_band_width_pct: input.wheel_band_width_pct }),
         ...(input.wheel_band_y_pct !== undefined && { wheel_band_y_pct: input.wheel_band_y_pct }),
         ...(input.wheel_band_height_pct !== undefined && { wheel_band_height_pct: input.wheel_band_height_pct }),
         ...(input.wheel_threshold_pct !== undefined && { wheel_threshold_pct: input.wheel_threshold_pct }),
@@ -1008,7 +1018,23 @@ const usersRouter = router({
     }))
     .output(publicUserSchema)
     .mutation(async ({ ctx, input }) => {
-      // Atomic semantics: Zyphr-register first; only insert the local row on
+      // Reactivation path: if a soft-deleted row exists for this email we can
+      // re-attach to the existing Zyphr account without re-registering. The
+      // admin-supplied password is intentionally ignored — the old Zyphr
+      // password still applies; the admin can use Reset Password afterward.
+      const deleted = db.getDeletedUserByEmail(input.email);
+      if (deleted) {
+        const row = db.reactivateUser({
+          id: deleted.id,
+          display_name: input.display_name,
+          role: input.role,
+          created_by: ctx.user.id,
+        });
+        return db.toPublicUser(row);
+      }
+
+      // Normal path: register at Zyphr first; only insert locally on 2xx.
+      // Atomicity contract: Zyphr-register first; only insert the local row on
       // a 2xx upstream response. Atomicity contract is here at Stage 1 so the
       // Stage 2a implementation has nowhere to drift.
       let registered;
@@ -1016,7 +1042,15 @@ const usersRouter = router({
         registered = await registerAccount(input.email, input.password, input.display_name);
       } catch (err) {
         if (err instanceof ZyphrEmailTaken) {
-          throw new TRPCError({ code: 'CONFLICT', message: 'email already registered' });
+          // True orphan: email exists at Zyphr but there is no local row (and
+          // no soft-deleted row — we checked above). An operator must purge the
+          // account in the Zyphr dashboard, or use a different email.
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message:
+              'email is registered with the auth provider but has no local account; ' +
+              'purge it in the Zyphr dashboard or use a different email',
+          });
         }
         throw err;
       }
@@ -1054,7 +1088,7 @@ const usersRouter = router({
     .output(publicUserSchema)
     .mutation(({ ctx, input }) => {
       const target = db.getUserById(input.id);
-      if (!target) {
+      if (!target || target.deleted_at !== null) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
       }
       // Refuse to demote the last remaining admin.
@@ -1106,7 +1140,7 @@ const usersRouter = router({
     .output(z.object({ ok: z.literal(true) }))
     .mutation(({ ctx, input }) => {
       const target = db.getUserById(input.id);
-      if (!target) {
+      if (!target || target.deleted_at !== null) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
       }
       if (target.role === 'admin' && db.countAdmins() <= 1) {
@@ -1139,7 +1173,7 @@ const usersRouter = router({
     .output(z.object({ ok: z.literal(true) }))
     .mutation(async ({ input }) => {
       const target = db.getUserById(input.id);
-      if (!target) {
+      if (!target || target.deleted_at !== null) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
       }
       await triggerForgotPassword(target.email);

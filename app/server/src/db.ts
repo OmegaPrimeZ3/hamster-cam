@@ -26,6 +26,8 @@ export interface UserRow {
   created_at: number;
   last_seen_at: number;
   created_by: number | null;
+  /** Epoch-ms when the user was soft-deleted. NULL means the account is active. */
+  deleted_at: number | null;
 }
 
 export interface PublicUser {
@@ -62,6 +64,10 @@ export interface CameraRow {
   wheel_mark_enabled: 0 | 1;
   /** Physical wheel diameter in millimetres — used to convert rotations → metres. */
   wheel_diameter_mm: number;
+  /** Left edge of the ROI box as a percentage of frame width (0–100). */
+  wheel_band_x_pct: number;
+  /** ROI box width as a percentage of frame width (0–100). */
+  wheel_band_width_pct: number;
   /** Centre of the sampling band as a percentage of frame height (0–100). */
   wheel_band_y_pct: number;
   /** Sampling band height as a percentage of frame height (0–100). */
@@ -203,9 +209,11 @@ interface Statements {
   userById: Database.Statement;
   userByEmail: Database.Statement;
   userByZyphrId: Database.Statement;
+  userDeletedByEmail: Database.Statement;
   userInsert: Database.Statement;
   userUpdate: Database.Statement;
-  userDelete: Database.Statement;
+  userSoftDelete: Database.Statement;
+  userReactivate: Database.Statement;
   userList: Database.Statement;
   userCount: Database.Statement;
   userAdminCount: Database.Statement;
@@ -292,9 +300,21 @@ function statements(): Statements {
     ),
 
     // users ------------------------------------------------------------
+    // `userById` intentionally includes soft-deleted rows: audit log / history
+    // lookups (actor_user_id resolution) must still resolve deleted users by id.
+    // Callers that need to gate on active status check deleted_at themselves.
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
-    userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
-    userByZyphrId: db.prepare('SELECT * FROM users WHERE zyphr_user_id = ?'),
+    // Access-control / login paths filter to active (non-deleted) rows only.
+    userByEmail: db.prepare(
+      'SELECT * FROM users WHERE email = ? COLLATE NOCASE AND deleted_at IS NULL',
+    ),
+    userByZyphrId: db.prepare(
+      'SELECT * FROM users WHERE zyphr_user_id = ? AND deleted_at IS NULL',
+    ),
+    // Reactivation path: find a previously-deleted row by email (deleted_at NOT NULL).
+    userDeletedByEmail: db.prepare(
+      'SELECT * FROM users WHERE email = ? COLLATE NOCASE AND deleted_at IS NOT NULL',
+    ),
     userInsert: db.prepare(`
       INSERT INTO users (
         zyphr_user_id, email, display_name, role,
@@ -310,12 +330,32 @@ function statements(): Statements {
              role         = @role
        WHERE id = @id
     `),
-    userDelete: db.prepare('DELETE FROM users WHERE id = ?'),
-    userList: db.prepare(
-      'SELECT * FROM users ORDER BY role DESC, display_name COLLATE NOCASE ASC',
+    // Soft-delete: stamp deleted_at; leave all other columns intact so the
+    // Zyphr account linkage (zyphr_user_id) is preserved for reactivation.
+    userSoftDelete: db.prepare(
+      'UPDATE users SET deleted_at = @deleted_at WHERE id = @id',
     ),
-    userCount: db.prepare('SELECT COUNT(*) AS n FROM users'),
-    userAdminCount: db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'"),
+    // Reactivation: clear deleted_at and apply the new profile supplied by
+    // the re-adding admin. `created_at` is refreshed so the UI shows the
+    // new creation time rather than the original one.
+    userReactivate: db.prepare(`
+      UPDATE users
+         SET deleted_at    = NULL,
+             display_name  = @display_name,
+             role          = @role,
+             created_by    = @created_by,
+             created_at    = @created_at,
+             last_seen_at  = @last_seen_at
+       WHERE id = @id
+    `),
+    // Listing and counts are restricted to active users only.
+    userList: db.prepare(
+      'SELECT * FROM users WHERE deleted_at IS NULL ORDER BY role DESC, display_name COLLATE NOCASE ASC',
+    ),
+    userCount: db.prepare('SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NULL'),
+    userAdminCount: db.prepare(
+      "SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND deleted_at IS NULL",
+    ),
     userTouchLastSeen: db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?'),
 
     // sessions ---------------------------------------------------------
@@ -341,27 +381,31 @@ function statements(): Statements {
       INSERT INTO cameras (
         name, emoji, stream_url, live_src, position, enabled, created_at, zones,
         wheel_mark_enabled, wheel_diameter_mm,
+        wheel_band_x_pct, wheel_band_width_pct,
         wheel_band_y_pct, wheel_band_height_pct, wheel_threshold_pct
       )
       VALUES (
         @name, @emoji, @stream_url, @live_src, @position, @enabled, @created_at, @zones,
         @wheel_mark_enabled, @wheel_diameter_mm,
+        @wheel_band_x_pct, @wheel_band_width_pct,
         @wheel_band_y_pct, @wheel_band_height_pct, @wheel_threshold_pct
       )
     `),
     cameraUpdate: db.prepare(`
       UPDATE cameras
-         SET name                = @name,
-             emoji               = @emoji,
-             stream_url          = @stream_url,
-             live_src            = @live_src,
-             enabled             = @enabled,
-             zones               = @zones,
-             wheel_mark_enabled  = @wheel_mark_enabled,
-             wheel_diameter_mm   = @wheel_diameter_mm,
-             wheel_band_y_pct    = @wheel_band_y_pct,
+         SET name                  = @name,
+             emoji                 = @emoji,
+             stream_url            = @stream_url,
+             live_src              = @live_src,
+             enabled               = @enabled,
+             zones                 = @zones,
+             wheel_mark_enabled    = @wheel_mark_enabled,
+             wheel_diameter_mm     = @wheel_diameter_mm,
+             wheel_band_x_pct      = @wheel_band_x_pct,
+             wheel_band_width_pct  = @wheel_band_width_pct,
+             wheel_band_y_pct      = @wheel_band_y_pct,
              wheel_band_height_pct = @wheel_band_height_pct,
-             wheel_threshold_pct = @wheel_threshold_pct
+             wheel_threshold_pct   = @wheel_threshold_pct
        WHERE id = @id
     `),
     cameraDelete: db.prepare('DELETE FROM cameras WHERE id = ?'),
@@ -661,8 +705,51 @@ export function updateUser(input: UpdateUserInput): UserRow | null {
   return getUserById(input.id);
 }
 
-export function deleteUser(id: number): void {
-  statements().userDelete.run(id);
+/**
+ * Soft-delete a user: stamps `deleted_at` so the row becomes invisible to all
+ * login / listing paths while remaining resolvable by id for audit-log lookups.
+ * Does NOT touch Zyphr — the Zyphr account stays live so a future re-add via
+ * `reactivateUser` can re-attach to the same Zyphr account without re-registering.
+ */
+export function deleteUser(id: number, when: number = Date.now()): void {
+  statements().userSoftDelete.run({ id, deleted_at: when });
+}
+
+/**
+ * Returns a soft-deleted user row matching `email`, or null if no such deleted
+ * row exists. Used by the reactivation path in `users.create` to detect that a
+ * previously-deleted account can be restored rather than re-registered at Zyphr.
+ */
+export function getDeletedUserByEmail(email: string): UserRow | null {
+  return (statements().userDeletedByEmail.get(email) as UserRow | undefined) ?? null;
+}
+
+export interface ReactivateUserInput {
+  id: number;
+  display_name: string;
+  role: UserRole;
+  created_by: number | null;
+}
+
+/**
+ * Reactivate a soft-deleted user: clears `deleted_at`, applies the new profile
+ * supplied by the re-adding admin, and refreshes `created_at` / `last_seen_at`.
+ * The `zyphr_user_id` and `email` columns are deliberately untouched — the
+ * existing Zyphr account is reused as-is.
+ */
+export function reactivateUser(input: ReactivateUserInput): UserRow {
+  const now = Date.now();
+  statements().userReactivate.run({
+    id: input.id,
+    display_name: input.display_name,
+    role: input.role,
+    created_by: input.created_by,
+    created_at: now,
+    last_seen_at: now,
+  });
+  const row = getUserById(input.id);
+  if (!row) throw new Error(`reactivateUser: row ${input.id} not found after reactivation`);
+  return row;
 }
 
 export function listUsers(): UserRow[] {
@@ -772,6 +859,8 @@ function decodeCameraRow(raw: unknown): CameraRow {
     zones,
     wheel_mark_enabled: r.wheel_mark_enabled === 1 ? 1 : 0,
     wheel_diameter_mm: typeof r.wheel_diameter_mm === 'number' ? r.wheel_diameter_mm : 152.0,
+    wheel_band_x_pct: typeof r.wheel_band_x_pct === 'number' ? r.wheel_band_x_pct : 0,
+    wheel_band_width_pct: typeof r.wheel_band_width_pct === 'number' ? r.wheel_band_width_pct : 100,
     wheel_band_y_pct: typeof r.wheel_band_y_pct === 'number' ? r.wheel_band_y_pct : 50.0,
     wheel_band_height_pct: typeof r.wheel_band_height_pct === 'number' ? r.wheel_band_height_pct : 10.0,
     wheel_threshold_pct: typeof r.wheel_threshold_pct === 'number' ? r.wheel_threshold_pct : 50.0,
@@ -799,6 +888,8 @@ export interface CreateCameraInput {
   zones?: string[];
   wheel_mark_enabled?: boolean;
   wheel_diameter_mm?: number;
+  wheel_band_x_pct?: number;
+  wheel_band_width_pct?: number;
   wheel_band_y_pct?: number;
   wheel_band_height_pct?: number;
   wheel_threshold_pct?: number;
@@ -818,6 +909,8 @@ export function createCamera(input: CreateCameraInput): CameraRow {
     zones: JSON.stringify(input.zones ?? []),
     wheel_mark_enabled: input.wheel_mark_enabled ? 1 : 0,
     wheel_diameter_mm: input.wheel_diameter_mm ?? 152.0,
+    wheel_band_x_pct: input.wheel_band_x_pct ?? 0,
+    wheel_band_width_pct: input.wheel_band_width_pct ?? 100,
     wheel_band_y_pct: input.wheel_band_y_pct ?? 50.0,
     wheel_band_height_pct: input.wheel_band_height_pct ?? 10.0,
     wheel_threshold_pct: input.wheel_threshold_pct ?? 50.0,
@@ -838,6 +931,8 @@ export interface UpdateCameraInput {
   zones?: string[];
   wheel_mark_enabled?: boolean;
   wheel_diameter_mm?: number;
+  wheel_band_x_pct?: number;
+  wheel_band_width_pct?: number;
   wheel_band_y_pct?: number;
   wheel_band_height_pct?: number;
   wheel_threshold_pct?: number;
@@ -864,6 +959,8 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
       ? (input.wheel_mark_enabled ? 1 : 0)
       : (existing?.wheel_mark_enabled ?? 0),
     wheel_diameter_mm: input.wheel_diameter_mm ?? existing?.wheel_diameter_mm ?? 152.0,
+    wheel_band_x_pct: input.wheel_band_x_pct ?? existing?.wheel_band_x_pct ?? 0,
+    wheel_band_width_pct: input.wheel_band_width_pct ?? existing?.wheel_band_width_pct ?? 100,
     wheel_band_y_pct: input.wheel_band_y_pct ?? existing?.wheel_band_y_pct ?? 50.0,
     wheel_band_height_pct: input.wheel_band_height_pct ?? existing?.wheel_band_height_pct ?? 10.0,
     wheel_threshold_pct: input.wheel_threshold_pct ?? existing?.wheel_threshold_pct ?? 50.0,

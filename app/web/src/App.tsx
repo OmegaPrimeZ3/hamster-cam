@@ -28,6 +28,7 @@ import { ChangePasswordForm } from './components/ChangePasswordForm';
 import { Mascot } from './components/Mascot';
 import { trpc } from './trpc';
 import { useAuth } from './hooks/useAuth';
+import { useWakeLock } from './hooks/useWakeLock';
 import {
   PaletteName,
   ThemeModeSetting,
@@ -65,6 +66,8 @@ export function App(): JSX.Element {
 export function AppShell(): JSX.Element {
   const { isAdmin } = useAuth();
   const utils = trpc.useUtils();
+  // Keep a docked/charging iPad's screen awake while the app is open.
+  useWakeLock();
   const cachedBrand = useMemo(() => readCachedBrand(), []);
   // staleTime: treat a successful settings fetch as fresh for 60s so a
   // tab-switch doesn't fire a redundant re-fetch every time.

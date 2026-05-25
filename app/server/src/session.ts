@@ -38,6 +38,11 @@ export function resolveSession(req: FastifyRequest): UserRow | null {
   if (!session) return null;
   const user = getUserById(session.user_id);
   if (!user) return null;
+  // Deleted users must not pass the session gate, even when a valid session
+  // row still exists (e.g. the session was created before an admin deleted
+  // the account). This terminates access immediately without waiting for
+  // session expiry.
+  if (user.deleted_at !== null) return null;
   req.sessionId = sid;
   req.user = user;
   touchLastSeen(user.id);
