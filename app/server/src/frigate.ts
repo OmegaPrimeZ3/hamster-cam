@@ -420,15 +420,29 @@ export class FfmpegError extends Error {
 
 // ---------------------------------------------------------------------------
 // Snapshot pull — fetches Frigate's `latest.jpg` for a camera and caches it
-// under STORAGE_PATH/snapshots/. Returns the relative path written. On any
-// failure (Frigate down, write error) we fall back to a small empty-placeholder
-// file so the diary entry still has a real file on disk to point at.
+// under STORAGE_PATH/snapshots/.
+//
+// Returns `{ path, captured: true }` when a real JPEG was fetched and written.
+// Returns `{ path, captured: false }` when Frigate was unreachable or returned
+// a non-ok status — the placeholder file is still written so the path field
+// always points to a real (possibly zero-byte) file, preserving the previous
+// behaviour for callers that need a disk path regardless.
+//
+// The `captured` flag is what callers that must not record failed pulls (e.g.
+// the snapshot-capture job) should gate on.
 // ---------------------------------------------------------------------------
+
+export interface CaptureSnapshotResult {
+  /** Relative path under STORAGE_PATH where the file was written. */
+  path: string;
+  /** True iff a real, non-zero-byte JPEG was fetched from Frigate. */
+  captured: boolean;
+}
 
 export async function captureLatestSnapshot(
   cameraName: string,
   takenAtMs: number,
-): Promise<string> {
+): Promise<CaptureSnapshotResult> {
   const cfg = getConfig();
   const snapsDir = join(cfg.STORAGE_PATH, 'snapshots');
   await mkdir(snapsDir, { recursive: true });
@@ -440,7 +454,7 @@ export async function captureLatestSnapshot(
 
   if (!cfg.FRIGATE_URL) {
     await writeFile(absPath, Buffer.alloc(0));
-    return relPath;
+    return { path: relPath, captured: false };
   }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), DEFAULT_FETCH_TIMEOUT_MS);
@@ -452,16 +466,18 @@ export async function captureLatestSnapshot(
     const res = await fetch(url, { signal: ctrl.signal });
     if (res.ok) {
       const buf = Buffer.from(await res.arrayBuffer());
-      await writeFile(absPath, buf);
-      return relPath;
+      if (buf.byteLength > 0) {
+        await writeFile(absPath, buf);
+        return { path: relPath, captured: true };
+      }
     }
   } catch {
-    // fall through
+    // fall through to placeholder
   } finally {
     clearTimeout(timer);
   }
   await writeFile(absPath, Buffer.alloc(0));
-  return relPath;
+  return { path: relPath, captured: false };
 }
 
 export function runFfmpeg(args: readonly string[]): Promise<void> {

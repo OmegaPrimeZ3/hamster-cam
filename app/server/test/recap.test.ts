@@ -103,6 +103,25 @@ function startOfLocalDay(d: Date): number {
 // ---------------------------------------------------------------------------
 
 describe('runRecapJob', () => {
+  it('skips when recap_enabled is set to "false" and never calls fetch', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const db = await import('../src/db.js');
+    db.setSetting('recap_enabled', 'false');
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedDiaryEntries(5);
+
+    let fetchCalled = false;
+    const sentinelFetch: typeof globalThis.fetch = async () => {
+      fetchCalled = true;
+      return { ok: true, json: async () => ({}) } as Response;
+    };
+
+    const result = await runRecapJob(TARGET_DATE, { fetch: sentinelFetch });
+    expect(result.skipped).toBe('disabled');
+    expect(result.diary_entry_id).toBeNull();
+    expect(fetchCalled).toBe(false);
+  });
+
   it('skips cleanly when GEMINI_API_KEY is not set', async () => {
     const { runRecapJob } = await import('../src/jobs/recap.js');
     await seedDiaryEntries(5);

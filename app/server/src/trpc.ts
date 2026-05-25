@@ -379,6 +379,8 @@ const settingsSchema = z.object({
   share_rate_limit_per_hour: z.number().int().nonnegative(),
   /** Distance unit for wheel odometer display. */
   distance_unit: z.enum(['mi', 'km']),
+  /** Whether the nightly AI recap job is enabled. Defaults to true. */
+  recap_enabled: z.boolean(),
 });
 export type SettingsDTO = z.infer<typeof settingsSchema>;
 
@@ -416,6 +418,7 @@ function parseSettingsKV(kv: db.SettingsKV): SettingsDTO {
     min_dwell_ms: num('min_dwell_ms', 2000),
     share_rate_limit_per_hour: num('share_rate_limit_per_hour', 10),
     distance_unit: rawDistUnit === 'km' ? 'km' : 'mi',
+    recap_enabled: bool('recap_enabled', true),
   };
 }
 
@@ -745,11 +748,11 @@ const activityRouter = router({
       // best-effort: if Frigate isn't reachable we still record the diary
       // row with an empty media_path so the timestamp lands in the day's
       // feed.
-      const mediaRel = await frigate.captureLatestSnapshot(camera.live_src ?? camera.name, now);
+      const snap = await frigate.captureLatestSnapshot(camera.live_src ?? camera.name, now);
       const entry = await saveManualSnapshot({
         cameraId: camera.id,
         takenAt: now,
-        mediaPath: mediaRel,
+        mediaPath: snap.path,
       });
       return diaryToDTO(entry);
     }),

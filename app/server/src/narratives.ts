@@ -65,7 +65,7 @@ export const narratives: Readonly<Record<NarrativeKey, readonly string[]>> = Obj
     '🐾 {pet} took a stroll: {from} → {to}.',
     '🔀 {pet} hopped over from the {from} to the {to}.',
   ],
-  timelapse: ["📽️ {pet}'s Day {date}"],
+  timelapse: ["📽️ {pet}'s Night {date}"],
 });
 
 /** Picks a deterministic-ish template — random by default but injectable for tests. */
