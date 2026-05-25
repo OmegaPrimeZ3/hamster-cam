@@ -105,7 +105,7 @@ describe('users.create', () => {
     expect(found?.zyphr_user_id).toBe('zy_newkid@example.com');
   });
 
-  it('Zyphr 409 → CONFLICT and no local row', async () => {
+  it('Zyphr 409 (true orphan) → CONFLICT with instructive message and no local row', async () => {
     const { appRouter } = await import('../src/trpc.js');
     const db = await import('../src/db.js');
     const ctx = await makeAdminCtx();
@@ -117,7 +117,7 @@ describe('users.create', () => {
         password: 'secret123',
         role: 'child',
       }),
-    ).rejects.toThrow(/already registered/);
+    ).rejects.toThrow(/auth provider but has no local account/);
     expect(db.getUserByEmail('taken@example.com')).toBeNull();
   });
 });
@@ -132,7 +132,7 @@ describe('users.delete', () => {
     ).rejects.toThrow(/last remaining admin|own account/);
   });
 
-  it('permits deletion when another admin exists', async () => {
+  it('soft-deletes the user (row invisible to getUserByEmail, but still resolvable by id)', async () => {
     const { appRouter } = await import('../src/trpc.js');
     const db = await import('../src/db.js');
     const ctx = await makeAdminCtx();
@@ -146,7 +146,145 @@ describe('users.delete', () => {
     const caller = appRouter.createCaller(ctx);
     const out = await caller.users.delete({ id: other.id });
     expect(out.ok).toBe(true);
+    // Soft-delete: row invisible to the login/listing path.
     expect(db.getUserByEmail('other@example.com')).toBeNull();
+    // But still resolvable by id for audit/history.
+    const raw = db.getUserById(other.id);
+    expect(raw).not.toBeNull();
+    expect(raw?.deleted_at).not.toBeNull();
+  });
+
+  it('re-add after delete reactivates the SAME row without calling Zyphr register', async () => {
+    const { appRouter } = await import('../src/trpc.js');
+    const db = await import('../src/db.js');
+    const ctx = await makeAdminCtx();
+    // Provision a second admin so we can delete `other` without hitting last-admin guard.
+    const other = db.createUser({
+      zyphr_user_id: 'zy_readd_admin',
+      email: 'readd@example.com',
+      display_name: 'Re-Add Admin',
+      role: 'admin',
+      created_by: ctx.user.id,
+    });
+    const originalId = other.id;
+    const originalZyphrId = other.zyphr_user_id;
+
+    let registerCalled = false;
+    mswServer.use(
+      http.post(`${ZYPHR_BASE}/auth/users/register`, async () => {
+        registerCalled = true;
+        return HttpResponse.json({ error: 'should not be called' }, { status: 500 });
+      }),
+    );
+
+    const caller = appRouter.createCaller(ctx);
+    await caller.users.delete({ id: other.id });
+
+    // Re-add with the same email.
+    const reAdded = await caller.users.create({
+      email: 'readd@example.com',
+      display_name: 'Re-Added',
+      password: 'doesnotmatter',
+      role: 'child',
+    });
+
+    // Same database row id and Zyphr account — no new Zyphr registration.
+    expect(reAdded.id).toBe(originalId);
+    expect(registerCalled).toBe(false);
+    expect(db.getUserById(originalId)?.zyphr_user_id).toBe(originalZyphrId);
+    expect(reAdded.display_name).toBe('Re-Added');
+    expect(reAdded.role).toBe('child');
+    // Active again: visible through normal email lookup.
+    expect(db.getUserByEmail('readd@example.com')).not.toBeNull();
+  });
+
+  it('deleted user session is immediately invalidated', async () => {
+    const { appRouter } = await import('../src/trpc.js');
+    const db = await import('../src/db.js');
+    const { resolveSession } = await import('../src/session.js');
+    const ctx = await makeAdminCtx();
+    const other = db.createUser({
+      zyphr_user_id: 'zy_session_del',
+      email: 'sessioned@example.com',
+      display_name: 'Sessioned',
+      role: 'admin',
+      created_by: ctx.user.id,
+    });
+    // Give them an active session.
+    db.createSession({
+      id: 'sess_del_test_0001',
+      user_id: other.id,
+      zyphr_refresh_token: null,
+      user_agent: 'test',
+      ttl_ms: 30 * 24 * 60 * 60 * 1000,
+    });
+
+    // Soft-delete the user.
+    const caller = appRouter.createCaller(ctx);
+    await caller.users.delete({ id: other.id });
+
+    // resolveSession must not return the deleted user.
+    const fakeReq = {
+      cookies: { '__Host-session': 'sess_del_test_0001' },
+    } as unknown as import('fastify').FastifyRequest;
+    expect(resolveSession(fakeReq)).toBeNull();
+  });
+
+  it('update on a soft-deleted user returns NOT_FOUND', async () => {
+    const { appRouter } = await import('../src/trpc.js');
+    const db = await import('../src/db.js');
+    const ctx = await makeAdminCtx();
+    const other = db.createUser({
+      zyphr_user_id: 'zy_upd_deleted',
+      email: 'upd_del@example.com',
+      display_name: 'To Delete',
+      role: 'admin',
+      created_by: ctx.user.id,
+    });
+    const caller = appRouter.createCaller(ctx);
+    await caller.users.delete({ id: other.id });
+    await expect(
+      caller.users.update({ id: other.id, display_name: 'New', role: 'child' }),
+    ).rejects.toThrow(/not found/i);
+  });
+
+  it('delete on an already soft-deleted user returns NOT_FOUND', async () => {
+    const { appRouter } = await import('../src/trpc.js');
+    const db = await import('../src/db.js');
+    const ctx = await makeAdminCtx();
+    const other = db.createUser({
+      zyphr_user_id: 'zy_del_twice',
+      email: 'del_twice@example.com',
+      display_name: 'To Delete Twice',
+      role: 'admin',
+      created_by: ctx.user.id,
+    });
+    const caller = appRouter.createCaller(ctx);
+    await caller.users.delete({ id: other.id });
+    await expect(
+      caller.users.delete({ id: other.id }),
+    ).rejects.toThrow(/not found/i);
+  });
+
+  it('last-admin guard still holds after soft-delete removes one admin', async () => {
+    const { appRouter } = await import('../src/trpc.js');
+    const db = await import('../src/db.js');
+    const ctx = await makeAdminCtx();
+    // Second admin.
+    const second = db.createUser({
+      zyphr_user_id: 'zy_last_guard2',
+      email: 'second_guard@example.com',
+      display_name: 'Second',
+      role: 'admin',
+      created_by: ctx.user.id,
+    });
+    const caller = appRouter.createCaller(ctx);
+    // Delete second — now only ctx.user (seed admin) remains.
+    await caller.users.delete({ id: second.id });
+    // Attempting to delete the last admin (self) must be refused.
+    await expect(
+      caller.users.delete({ id: ctx.user.id }),
+    ).rejects.toThrow(/last remaining admin|own account/);
   });
 });
 

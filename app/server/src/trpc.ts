@@ -1018,7 +1018,23 @@ const usersRouter = router({
     }))
     .output(publicUserSchema)
     .mutation(async ({ ctx, input }) => {
-      // Atomic semantics: Zyphr-register first; only insert the local row on
+      // Reactivation path: if a soft-deleted row exists for this email we can
+      // re-attach to the existing Zyphr account without re-registering. The
+      // admin-supplied password is intentionally ignored — the old Zyphr
+      // password still applies; the admin can use Reset Password afterward.
+      const deleted = db.getDeletedUserByEmail(input.email);
+      if (deleted) {
+        const row = db.reactivateUser({
+          id: deleted.id,
+          display_name: input.display_name,
+          role: input.role,
+          created_by: ctx.user.id,
+        });
+        return db.toPublicUser(row);
+      }
+
+      // Normal path: register at Zyphr first; only insert locally on 2xx.
+      // Atomicity contract: Zyphr-register first; only insert the local row on
       // a 2xx upstream response. Atomicity contract is here at Stage 1 so the
       // Stage 2a implementation has nowhere to drift.
       let registered;
@@ -1026,7 +1042,15 @@ const usersRouter = router({
         registered = await registerAccount(input.email, input.password, input.display_name);
       } catch (err) {
         if (err instanceof ZyphrEmailTaken) {
-          throw new TRPCError({ code: 'CONFLICT', message: 'email already registered' });
+          // True orphan: email exists at Zyphr but there is no local row (and
+          // no soft-deleted row — we checked above). An operator must purge the
+          // account in the Zyphr dashboard, or use a different email.
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message:
+              'email is registered with the auth provider but has no local account; ' +
+              'purge it in the Zyphr dashboard or use a different email',
+          });
         }
         throw err;
       }
@@ -1064,7 +1088,7 @@ const usersRouter = router({
     .output(publicUserSchema)
     .mutation(({ ctx, input }) => {
       const target = db.getUserById(input.id);
-      if (!target) {
+      if (!target || target.deleted_at !== null) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
       }
       // Refuse to demote the last remaining admin.
@@ -1116,7 +1140,7 @@ const usersRouter = router({
     .output(z.object({ ok: z.literal(true) }))
     .mutation(({ ctx, input }) => {
       const target = db.getUserById(input.id);
-      if (!target) {
+      if (!target || target.deleted_at !== null) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
       }
       if (target.role === 'admin' && db.countAdmins() <= 1) {
@@ -1149,7 +1173,7 @@ const usersRouter = router({
     .output(z.object({ ok: z.literal(true) }))
     .mutation(async ({ input }) => {
       const target = db.getUserById(input.id);
-      if (!target) {
+      if (!target || target.deleted_at !== null) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'user not found' });
       }
       await triggerForgotPassword(target.email);

@@ -238,9 +238,9 @@ export async function me(
     return;
   }
   const user = db.getUserById(session.user_id);
-  if (!user) {
-    // Race: session row exists but the user row was wiped (admin deleted them
-    // mid-flight). Treat as logged out.
+  if (!user || user.deleted_at !== null) {
+    // Race: session row exists but the user was deleted (hard or soft) since
+    // the session was issued. Treat as logged out.
     db.deleteSession(session.id);
     clearSessionCookie(reply);
     reply.code(401).send({ error: 'unauthenticated' });
