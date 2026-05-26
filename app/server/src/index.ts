@@ -444,7 +444,7 @@ function scheduleCronJobs(app: AppServer): ScheduledTask[] {
   const jobs: Array<{ name: string; spec: string; run: () => Promise<unknown> }> = [
     { name: 'snapshot-capture', spec: '*/2 22,23,0-5 * * *', run: () => runSnapshotCaptureJob() },
     { name: 'timelapse',        spec: '5 6 * * *',             run: () => runTimelapseJob() },
-    { name: 'recap',            spec: '58 23 * * *',          run: () => runRecapJob() },
+    { name: 'recap',            spec: '10 6 * * *',            run: () => runRecapJob() }, // 06:10 — after the 06:05 timelapse; window closes at 06:00
     { name: 'retention',        spec: '0 2 * * *',            run: () => runRetentionJob() },
     { name: 'disk-watch',       spec: '0 3 * * *',            run: () => runDiskWatchJob() },
   ];

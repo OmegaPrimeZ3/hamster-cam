@@ -1,6 +1,15 @@
 // app/server/src/jobs/recap.ts
-// Nightly 23:58 local: summarise the day's diary into a warm storybook
-// paragraph via Gemini and store it as a 'recap' diary entry. Idempotent.
+// Overnight recap — fires at 06:10 local (after the 06:05 timelapse) and
+// summarises what the hamster got up to between 21:00 the previous evening
+// and 06:00 this morning, producing a warm storybook paragraph via Gemini
+// stored as a 'recap' diary entry. Idempotent per night.
+//
+// Window: [nightStart, nightEnd) where
+//   nightEnd   = 06:00:00.000 local today  (same anchor the timelapse uses)
+//   nightStart = nightEnd − 9 h            = 21:00:00.000 local yesterday
+//
+// Date key: nightStart's local date (the evening the night began), so the
+// night of May 25 21:00 → May 26 06:00 is labelled "2026-05-25".
 //
 // Safety gate: if GEMINI_API_KEY is unset the job logs and returns without
 // throwing. Network errors are also swallowed — the narrator path must
@@ -17,7 +26,11 @@ const SKIP_ACTIVITIES: ReadonlySet<db.DiaryActivity> = new Set(['snapshot', 'tim
 const MIN_SOURCE_ENTRIES = 3;
 const FETCH_TIMEOUT_MS = 20_000;
 
+/** 9-hour overnight capture window: 21:00 → 06:00. */
+const NIGHT_WINDOW_MS = 9 * 60 * 60 * 1000;
+
 export interface RecapRunResult {
+  /** ISO YYYY-MM-DD of the night's START date (the evening the night began). */
   date: string;
   skipped: false | 'disabled' | 'no_api_key' | 'too_few_entries' | 'api_error';
   diary_entry_id: number | null;
@@ -30,19 +43,29 @@ export interface RecapDeps {
 }
 
 /**
- * Run the recap job for the given date. Default: today (the cron fires at
- * 23:58, so "today" is correct). Idempotent per date.
+ * Run the overnight recap job for the night ending at 06:00 on the reference
+ * time. Default: now (the cron fires at 06:10, so "now" is the morning after
+ * the night). Pass a fixed Date to pin the window for tests. Idempotent per
+ * night.
  */
 export async function runRecapJob(
-  date?: Date,
+  ref?: Date,
   deps: RecapDeps = {},
 ): Promise<RecapRunResult> {
   const cfg = getConfig();
   const fetchFn = deps.fetch ?? globalThis.fetch;
   const nowFn = deps.now ?? (() => Date.now());
 
-  const targetDate = date ?? new Date(nowFn());
-  const isoDate = toIsoDate(targetDate);
+  const refDate = ref ?? new Date(nowFn());
+
+  // nightEnd = 06:00:00.000 local today (same anchor the timelapse uses).
+  const nightEnd = localSixAM(refDate);
+  // nightStart = 21:00:00.000 local yesterday.
+  const nightStart = nightEnd - NIGHT_WINDOW_MS;
+
+  // Key the recap to the START of the night (the evening), matching the
+  // timelapse convention so both entries carry the same date label.
+  const isoDate = toIsoDate(new Date(nightStart));
 
   const recapEnabledRaw = db.getSetting('recap_enabled');
   if (recapEnabledRaw === 'false' || recapEnabledRaw === '0') {
@@ -55,18 +78,15 @@ export async function runRecapJob(
     return { date: isoDate, skipped: 'no_api_key', diary_entry_id: null };
   }
 
-  const dayStart = startOfLocalDay(targetDate);
-  const dayEnd = dayStart + 24 * 60 * 60 * 1000;
-
-  const allEntries = db.listDiaryEntriesBetween(dayStart, dayEnd);
+  const allEntries = db.listDiaryEntriesBetween(nightStart, nightEnd);
   const sourceEntries = allEntries.filter(
     (e) => !SKIP_KINDS.has(e.kind) && (e.activity == null || !SKIP_ACTIVITIES.has(e.activity)),
   );
 
   if (sourceEntries.length < MIN_SOURCE_ENTRIES) {
     logger.info(
-      { job: 'recap', date: isoDate, entries: sourceEntries.length, skipped: 'too_few_entries' },
-      'recap skipped — not enough source entries',
+      { job: 'recap', night: isoDate, entries: sourceEntries.length, skipped: 'too_few_entries' },
+      'overnight recap skipped — not enough source entries',
     );
     return { date: isoDate, skipped: 'too_few_entries', diary_entry_id: null };
   }
@@ -79,12 +99,17 @@ export async function runRecapJob(
   try {
     recapText = await callGemini(cfg.GEMINI_API_KEY, cfg.GEMINI_MODEL ?? 'gemini-2.0-flash', prompt, fetchFn);
   } catch (err) {
-    logger.warn({ job: 'recap', date: isoDate, err: (err as Error).message }, 'recap API call failed');
+    logger.warn({ job: 'recap', night: isoDate, err: (err as Error).message }, 'overnight recap API call failed');
     return { date: isoDate, skipped: 'api_error', diary_entry_id: null };
   }
 
-  const entry = db.replaceRecapEntry(dayStart, dayEnd, {
-    occurred_at: dayEnd - 2,
+  // occurred_at = nightEnd − 1 so the recap entry lands at 05:59:59.999 —
+  // inside the morning's activity.today window (after 00:00 local) and just
+  // after the timelapse entry (nightEnd − 1 shared with timelapse; recap is
+  // written at nightEnd − 1 as well, relying on the frontend's kind-based
+  // sort tiebreak to place recap above timelapse when timestamps are equal).
+  const entry = db.replaceRecapEntry(nightStart, nightEnd, {
+    occurred_at: nightEnd - 1,
     kind: 'recap',
     activity: 'recap',
     narrative: recapText,
@@ -100,8 +125,8 @@ export async function runRecapJob(
   });
 
   logger.info(
-    { job: 'recap', date: isoDate, entry_id: entry.id, model: entry.ai_model },
-    'recap produced',
+    { job: 'recap', night: isoDate, entry_id: entry.id, model: entry.ai_model },
+    'overnight recap produced',
   );
   return { date: isoDate, skipped: false, diary_entry_id: entry.id };
 }
@@ -168,17 +193,22 @@ function buildBulletList(entries: db.DiaryEntryRow[]): string {
 function buildPrompt(petName: string, bulletList: string): string {
   return (
     `You are writing one short, warm, child-friendly storybook paragraph (2–4 sentences) ` +
-    `about a day in the life of a pet hamster named ${petName}. ` +
-    `Use only the facts in the day's activity log below. ` +
+    `about what the pet hamster ${petName} got up to overnight. ` +
+    `Use only the facts in the activity log below. ` +
     `Write in past tense, third person. Do not invent new facts. ` +
     `Keep it under 80 words. End on a cozy note.\n\n` +
-    `Today's activity log:\n${bulletList}`
+    `Last night's activity log:\n${bulletList}`
   );
 }
 
-function startOfLocalDay(d: Date): number {
-  const copy = new Date(d);
-  copy.setHours(0, 0, 0, 0);
+/**
+ * Return a timestamp for 06:00:00.000 local time on the same calendar day as
+ * `ref`. Mirrors the identical helper in jobs/timelapse.ts — kept here so
+ * recap.ts has no import dependency on that module.
+ */
+function localSixAM(ref: Date): number {
+  const copy = new Date(ref);
+  copy.setHours(6, 0, 0, 0);
   return copy.getTime();
 }
 
