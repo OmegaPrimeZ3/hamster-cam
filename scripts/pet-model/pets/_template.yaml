@@ -28,6 +28,23 @@ datasets:
   #   project: another-project
   #   version: 2
 
+# Optional LOCAL sources — real frames you harvested yourself (e.g. off the live
+# Frigate host). Folded in AFTER the Roboflow merge, de-duped against everything.
+#   role: positive -> <path>/images + <path>/labels (YOLOv8 layout; labels get
+#                     remapped to class 0 like any other source).
+#   role: negative -> <path>/images only; emitted as YOLO *background* (empty
+#                     label) so the model learns NOT to fire on reflections/glints.
+# local_sources:
+#   - path: ~/pet-models/pet/local/cage_pos
+#     role: positive
+#   - path: ~/pet-models/pet/local/cage_neg
+#     role: negative
+
+# Duplicate LOCAL samples this many times in the TRAIN split so scarce real
+# frames aren't drowned out by the larger public sets. Val is never oversampled
+# (honest metrics). 1 = off. Try 3–5 once you have local frames.
+local_oversample: 1
+
 # --- Training knobs (defaults are tuned for Frigate/OpenVINO at 320px) ---
 base_model: yolov9t.pt   # tiny. Bump to yolov9s.pt if Gate B mAP50 < 0.85.
 imgsz: 320               # Frigate yolo-generic input. Keep 320 unless you know better.
