@@ -99,7 +99,7 @@ export async function checkLiveSrc(src: string): Promise<{ ok: boolean }> {
 }
 
 // ---------------------------------------------------------------------------
-// /api/stats — per-camera last-frame timestamp
+// /api/stats — per-camera last-frame timestamp, background-polled cache
 // ---------------------------------------------------------------------------
 
 // Frigate stats includes `cameras.<name>.camera_fps` and `process_fps`,
@@ -118,29 +118,132 @@ interface FrigateStats {
   cameras?: Record<string, FrigateStatsCameraEntry>;
 }
 
-export async function getCameraStats(cameraName: string): Promise<CameraStats> {
-  // Prefer the per-camera REST reading when Frigate is reachable; fall back
-  // to the MQTT heartbeat published by mqtt.ts. Either source missing yields
-  // `null`, which the frontend renders as the napping/offline state.
-  const stats = await frigateFetch<FrigateStats>('/api/stats');
-  const entry = stats?.cameras?.[cameraName];
-  // Prefer an explicit per-camera last_frame_time when present. Otherwise treat
-  // a positive camera_fps as "live right now": Frigate 0.17's /api/stats reports
-  // camera_fps per camera (and NOT last_frame_time), and a non-zero rate means
-  // it's actively pulling frames. Without this, last_frame_time being absent
-  // leaves restLast null and grid tiles never reach the 'live' state (the
-  // maximized view plays regardless, which is why single-camera worked).
-  const restLast = typeof entry?.last_frame_time === 'number'
+// How often the background poller re-fetches /api/stats.
+const STATS_POLL_INTERVAL_MS = 5_000;
+
+// Module-level cache populated by the background poller.
+// `cameras.list` reads this synchronously — no network round-trip per request.
+const statsCache = new Map<string, CameraStats>();
+
+let _pollerHandle: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Parse a single FrigateStatsCameraEntry into CameraStats.
+ * Extracted so the poller and the tests share the same logic.
+ */
+function parseStatsCameraEntry(entry: FrigateStatsCameraEntry | undefined): CameraStats {
+  const lastFrameAt = typeof entry?.last_frame_time === 'number'
     ? Math.round(entry.last_frame_time * 1000)
     : typeof entry?.camera_fps === 'number' && entry.camera_fps > 0
       ? Date.now()
       : null;
-  const heartbeatLast = getCameraHeartbeat(cameraName);
-  const lastFrameAt = restLast ?? heartbeatLast;
   return {
     lastFrameAt,
     fps: typeof entry?.camera_fps === 'number' ? entry.camera_fps : null,
   };
+}
+
+export interface PollFrigateStatsDeps {
+  /**
+   * Override the Frigate base URL. When provided, the function skips
+   * `getConfig()` entirely — used by unit tests that run without a full env.
+   */
+  frigateUrl?: string;
+  /** Override global fetch — used by unit tests to inject a fake response. */
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * Runs one poll cycle: fetch /api/stats and write each camera's parsed stats
+ * into the module-level cache. Exported for direct use in tests.
+ * Returns the raw parsed stats map (camera name → CameraStats) so tests can
+ * inspect the result without coupling to the module cache.
+ *
+ * `deps.frigateUrl` + `deps.fetchFn` allow tests to inject a URL and fake
+ * fetch without touching global state or needing a full env setup.
+ */
+export async function pollFrigateStats(deps: PollFrigateStatsDeps = {}): Promise<Map<string, CameraStats>> {
+  const result = new Map<string, CameraStats>();
+
+  // Resolve the Frigate URL: explicit dep (tests) → config (production).
+  const frigateUrl = deps.frigateUrl ?? (() => {
+    const cfg = getConfig();
+    return cfg.FRIGATE_URL;
+  })();
+  if (!frigateUrl) return result;
+
+  const doFetch = deps.fetchFn ?? fetch;
+  const url = new URL('/api/stats', frigateUrl).toString();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), DEFAULT_FETCH_TIMEOUT_MS);
+  let stats: FrigateStats | null = null;
+  try {
+    const res = await doFetch(url, { signal: ctrl.signal });
+    if (res.ok) stats = (await res.json()) as FrigateStats;
+  } catch {
+    // Frigate unreachable — leave cache as-is, return empty map.
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!stats?.cameras) return result;
+  for (const [name, entry] of Object.entries(stats.cameras)) {
+    const parsed = parseStatsCameraEntry(entry);
+    statsCache.set(name, parsed);
+    result.set(name, parsed);
+  }
+  return result;
+}
+
+/**
+ * Read cached Frigate stats for a camera SYNCHRONOUSLY.
+ * Preserves the old getCameraStats semantics: the REST/stats value is
+ * preferred, but the MQTT heartbeat is used as a fallback whenever
+ * `lastFrameAt` is null — whether from a missing cache entry (server just
+ * started / Frigate never reached) OR from a present-but-null entry (Frigate
+ * lists the camera but camera_fps is 0 and there is no last_frame_time).
+ */
+export function getCachedCameraStats(cameraName: string): CameraStats {
+  const cached = statsCache.get(cameraName);
+  const restLast = cached?.lastFrameAt ?? null;
+  const lastFrameAt = restLast ?? getCameraHeartbeat(cameraName);
+  return { lastFrameAt, fps: cached?.fps ?? null };
+}
+
+/**
+ * Start the background stats poller. Must be called once at server boot.
+ * Safe to call with no FRIGATE_URL — logs a warning and returns immediately
+ * without scheduling any timer (mirrors the frigateFetch guard).
+ */
+export function startFrigateStatsPoller(): void {
+  const cfg = getConfig();
+  if (!cfg.FRIGATE_URL) {
+    // No Frigate configured — cache stays empty, getCachedCameraStats falls
+    // back to MQTT heartbeat. This is correct degraded-mode behaviour.
+    return;
+  }
+  if (_pollerHandle !== null) return; // already running
+
+  // Fire once immediately so the cache is warm before the first request.
+  void pollFrigateStats();
+
+  _pollerHandle = setInterval(() => {
+    void pollFrigateStats();
+  }, STATS_POLL_INTERVAL_MS);
+
+  // Don't let the timer prevent a clean process exit.
+  _pollerHandle.unref();
+}
+
+/**
+ * Stop the background stats poller. Called during graceful shutdown or in tests.
+ */
+export function stopFrigateStatsPoller(): void {
+  if (_pollerHandle !== null) {
+    clearInterval(_pollerHandle);
+    _pollerHandle = null;
+  }
+  statsCache.clear();
 }
 
 // ---------------------------------------------------------------------------

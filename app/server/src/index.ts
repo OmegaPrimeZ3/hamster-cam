@@ -47,6 +47,7 @@ import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
 import { initVapidKeys } from './push.js';
+import { startFrigateStatsPoller, stopFrigateStatsPoller } from './frigate.js';
 import { closeWss, registerLiveWsProxy } from './live-ws.js';
 import { resolveSession } from './session.js';
 import { appRouter, createContext } from './trpc.js';
@@ -387,6 +388,7 @@ export async function startRuntime(): Promise<RuntimeHandles> {
     mqtt = { ready: async () => {}, close: async () => {} };
   }
 
+  startFrigateStatsPoller();
   const crons = scheduleCronJobs(app);
 
   await app.listen({ port: cfg.PORT, host: '0.0.0.0' });
@@ -438,6 +440,7 @@ async function shutdown(handles: RuntimeHandles, sig: string): Promise<void> {
   for (const t of handles.crons) {
     try { t.stop(); } catch { /* noop */ }
   }
+  stopFrigateStatsPoller();
 
   // 2. Flush the narrator's in-memory coalescing window to the DB.
   try {

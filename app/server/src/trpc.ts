@@ -501,26 +501,20 @@ const settingsRouter = router({
 // ---------------------------------------------------------------------------
 
 const camerasRouter = router({
-  // List + last_frame_at per camera. Lookup via frigate.getCameraStats is best-
-  // effort: if Frigate isn't reachable, lastFrameAt is null and the frontend
-  // renders the napping/offline state — exactly the desired degradation.
+  // List + last_frame_at per camera. Uses the background stats poller cache so
+  // this resolves synchronously in microseconds — no Frigate network round-trip
+  // in the request path. If Frigate is unreachable the cache entry is absent and
+  // getCachedCameraStats falls back to the MQTT heartbeat, yielding null when
+  // both are unavailable — the frontend renders the napping/offline state.
   list: protectedProcedure
     .input(z.void())
     .output(z.array(cameraSchema))
-    .query(async () => {
+    .query(() => {
       const rows = db.listCameras();
-      return Promise.all(
-        rows.map(async (row): Promise<CameraDTO> => {
-          let lastFrameAt: number | null = null;
-          try {
-            const stats = await frigate.getCameraStats(row.live_src ?? row.name);
-            lastFrameAt = stats.lastFrameAt;
-          } catch {
-            lastFrameAt = null;
-          }
-          return cameraToDTO(row, lastFrameAt);
-        }),
-      );
+      return rows.map((row): CameraDTO => {
+        const stats = frigate.getCachedCameraStats(row.live_src ?? row.name);
+        return cameraToDTO(row, stats.lastFrameAt);
+      });
     }),
 
   create: adminProcedure

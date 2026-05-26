@@ -27,7 +27,17 @@ export function CameraGrid({ onAdminOpenCameras }: CameraGridProps): JSX.Element
     [cameras.data],
   );
 
-  if (cameras.isLoading) {
+  // Show the loading skeleton while the first fetch is in flight OR while a
+  // cold fetch has errored/is retrying with no data yet. We must NOT fall
+  // through to the "set up your first camera" prompt on a transient failure:
+  // in TanStack Query v4 the query only leaves `isLoading` once all retries are
+  // exhausted, and on error `data` stays undefined — which used to render a
+  // scary false "no cameras" message for ~20-30s until the 15s background
+  // refetch healed it (same client-side recovery gap as the settings flow —
+  // see project_web_resilience). Gating on `data === undefined` keys off the
+  // real signal: React Query keeps `data` populated across later refetch
+  // errors, so this only covers the genuine cold-start window.
+  if (cameras.data === undefined) {
     return (
       <section aria-label="Cameras" style={gridStyle}>
         {[0, 1, 2].map((i) => (
@@ -37,6 +47,7 @@ export function CameraGrid({ onAdminOpenCameras }: CameraGridProps): JSX.Element
     );
   }
 
+  // Genuinely zero cameras: the query succeeded and returned an empty list.
   if (list.length === 0) {
     return (
       <section className="hc-card" style={{ padding: 24, textAlign: 'center' }}>
