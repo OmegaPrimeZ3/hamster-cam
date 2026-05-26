@@ -49,21 +49,39 @@ datasets:
 #     project: hamster-and-guinea-pig
 #     version: 3
 #
-# Real cage frames harvested off the live host (Phases G+H). NIGHT batch of 523
-# positives already staged at ~/pet-models/hamster/local/cage_pos (auto-labeled,
-# AWAITING [HUMAN] box-review + daytime frames). Enable after review:
-# local_sources:
-#   - path: ~/pet-models/hamster/local/cage_pos
-#     role: positive
-#   - path: ~/pet-models/hamster/local/cage_neg
-#     role: negative
-# local_oversample: 4   # up-weight scarce cage frames vs the larger public pool
+# --- v3 precision pass (docs/HAMSTER_MODEL_TUNING.md Phase H) ---
+# Background NEGATIVES harvested from the live cage: empty cage, white bedding
+# fluff, the wooden house, glass/water reflections — the exact static objects the
+# v1/v2 model false-fires on (confirmed in Frigate events, scoring ~71–77%).
+# Negatives need no boxes; they teach the model "no hamster here," killing the
+# false positives at the source. The 523 NIGHT positives at cage_pos stay OUT
+# until [HUMAN] box-review — the current model's auto-labels are contaminated
+# with these same false fires, so training on them unreviewed would teach
+# fluff/house == hamster. Re-enable cage_pos for a later recall pass.
+local_sources:
+  - path: ~/pet-models/hamster/local/cage_neg
+    role: negative
+  # - path: ~/pet-models/hamster/local/cage_pos   # enable after box-review (recall pass)
+  #   role: positive
+local_oversample: 3   # up-weight the scarce local frames vs the ~2700 public pool
+
+# Phase I domain augmentation — forwarded to Ultralytics model.train() verbatim.
+# Simulates the day↔night/IR brightness range and the camera's ~45° angle.
+augment:
+  hsv_v: 0.5      # brightness jitter — highest-value aug for day/night robustness
+  hsv_s: 0.4
+  degrees: 8
+  scale: 0.5
+  translate: 0.1
+  fliplr: 0.5
+  flipud: 0.0     # a hamster is never upside-down to the camera
+  close_mosaic: 10
 
 base_model: yolov9t.pt
 imgsz: 320
-epochs: 120
+epochs: 150
 batch: 32
-patience: 30
+patience: 50
 device: mps
 val_split: 0.20
 

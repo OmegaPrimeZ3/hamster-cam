@@ -56,12 +56,21 @@ def train(cfg: dict, work_dir: Path, data_yaml: Path) -> tuple[Path, dict]:
     run_name = f"{cfg['class_name']}_y9"
     runs_dir = work_dir / "runs"
 
+    # Optional domain augmentation (docs/HAMSTER_MODEL_TUNING.md Phase I). Any keys
+    # under `augment:` in the pet YAML are forwarded verbatim to Ultralytics
+    # model.train(); the core args below win on conflict (setdefault).
+    aug = cfg.get("augment") or {}
+    if not isinstance(aug, dict):
+        sys.exit("FATAL: config 'augment' must be a mapping of Ultralytics train args.")
+
     log(
         f"training {base_model} imgsz={imgsz} epochs={epochs} batch={batch} "
         f"device={device} -> {runs_dir}/{run_name}"
     )
+    if aug:
+        log(f"augmentation overrides: {aug}")
     model = YOLO(base_model)
-    results = model.train(
+    train_kwargs = dict(
         data=str(data_yaml),
         imgsz=imgsz,
         epochs=epochs,
@@ -72,6 +81,9 @@ def train(cfg: dict, work_dir: Path, data_yaml: Path) -> tuple[Path, dict]:
         name=run_name,
         exist_ok=True,
     )
+    for k, v in aug.items():
+        train_kwargs.setdefault(k, v)
+    results = model.train(**train_kwargs)
 
     best = runs_dir / run_name / "weights" / "best.pt"
     if not best.exists():
