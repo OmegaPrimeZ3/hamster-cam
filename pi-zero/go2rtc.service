@@ -10,6 +10,19 @@ Type=simple
 # secret here rather than on the ExecStart command line keeps it out of
 # /proc/<pid>/cmdline and out of `ps` output.
 EnvironmentFile=/etc/go2rtc/go2rtc.env
+# Anti-flicker / anti-banding: US mains run at 60 Hz, so the sensor's
+# electronic rolling shutter beats against the light cycle and produces
+# horizontal wavy "heat-haze" distortion under artificial light.
+# power_line_frequency=2 → 60 Hz; =1 → 50 Hz (UK/EU). This must be set
+# BEFORE go2rtc/ffmpeg opens /dev/video0, which is why it lives in
+# ExecStartPre rather than a one-shot post-start. The leading `-` means
+# "ignore a non-zero exit" — if this Pi's sensor driver doesn't expose the
+# control (e.g. a substitute camera module) the failure is absorbed and
+# go2rtc still starts. Path /usr/bin/v4l2-ctl is from the Debian bookworm
+# v4l-utils package; run `which v4l2-ctl` on the Pi if a future OS upgrade
+# moves it. Re-applied on every start, so it survives the watchdog restarts
+# and the documented cam2 random reboots.
+ExecStartPre=-/usr/bin/v4l2-ctl -d /dev/video0 --set-ctrl=power_line_frequency=2
 ExecStart=/usr/local/bin/go2rtc -config /etc/go2rtc/go2rtc.yaml
 Restart=always
 RestartSec=5
