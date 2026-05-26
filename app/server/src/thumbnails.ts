@@ -159,9 +159,14 @@ async function thumbnailFromFrigateFrame(
   const camera = db.getCameraById(cameraId);
   if (!camera) return null;
 
+  // Sample mid-activity: occurred_at is the END of the narrative; bias the
+  // frame back by half the duration so the hamster is reliably visible.
+  const dur = entry.duration_ms ?? 0;
+  const atMs = entry.occurred_at - Math.floor(dur / 2);
+
   const result = await extractFrame({
     cameraName: camera.live_src ?? camera.name,
-    atMs: entry.occurred_at,
+    atMs,
     widthPx: THUMB_WIDTH,
   });
 

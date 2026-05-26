@@ -61,9 +61,24 @@ export async function ensureClip(entry: db.DiaryEntryRow): Promise<EnsureClipRes
     );
   }
 
+  // Center the clip on the MIDDLE of the activity so the hamster is in-frame
+  // rather than just leaving.  occurred_at is the END of the activity, so the
+  // midpoint is occurred_at − duration/2.  For zero/null duration this
+  // collapses back to occurred_at (safe; Frigate window covers a bit of lead-in
+  // via the minimum durationMs below).
+  const dur = entry.duration_ms ?? 0;
+  const centerMs = entry.occurred_at - Math.floor(dur / 2);
+
+  // Adaptive window: cover the full activity + 4 s of headroom, clamped to
+  // [8 s, 20 s].  A 6 s food visit → 10 s clip; an 8-min wheel run → 20 s
+  // clip centred mid-run.  The 10 s default in extractClip is kept for callers
+  // (e.g. future share-clip paths) that skip this layer.
+  const clampedDurationMs = Math.max(8_000, Math.min(20_000, dur + 4_000));
+
   const extracted = await extractClip({
     cameraName: camera.live_src ?? camera.name,
-    centerMs: entry.occurred_at,
+    centerMs,
+    durationMs: clampedDurationMs,
   });
 
   // Convert the absolute path returned by extractClip to a STORAGE_PATH-relative path.

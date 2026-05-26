@@ -112,7 +112,7 @@ describe('ensureClip', () => {
     expect(extractClip).not.toHaveBeenCalled();
   });
 
-  it('calls extractClip and persists the result when no cache and no video media', async () => {
+  it('calls extractClip with midpoint centerMs and adaptive durationMs for a narrative entry', async () => {
     const db = await import('../src/db.js');
     const { ensureClip } = await import('../src/clips.js');
     const frigateModule = await import('../src/frigate.js');
@@ -126,8 +126,11 @@ describe('ensureClip', () => {
       live_src: 'testcam',
       enabled: true,
     });
+    // Entry: occurred_at=10000 ms (end of activity), duration=6000 ms.
+    // Expected: centerMs = 10000 - floor(6000/2) = 7000
+    //           durationMs = clamp(6000 + 4000, 8000, 20000) = 10000
     const entry = db.createDiaryEntry({
-      occurred_at: Date.now(),
+      occurred_at: 10_000,
       kind: 'narrative',
       activity: 'wheel',
       narrative: 'running',
@@ -135,7 +138,7 @@ describe('ensureClip', () => {
       camera_id: camera.id,
       from_camera_id: null,
       to_camera_id: null,
-      duration_ms: 5000,
+      duration_ms: 6_000,
       snapshot_id: null,
       media_path: null,
       details: null,
@@ -150,11 +153,95 @@ describe('ensureClip', () => {
     const result = await ensureClip(entry);
 
     expect(extractClip).toHaveBeenCalledOnce();
+    const callArg = extractClip.mock.calls[0]![0] as { centerMs: number; durationMs: number };
+    expect(callArg.centerMs).toBe(7_000);   // midpoint = occurred_at − dur/2
+    expect(callArg.durationMs).toBe(10_000); // clamp(6000+4000, 8000, 20000) = 10000
     expect(result.relPath).toContain('clips');
 
     // Check it was persisted in the DB.
     const refreshed = db.getDiaryEntryById(entry.id);
     expect(refreshed?.clip_path).toBe(result.relPath);
+  });
+
+  it('uses occurred_at as centerMs and 8000 ms window when duration_ms is null', async () => {
+    const db = await import('../src/db.js');
+    const { ensureClip } = await import('../src/clips.js');
+    const frigateModule = await import('../src/frigate.js');
+    const extractClip = vi.mocked(frigateModule.extractClip);
+
+    const camera = db.createCamera({
+      name: 'nulldur',
+      emoji: '📷',
+      stream_url: 'rtsp://nulldur',
+      live_src: 'nulldur',
+      enabled: true,
+    });
+    const entry = db.createDiaryEntry({
+      occurred_at: 50_000,
+      kind: 'narrative',
+      activity: 'food',
+      narrative: 'eating',
+      pet_name: null,
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: null,   // no duration recorded
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+
+    const extractedAbs = join(workdir, 'clips', 'nulldur-0-8.mp4');
+    writeFileSync(extractedAbs, Buffer.alloc(16));
+    extractClip.mockResolvedValueOnce({ path: extractedAbs, duration_ms: 8_000 });
+
+    await ensureClip(entry);
+
+    const callArg = extractClip.mock.calls[0]![0] as { centerMs: number; durationMs: number };
+    // dur=0, so centerMs = occurred_at − 0 = 50000; durationMs = clamp(0+4000,8000,20000)=8000
+    expect(callArg.centerMs).toBe(50_000);
+    expect(callArg.durationMs).toBe(8_000);
+  });
+
+  it('clamps durationMs to 20000 for very long activities', async () => {
+    const db = await import('../src/db.js');
+    const { ensureClip } = await import('../src/clips.js');
+    const frigateModule = await import('../src/frigate.js');
+    const extractClip = vi.mocked(frigateModule.extractClip);
+
+    const camera = db.createCamera({
+      name: 'longrun',
+      emoji: '🐹',
+      stream_url: 'rtsp://longrun',
+      live_src: 'longrun',
+      enabled: true,
+    });
+    // 8-minute (480000 ms) wheel run — clamp should cap durationMs at 20000.
+    // centerMs = 600000 − floor(480000/2) = 600000 − 240000 = 360000
+    const entry = db.createDiaryEntry({
+      occurred_at: 600_000,
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'marathon session',
+      pet_name: null,
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 480_000,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+
+    const extractedAbs = join(workdir, 'clips', 'longrun-350-370.mp4');
+    writeFileSync(extractedAbs, Buffer.alloc(16));
+    extractClip.mockResolvedValueOnce({ path: extractedAbs, duration_ms: 20_000 });
+
+    await ensureClip(entry);
+
+    const callArg = extractClip.mock.calls[0]![0] as { centerMs: number; durationMs: number };
+    expect(callArg.centerMs).toBe(360_000); // mid-run
+    expect(callArg.durationMs).toBe(20_000); // capped
   });
 
   it('re-extracts when cached file is missing from disk', async () => {

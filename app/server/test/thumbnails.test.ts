@@ -185,7 +185,7 @@ describe('generateThumbnailForEntry', () => {
     expect(args).toContain('1');
   });
 
-  it("calls extractFrame for 'narrative' entries with a resolvable camera", async () => {
+  it("calls extractFrame at mid-activity time for 'narrative' entries with a resolvable camera", async () => {
     const db = await import('../src/db.js');
     const { generateThumbnailForEntry } = await import('../src/thumbnails.js');
     const frigateModule = await import('../src/frigate.js');
@@ -199,14 +199,15 @@ describe('generateThumbnailForEntry', () => {
       enabled: true,
     });
 
-    // extractFrame mock: override for this test to return captured:true.
-    const thumbRel = join('thumbnails', 'cam-narrative-999.jpg');
+    // Entry: occurred_at=10000 ms (end of activity), duration_ms=6000.
+    // Expected atMs = 10000 − floor(6000/2) = 7000  (middle of activity).
+    const thumbRel = join('thumbnails', 'cam-narrative-7000.jpg');
     const thumbAbs = join(workdir, thumbRel);
     writeFileSync(thumbAbs, Buffer.alloc(16));
     extractFrame.mockResolvedValueOnce({ path: thumbRel, captured: true });
 
     const entry = db.createDiaryEntry({
-      occurred_at: 999,
+      occurred_at: 10_000,
       kind: 'narrative',
       activity: 'wheel',
       narrative: 'spinning',
@@ -214,7 +215,7 @@ describe('generateThumbnailForEntry', () => {
       camera_id: camera.id,
       from_camera_id: null,
       to_camera_id: null,
-      duration_ms: 5000,
+      duration_ms: 6_000,
       snapshot_id: null,
       media_path: null,
       details: null,
@@ -225,7 +226,50 @@ describe('generateThumbnailForEntry', () => {
     expect(extractFrame).toHaveBeenCalledOnce();
     const callArg = extractFrame.mock.calls[0]![0] as { cameraName: string; atMs: number };
     expect(callArg.cameraName).toBe('cam-narrative');
-    expect(callArg.atMs).toBe(999);
+    // Must be mid-activity, not the end.
+    expect(callArg.atMs).toBe(7_000);
+  });
+
+  it("uses occurred_at as atMs when duration_ms is null for 'narrative' entries", async () => {
+    const db = await import('../src/db.js');
+    const { generateThumbnailForEntry } = await import('../src/thumbnails.js');
+    const frigateModule = await import('../src/frigate.js');
+    const extractFrame = vi.mocked(frigateModule.extractFrame);
+
+    const camera = db.createCamera({
+      name: 'cam-nodur',
+      emoji: '📷',
+      stream_url: 'rtsp://cam-nodur',
+      live_src: 'cam-nodur',
+      enabled: true,
+    });
+
+    const thumbRel = join('thumbnails', 'cam-nodur-5000.jpg');
+    const thumbAbs = join(workdir, thumbRel);
+    writeFileSync(thumbAbs, Buffer.alloc(16));
+    extractFrame.mockResolvedValueOnce({ path: thumbRel, captured: true });
+
+    const entry = db.createDiaryEntry({
+      occurred_at: 5_000,
+      kind: 'narrative',
+      activity: 'food',
+      narrative: 'eating',
+      pet_name: null,
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: null,  // no duration
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+
+    await generateThumbnailForEntry(entry);
+
+    expect(extractFrame).toHaveBeenCalledOnce();
+    const callArg = extractFrame.mock.calls[0]![0] as { cameraName: string; atMs: number };
+    // dur=0, so atMs = occurred_at − 0 = 5000 (unchanged)
+    expect(callArg.atMs).toBe(5_000);
   });
 
   it("skips silently for 'narrative' with no camera (no throw)", async () => {
