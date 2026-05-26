@@ -105,7 +105,7 @@ if [[ -z "$MAC_MINI_HOST" || -z "$MAC_MINI_USER" ]]; then
     cat >&2 <<EOF
 deploy.sh: MAC_MINI_HOST and MAC_MINI_USER must be set.
 Either populate them in .env at the repo root or pass them inline:
-  MAC_MINI_HOST=hamster-mac.local MAC_MINI_USER=omegaprime ./deploy.sh
+  MAC_MINI_HOST=hamster-mac.local MAC_MINI_USER=YOUR_USERNAME ./deploy.sh
 EOF
     exit 2
 fi
@@ -248,7 +248,7 @@ rsync_cmd pi-zero/ "${REMOTE}:${MAC_MINI_PATH}/pi-zero-staging/"
 #    `docker compose up -d` is idempotent and will only recreate services
 #    whose image or config changed. The new image load in step 1 changes
 #    the image digest, which triggers hamster-app recreation automatically.
-#    No sudo needed — omegaprime is in the docker group.
+#    No sudo needed — YOUR_USERNAME is in the docker group.
 # ----------------------------------------------------------------------
 log "remote: docker compose up"
 ssh_cmd "bash -se" <<EOREMOTE

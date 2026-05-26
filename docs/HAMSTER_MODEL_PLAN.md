@@ -119,7 +119,7 @@ the layout against Frigate's `yolo-generic` decoder (ref: Frigate Discussion
 
 1. **Labelmap** — `mac-mini/models/hamster.txt` (single line: `hamster`).
 2. **Ship the model** to the host model cache:
-   `scp best.onnx omegaprime@project-server:/opt/hamster-cam/storage/model_cache/hamster_y9.onnx`
+   `scp best.onnx YOUR_USERNAME@project-server:/opt/hamster-cam/storage/model_cache/hamster_y9.onnx`
    (mount it into Frigate at `/config/model_cache/` — add the bind-mount + the
    labelmap mount in `mac-mini/docker-compose.yml` if not already mapped).
 3. **Edit `mac-mini/frigate-config.yml`:**
@@ -140,7 +140,7 @@ the layout against Frigate's `yolo-generic` decoder (ref: Frigate Discussion
    Update both `hamster_cam_1` / `hamster_cam_2` per-camera `objects` blocks the
    same way. Keep `detectors.ov` (`openvino`, `device: GPU`).
 4. **Deploy:** `./deploy.sh --sync-frigate-config` (backs up the remote first) +
-   ship the model, then `ssh omegaprime@project-server 'cd /opt/hamster-cam && docker compose restart frigate'`.
+   ship the model, then `ssh YOUR_USERNAME@project-server 'cd /opt/hamster-cam && docker compose restart frigate'`.
 
 ## 7. Phase E — Verify (autonomous checks + one [HUMAN] look)
 
@@ -183,6 +183,6 @@ and `docker compose restart frigate`.
 ## How to run this
 
 Hand this file to an agent with: a `ROBOFLOW_API_KEY`, Bash on the dev Mac, and
-SSH to `omegaprime@project-server`. It executes Phases A→E autonomously, pausing
+SSH to `YOUR_USERNAME@project-server`. It executes Phases A→E autonomously, pausing
 only at the **[HUMAN]** gates (API key up front, final visual sign-off, and the
 optional Phase F label review).

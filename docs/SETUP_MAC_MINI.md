@@ -61,7 +61,7 @@ Linux installation. Use the [t2linux.org Ubuntu guide](https://wiki.t2linux.org/
    - Install OpenSSH Server (you will not want a monitor attached
      to the Mini after first boot).
    - Skip the snap selections.
-   - Create a user (e.g. `omegaprime`) with a strong password.
+   - Create a user (e.g. `YOUR_USERNAME`) with a strong password.
 
 5. **After install, on the Mac Mini console:**
 
@@ -74,14 +74,14 @@ Linux installation. Use the [t2linux.org Ubuntu guide](https://wiki.t2linux.org/
 6. **From your dev machine, SSH in:**
 
    ```sh
-   ssh omegaprime@<mac-mini-ip>
+   ssh YOUR_USERNAME@<mac-mini-ip>
    ```
 
 7. **Set up SSH key auth** so you stop typing the password:
 
    ```sh
    # On the dev machine
-   ssh-copy-id omegaprime@<mac-mini-ip>
+   ssh-copy-id YOUR_USERNAME@<mac-mini-ip>
    ```
 
 8. **Reserve a static DHCP lease** for the Mac Mini in your router
@@ -126,7 +126,7 @@ iGPU driver is one of the things their patches may need.
 
 ```sh
 # On the Mac Mini
-# Chown to the user that deploy.sh SSHes in as (here: omegaprime).
+# Chown to the user that deploy.sh SSHes in as (here: YOUR_USERNAME).
 # The container's bind-mounts under ./db and ./storage must be owned
 # by the same UID the container runs as (see HOST_UID in .env.example).
 sudo mkdir -p /opt/hamster-cam/{storage,db,storage/timelapse}
@@ -152,7 +152,7 @@ authoritative annotated reference.
 
 ```sh
 # From the dev machine
-scp .env.example omegaprime@<mac-mini-ip>:/opt/hamster-cam/.env
+scp .env.example YOUR_USERNAME@<mac-mini-ip>:/opt/hamster-cam/.env
 
 # On the Mac Mini
 chmod 600 /opt/hamster-cam/.env
@@ -188,7 +188,7 @@ can copy manually:
 
 ```sh
 # From the dev machine, in the repo root
-rsync -av mac-mini/ omegaprime@<mac-mini-ip>:/opt/hamster-cam/
+rsync -av mac-mini/ YOUR_USERNAME@<mac-mini-ip>:/opt/hamster-cam/
 ```
 
 Every config lands at the **project root** (`/opt/hamster-cam/`),
@@ -472,8 +472,8 @@ sudo chown -R 1001:1001 /opt/hamster-cam/storage
 Also confirm the deploy user is in the `docker` group:
 
 ```sh
-groups omegaprime   # must include "docker"
-# If not: sudo usermod -aG docker omegaprime && newgrp docker
+groups YOUR_USERNAME   # must include "docker"
+# If not: sudo usermod -aG docker YOUR_USERNAME && newgrp docker
 ```
 
 ### 10.2 — Point deploy.sh at the Mac Mini
@@ -483,7 +483,7 @@ In the repo-root `.env` on the **dev machine** (separate from the Mini's
 
 ```sh
 MAC_MINI_HOST=project-server   # or the static LAN IP from Step 1
-MAC_MINI_USER=omegaprime
+MAC_MINI_USER=YOUR_USERNAME
 MAC_MINI_PATH=/opt/hamster-cam
 ```
 
@@ -565,7 +565,7 @@ co-admins, etc.) from Settings → Users in the running app.
 
 Before declaring the Mac Mini ready, confirm:
 
-- [ ] `ssh omegaprime@<mac-mini-ip>` works with key auth (no password prompt)
+- [ ] `ssh YOUR_USERNAME@<mac-mini-ip>` works with key auth (no password prompt)
 - [ ] Static DHCP lease reserved for the Mini's MAC address
 - [ ] `docker run hello-world` succeeds
 - [ ] `vainfo` shows the Intel iHD driver (Linux path only)

@@ -44,7 +44,7 @@ services:
     # See docs/SETUP_MAC_MINI.md — "Step 10: App container bind-mount prep".
     #
     # If HOST_UID/HOST_GID are not set, the container falls back to uid 1000.
-    # `id -u omegaprime` on the Mini is also 1000 per the live deployment
+    # `id -u YOUR_USERNAME` on the Mini is also 1000 per the live deployment
     # notes, so no chown is required there. Set them explicitly if your user
     # has a different uid (check with: id -u && id -g on the Mac Mini).
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
