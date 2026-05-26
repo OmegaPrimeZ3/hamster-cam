@@ -4,11 +4,66 @@
 //
 // PLAN §5.4 (cross-camera tracking).
 //
+// ============================================================================
+// ZONE-ENTRY / ZONE-EXIT MODEL (updated 2026-05-25)
+// ============================================================================
+//
 // State is in-memory; this module owns:
-//   - a per-pet `lastSeen` map (rolling)
-//   - a per-pet `pendingEnd` map (an end-event held briefly to see if a
-//     follow-up event on a different camera arrives — that's a transition)
-//   - a per-pet event ring buffer used by `activity.recentEvents` for tuning
+//   - a per-pet `zoneVisits` map: tracks every open zone visit (key = Activity
+//     name, value = ZoneVisit). Each visit records which cameras are currently
+//     reporting it, when it started, and any active odometer session.
+//   - a per-pet `pendingEnd` slot: holds deferred zone-exit entries briefly
+//     after the Frigate object track ends, to detect cross-camera A→B
+//     transitions before committing them.
+//   - a per-pet event ring buffer used by `activity.recentEvents` for tuning.
+//
+// EMISSION STRATEGY: emit at zone EXIT so duration is always known precisely.
+// Duration = zone-exit timestamp minus zone-entered timestamp.
+//
+// TWO KINDS OF ZONE-EXIT:
+//
+//   MID-TRACK zone exit (new/update event changes current_zones):
+//     The zone visit closes and the entry is emitted IMMEDIATELY. These are
+//     genuine within-track zone transitions (e.g. wheel → food mid-object-life)
+//     and need no cross-camera disambiguation.
+//
+//   TRACK-END zone exit (end event, pet still on OTHER cameras):
+//     The visits closed by this camera's 'end' are emitted IMMEDIATELY because
+//     the pet is still visible on other cameras — no cross-camera transition is
+//     possible from this specific 'end'.
+//
+//   TRACK-END zone exit (end event, LAST camera for this pet):
+//     The zone visit closes but the entry is DEFERRED into a `PendingEnd` slot
+//     with a transition-window timer. If a `new` event arrives on a DIFFERENT
+//     camera within transitionWindowMs, a single TRANSITION entry is emitted
+//     instead (the deferred entries are dropped). If the window expires with no
+//     follow-up, the deferred entries are committed to the diary.
+//
+// ZONE-VISIT LIFECYCLE:
+//   1. Any event (new/update/end) runs classifyZones() on after.current_zones.
+//      classifyZones() returns the set of known Activities present in that list;
+//      when the list is empty (or no known keywords), returns {'exploring'}.
+//   2. Zones newly present (in current but not in zoneVisits) → open a visit.
+//   3. Zones no longer present (in zoneVisits but not in current):
+//      • mid-track (new/update): close immediately.
+//      • track-end, other cameras still alive: close immediately.
+//      • track-end, last camera: defer via PendingEnd.
+//   4. For 'end' events the camera is removed from every visit; visits whose
+//      camera set empties are closed per rule 3.
+//   5. When ALL zone visits close after an 'end', queue the PendingEnd.
+//
+// MULTI-CAMERA DEDUP INVARIANTS:
+//   1. At most ONE active wheel odometer session per pet at any time.
+//   2. Simultaneous same-zone across cameras → ONE diary entry.
+//   3. Sequential cross-camera A→B transitions → ONE transition entry.
+//   4. Single-camera behaviour is unchanged.
+//   5. Concurrent DIFFERENT zones on different cameras: each zone visit is
+//      independent. Entries are only emitted when the respective visit closes.
+//
+// DEBOUNCE: Frigate fires many 'update' events for a stationary object all
+// reporting the same current_zones. The diff in step 1 means we open a visit
+// exactly once per zone-entry and emit exactly once per zone-exit. Re-entering
+// a zone after leaving it opens a fresh visit.
 //
 // The narrator is fully testable: `handleFrigateEvent` does all I/O via the
 // `db` module, time can be controlled by passing `now`, and template choice
@@ -31,6 +86,16 @@ interface NarratorTuning {
 }
 
 let tuning: NarratorTuning = { transitionWindowMs: 8_000, minDwellMs: 2_000 };
+
+/**
+ * Back-to-back same-activity coalescing window. When a non-wheel zone visit
+ * closes and the most recent diary entry is the SAME activity and ended within
+ * this gap, we extend that entry instead of writing a new one — this is what
+ * stops "Exploring → Exploring" runs of near-identical entries. Wheel is
+ * excluded so every run keeps its own odometer distance. A larger gap is
+ * treated as a genuinely separate episode and gets its own entry.
+ */
+const COALESCE_WINDOW_MS = 120_000;
 
 /** Re-read tunables from `settings` (called from index.ts on startup & after settings.update). */
 export function refreshNarratorTunings(): void {
@@ -99,7 +164,29 @@ function classifyActivity(side: FrigateEventPayloadSide): Activity {
   return k ?? 'exploring';
 }
 
-function matchKeyword(value: string): Activity | null {
+/**
+ * Classify ALL known-zone Activities present in `current_zones`. Returns the
+ * full set so callers can diff against currently-open visits.
+ *
+ * If no known zones are present, returns a set containing just 'exploring'
+ * (the fallback for genuine open-space wandering).
+ */
+function classifyZones(side: FrigateEventPayloadSide): Set<Activity> {
+  const known = new Set<Activity>();
+  for (const z of side.current_zones ?? []) {
+    const k = matchKeyword(z);
+    if (k) known.add(k);
+  }
+  // Camera name as a fallback keyword source (same heuristic as before).
+  if (known.size === 0) {
+    const k = matchKeyword(side.camera);
+    if (k) known.add(k);
+  }
+  if (known.size === 0) known.add('exploring');
+  return known;
+}
+
+export function matchKeyword(value: string): Activity | null {
   const v = value.toLowerCase();
   if (v.includes('wheel')) return 'wheel';
   if (v.includes('food') || v.includes('bowl') || v.includes('feed')) return 'food';
@@ -122,30 +209,50 @@ interface LastSeen {
 }
 
 /**
- * Tracks the pet's current activity at the activity level (not per-camera).
- * `cameras` is the set of cameras currently reporting this activity; the
- * activity only ends when this set empties. `odomCameraId` is the camera id
- * whose wheel session is running (null if odometry is not active for this
- * activity).
+ * Represents one open zone visit. Multiple cameras can contribute to the same
+ * visit (multi-camera dedup invariant 2). The visit closes when the cameras
+ * set empties after a zone departure.
  */
-interface ActiveActivity {
-  kind: Activity;
-  cameras: Set<string>;
+interface ZoneVisit {
+  /** When this zone was first entered (ms since epoch). */
   startedAt: number;
-  /** Camera id whose wheel odometer session is running, or null. */
+  /** All cameras currently reporting this zone for this pet. */
+  cameras: Set<string>;
+  /** Camera id whose wheel odometer session is running (null if none). */
   odomCameraId: number | null;
 }
 
-interface PendingEnd {
-  event: FrigateEvent;
+/**
+ * A closed zone visit whose entry has been computed but not yet committed.
+ * Stored in PendingEnd so we can suppress the entry if a cross-camera
+ * transition fires before the window expires.
+ */
+interface DeferredEntry {
   activity: Activity;
+  durationMs: number;
+  occurredAt: number;
+  cameraId: number | null;
+  details: Record<string, unknown>;
+}
+
+/**
+ * Holds deferred zone-exit entries after the LAST camera for a pet ends.
+ * If a 'new' event on a different camera arrives within transitionWindowMs,
+ * a TRANSITION entry replaces the deferred entries. Otherwise the timer fires
+ * and the deferred entries are committed.
+ */
+interface PendingEnd {
+  /** Dominant activity at end time — used to classify the transition fromZone. */
+  activity: Activity;
+  /** Camera name where the track ended. */
+  camera: string;
   /** ms since epoch when the end fired. */
   at: number;
-  /** ms since epoch the object first appeared. */
+  /** ms since epoch of the original track start (for transition dwell calc). */
   startedAt: number;
-  /** Camera id whose odometer was running, so flushPending can end the right session. */
-  odomCameraId: number | null;
-  /** Timer that, if it fires, flushes the pending end as a standalone entry. */
+  /** Deferred zone-exit entries — committed if no transition follows. */
+  deferred: DeferredEntry[];
+  /** Timer that commits deferred entries when transition window expires. */
   timer: NodeJS.Timeout;
 }
 
@@ -162,8 +269,12 @@ const RECENT_RING_SIZE = 20;
 interface PetState {
   lastSeen: LastSeen | null;
   pending: PendingEnd | null;
-  /** Activity-level dedup: the single ongoing activity across all cameras. */
-  activeActivity: ActiveActivity | null;
+  /**
+   * Zone-visit tracking: key = Activity name, value = open ZoneVisit.
+   * Source of truth for dedup invariants 1 (one odometer session) and
+   * 2 (same zone → one entry).
+   */
+  zoneVisits: Map<Activity, ZoneVisit>;
 }
 
 const state = new Map<string, PetState>();
@@ -172,7 +283,7 @@ const recentByPet = new Map<string, RecentEventEntry[]>();
 function getOrInitPetState(pet: string): PetState {
   let s = state.get(pet);
   if (!s) {
-    s = { lastSeen: null, pending: null, activeActivity: null };
+    s = { lastSeen: null, pending: null, zoneVisits: new Map() };
     state.set(pet, s);
   }
   return s;
@@ -361,7 +472,7 @@ function writeEntry(params: WriteParams): db.DiaryEntryRow {
 }
 
 // ---------------------------------------------------------------------------
-// Core handler
+// Zone-visit helpers
 // ---------------------------------------------------------------------------
 
 interface ScheduledFlushDeps {
@@ -370,52 +481,119 @@ interface ScheduledFlushDeps {
   onEntryWritten: (entry: db.DiaryEntryRow) => Promise<void> | void;
 }
 
-async function flushPending(
-  petKey: string,
-  pending: PendingEnd,
-  deps: ScheduledFlushDeps,
-): Promise<db.DiaryEntryRow | null> {
-  clearTimeout(pending.timer);
-  const s = getOrInitPetState(petKey);
-  if (s.pending === pending) s.pending = null;
-  const dwellMs = pending.at - pending.startedAt;
-  if (dwellMs < tuning.minDwellMs) {
-    // Fly-through — discard.
-    return null;
+/**
+ * Open a new zone visit. Starts a wheel odometer session if applicable.
+ * Must only be called when the zone is NOT already in petState.zoneVisits.
+ */
+function openZoneVisit(
+  petState: PetState,
+  activity: Activity,
+  cameraName: string,
+  startedAt: number,
+): void {
+  let odomCameraId: number | null = null;
+  if (activity === 'wheel') {
+    // Only start an odometer if no other wheel visit is running (invariant 1).
+    const existingWheel = petState.zoneVisits.get('wheel');
+    const alreadyRunning = existingWheel !== undefined && existingWheel.odomCameraId !== null;
+    if (!alreadyRunning) {
+      const camId = cameraIdByName(cameraName);
+      if (camId !== null) {
+        try {
+          startWheelSession(camId, startedAt);
+          if (isCameraWheelEnabled(camId)) {
+            odomCameraId = camId;
+          }
+        } catch (err) {
+          // Never block the narrator path for odometry errors.
+          void err;
+        }
+      }
+    }
+  }
+  petState.zoneVisits.set(activity, {
+    startedAt,
+    cameras: new Set([cameraName]),
+    odomCameraId,
+  });
+}
+
+/**
+ * Close a zone visit and prepare a DeferredEntry. Always ends the wheel
+ * odometer session — never leaves an ffmpeg session open regardless of dwell.
+ */
+function prepareCloseVisit(
+  visit: ZoneVisit,
+  activity: Activity,
+  cameraName: string,
+  closedAt: number,
+): DeferredEntry {
+  const details: Record<string, unknown> = {
+    camera: [...visit.cameras][0] ?? cameraName,
+  };
+
+  // Always end the odometer session — never leave ffmpeg running.
+  if (activity === 'wheel' && visit.odomCameraId !== null) {
+    try {
+      const metres = endWheelSession(visit.odomCameraId);
+      if (metres !== null) {
+        details['wheel_meters'] = metres;
+      }
+    } catch (err) {
+      void err;
+    }
   }
 
-  // Collect wheel odometry before writing the entry so metres land in details.
-  const details: Record<string, unknown> = {
-    type: pending.event.type,
-    camera: pending.event.before.camera,
+  return {
+    activity,
+    durationMs: closedAt - visit.startedAt,
+    occurredAt: closedAt,
+    cameraId: cameraIdByName([...visit.cameras][0] ?? cameraName),
+    details,
   };
-  if (pending.activity === 'wheel') {
-    // Use the stored odomCameraId — it is the camera whose session is actually
-    // running (may differ from event.before.camera in multi-camera scenarios).
-    const camId = pending.odomCameraId;
-    if (camId !== null) {
-      try {
-        const metres = endWheelSession(camId);
-        if (metres !== null) {
-          details['wheel_meters'] = metres;
-        }
-      } catch (err) {
-        // Never block diary writes for odometry failures.
-        void err;
-      }
+}
+
+/**
+ * Commit a DeferredEntry to the diary (if dwell >= minDwellMs).
+ * Returns the written row or null for fly-throughs.
+ */
+async function commitDeferred(
+  deferred: DeferredEntry,
+  deps: ScheduledFlushDeps,
+): Promise<db.DiaryEntryRow | null> {
+  if (deferred.durationMs < tuning.minDwellMs) return null;
+
+  // Back-to-back same-activity coalescing: if the most recent diary entry is
+  // the SAME non-wheel activity and the pet returned to it within
+  // COALESCE_WINDOW_MS, extend that entry instead of writing a near-duplicate
+  // (this is what collapses "Exploring → Exploring" runs into one). Wheel is
+  // excluded so each run keeps its own odometer distance. We do NOT re-fire
+  // onEntryWritten here — the original entry already ran badges/push, and
+  // re-firing would double-notify for a single continuing activity.
+  if (deferred.activity !== 'wheel') {
+    const latest = db.getLatestDiaryEntry();
+    if (
+      latest &&
+      latest.kind === 'narrative' &&
+      latest.activity === deferred.activity &&
+      deferred.occurredAt > latest.occurred_at &&
+      deferred.occurredAt - deferred.durationMs - latest.occurred_at <= COALESCE_WINDOW_MS
+    ) {
+      const startedAt = latest.occurred_at - (latest.duration_ms ?? 0);
+      return db.extendDiaryEntry(latest.id, deferred.occurredAt, deferred.occurredAt - startedAt);
     }
   }
 
   const entry = writeEntry({
-    activity: pending.activity,
-    occurredAt: pending.at,
-    cameraId: cameraIdByName(pending.event.before.camera),
-    durationMs: dwellMs,
+    activity: deferred.activity,
+    occurredAt: deferred.occurredAt,
+    cameraId: deferred.cameraId,
+    durationMs: deferred.durationMs,
     fromCameraId: null,
     toCameraId: null,
     fromZone: null,
     toZone: null,
-    details,
+    details: Object.keys(deferred.details).length > 0 ? deferred.details : null,
     rng: deps.rng,
     pet: petName(),
   });
@@ -423,27 +601,46 @@ async function flushPending(
   return entry;
 }
 
+// ---------------------------------------------------------------------------
+// Pending-end / transition-window flush
+// ---------------------------------------------------------------------------
+
 /**
- * Process one MQTT-delivered Frigate event. May emit zero, one, or two diary
- * entries: e.g. flushing a pending end the moment a transition gets resolved.
+ * Commit all deferred entries in a PendingEnd (called when transition window
+ * expires with no cross-camera follow-up).
+ */
+async function flushPending(
+  petKey: string,
+  pending: PendingEnd,
+  deps: ScheduledFlushDeps,
+): Promise<db.DiaryEntryRow[]> {
+  clearTimeout(pending.timer);
+  const s = getOrInitPetState(petKey);
+  if (s.pending === pending) s.pending = null;
+
+  const out: db.DiaryEntryRow[] = [];
+  for (const deferred of pending.deferred) {
+    const entry = await commitDeferred(deferred, deps);
+    if (entry) out.push(entry);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Core handler
+// ---------------------------------------------------------------------------
+
+/**
+ * Process one MQTT-delivered Frigate event. May emit zero, one, or more diary
+ * entries.
  *
  * Multi-camera dedup invariants:
  *  1. At most ONE active wheel odometer session per pet at any time.
- *  2. Simultaneous same-activity across cameras → ONE diary entry.
- *  3. Sequential cross-camera A→B transitions still produce one transition entry.
- *  4. Single-camera behavior is unchanged.
- *  5. Concurrent DIFFERENT activities on different cameras (overlapping detections):
- *     the displaced activity is written as a STANDALONE entry (if its dwell meets
- *     minDwellMs), its odometer session is always ended, and the new activity
- *     starts cleanly. No transition entry is emitted because the displaced
- *     activity never signalled it left — detections simply overlapped.
- *
- * The per-pet `activeActivity` field is the source of truth for invariants 1&2.
- * A `new` event joins the existing activity when the activity kind matches;
- * it only starts a fresh activity (and possibly a new odometer session) when
- * the activity is different or there is no current activity. An `end` event
- * removes the camera from the activity set; only when the set empties does the
- * pending-end / transition-window logic run.
+ *  2. Simultaneous same-zone across cameras → ONE diary entry.
+ *  3. Sequential cross-camera A→B transitions → ONE transition entry.
+ *  4. Single-camera behaviour is unchanged.
+ *  5. Concurrent DIFFERENT zones on different cameras: each zone visit is
+ *     independent; entries are emitted only when the respective visit closes.
  */
 export async function handleFrigateEvent(
   event: FrigateEvent,
@@ -474,123 +671,36 @@ export async function handleFrigateEvent(
   const petState = getOrInitPetState(petKey);
   const written: db.DiaryEntryRow[] = [];
 
-  if (event.type === 'new') {
-    const activity = classifyActivity(event.after);
-    petState.lastSeen = { camera: cameraName, zone, at: nowMs };
-
-    // -----------------------------------------------------------------------
-    // Check if the pet is already doing this same activity on another camera.
-    // If so, just add this camera to the set — no new session, no new entry.
-    // -----------------------------------------------------------------------
-    if (petState.activeActivity && petState.activeActivity.kind === activity) {
-      petState.activeActivity.cameras.add(cameraName);
-
-      // Edge case: if the existing activity has no odometer running yet (the
-      // first camera that claimed it had wheel_mark_enabled=0) but this camera
-      // has it enabled, start the session now on this camera.
-      if (activity === 'wheel' && petState.activeActivity.odomCameraId === null) {
-        const camId = cameraIdByName(cameraName);
-        if (camId !== null) {
-          try {
-            startWheelSession(camId, petState.activeActivity.startedAt);
-            if (isCameraWheelEnabled(camId)) {
-              petState.activeActivity.odomCameraId = camId;
-            }
-          } catch (err) {
-            void err;
-          }
-        }
-      }
-      return written;
-    }
-
-    // -----------------------------------------------------------------------
-    // Concurrent different-activity displacement (Invariant 5).
-    //
-    // If there is an active activity of a DIFFERENT kind, two camera fields of
-    // view are overlapping at the same moment — e.g. cam1 still classifies
-    // 'wheel' while cam2 fires 'food'. We cannot wait for a 'end' that may
-    // never arrive (the detection sets simply overlapped). Instead:
-    //   a) Always end the displaced odometer session so no ffmpeg leak occurs.
-    //   b) If the displaced dwell meets minDwellMs, write a STANDALONE entry
-    //      for it (no transition — the activity never signalled departure).
-    //      If dwell is below the threshold, discard silently (fly-through).
-    //   c) Null out activeActivity so the new-activity start below is clean.
-    // -----------------------------------------------------------------------
-    const displaced = petState.activeActivity;
-    if (displaced !== null && displaced.kind !== activity) {
-      const displacedDwellMs = nowMs - displaced.startedAt;
-
-      // (a) Always end the odometer session for the displaced activity.
-      let displacedMetres: number | null = null;
-      if (displaced.odomCameraId !== null) {
-        try {
-          displacedMetres = endWheelSession(displaced.odomCameraId);
-        } catch (err) {
-          // Never let odometry errors block the narrator path.
-          void err;
-        }
-      }
-
-      // (b) Write a standalone entry when dwell is long enough.
-      if (displacedDwellMs >= tuning.minDwellMs) {
-        // Pick a representative camera from the displaced activity's set.
-        const representativeCamera = [...displaced.cameras][0] ?? cameraName;
-        const displacedDetails: Record<string, unknown> = { camera: representativeCamera };
-        if (displacedMetres !== null) {
-          displacedDetails['wheel_meters'] = displacedMetres;
-        }
-        const displacedEntry = writeEntry({
-          activity: displaced.kind,
-          occurredAt: nowMs,
-          cameraId: cameraIdByName(representativeCamera),
-          durationMs: displacedDwellMs,
-          fromCameraId: null,
-          toCameraId: null,
-          fromZone: null,
-          toZone: null,
-          details: displacedDetails,
-          rng: deps.rng,
-          pet: petName(),
-        });
-        await deps.onEntryWritten(displacedEntry);
-        written.push(displacedEntry);
-      }
-      // Fly-through (dwell below threshold): discard the displaced entry.
-      // The odometer was already ended above regardless of dwell.
-
-      // (c) Clear so the new-activity start block begins cleanly.
-      petState.activeActivity = null;
-    }
-
-    // -----------------------------------------------------------------------
-    // Different activity (or no current activity): this is a genuine start.
-    // First check if this 'new' resolves a pending transition.
-    // -----------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Cross-camera transition detection: a 'new' or 'update' event on a DIFFERENT
+  // camera while a pending-end is in flight means the pet moved cameras.
+  // Emit a transition entry and discard the deferred entries (they'd be
+  // redundant noise alongside the transition).
+  // -------------------------------------------------------------------------
+  if (event.type !== 'end') {
     const pending = petState.pending;
     if (
       pending &&
-      pending.event.before.camera !== cameraName &&
+      pending.camera !== cameraName &&
       nowMs - pending.at <= tuning.transitionWindowMs
     ) {
       clearTimeout(pending.timer);
       petState.pending = null;
-      petState.activeActivity = null;
       const dwellMs = pending.at - pending.startedAt;
       if (dwellMs >= tuning.minDwellMs) {
-        const fromZone = classifyActivity(pending.event.before);
+        const fromZone = pending.activity;
         const toZone = classifyActivity(event.after);
         const entry = writeEntry({
           activity: 'transition',
           occurredAt: nowMs,
           cameraId: null,
           durationMs: nowMs - pending.startedAt,
-          fromCameraId: cameraIdByName(pending.event.before.camera),
+          fromCameraId: cameraIdByName(pending.camera),
           toCameraId: cameraIdByName(cameraName),
           fromZone,
           toZone,
           details: {
-            from: pending.event.before.camera,
+            from: pending.camera,
             to: cameraName,
             dwell_ms: dwellMs,
           },
@@ -600,85 +710,169 @@ export async function handleFrigateEvent(
         await deps.onEntryWritten(entry);
         written.push(entry);
       }
+      // Deferred entries discarded — transition entry covers this movement.
     }
+  }
 
-    // Start a new activity tracker for this pet.
-    let odomCameraId: number | null = null;
-    if (activity === 'wheel') {
-      const camId = cameraIdByName(cameraName);
-      if (camId !== null) {
-        try {
-          startWheelSession(camId, nowMs);
-          if (isCameraWheelEnabled(camId)) {
-            odomCameraId = camId;
+  // -------------------------------------------------------------------------
+  // Compute the set of zones this camera currently reports.
+  // For 'end' events, the object is gone — treat as no zones.
+  // -------------------------------------------------------------------------
+  const currentZones: Set<Activity> =
+    event.type === 'end' ? new Set() : classifyZones(event.after);
+
+  // -------------------------------------------------------------------------
+  // Open visits for newly-entered zones (debounce: camera already in visit →
+  // no-op).
+  // -------------------------------------------------------------------------
+  for (const activity of currentZones) {
+    const existing = petState.zoneVisits.get(activity);
+    if (!existing) {
+      openZoneVisit(petState, activity, cameraName, nowMs);
+    } else if (!existing.cameras.has(cameraName)) {
+      // Additional camera joins the existing visit (dedup invariant 2).
+      existing.cameras.add(cameraName);
+
+      // Edge case: existing visit has no odometer but this camera can provide one.
+      if (activity === 'wheel' && existing.odomCameraId === null) {
+        const camId = cameraIdByName(cameraName);
+        if (camId !== null && isCameraWheelEnabled(camId)) {
+          try {
+            startWheelSession(camId, existing.startedAt);
+            existing.odomCameraId = camId;
+          } catch (err) {
+            void err;
           }
-        } catch (err) {
-          // Never block the narrator path for odometry errors.
-          void err;
+        }
+      }
+    }
+    // else: camera already in this visit — debounce, nothing to do.
+  }
+
+  // -------------------------------------------------------------------------
+  // Close visits for zones that this camera has departed (mid-track: the
+  // camera's current_zones no longer includes this zone).
+  //
+  // MID-TRACK closes ONLY — skip for 'end' events (those go through the
+  // track-end path below so the transition-window can fire for the last camera).
+  // -------------------------------------------------------------------------
+  if (event.type !== 'end') {
+    const midTrackToClose: Activity[] = [];
+    for (const [activity, visit] of petState.zoneVisits) {
+      if (!currentZones.has(activity) && visit.cameras.has(cameraName)) {
+        visit.cameras.delete(cameraName);
+        if (visit.cameras.size === 0) {
+          midTrackToClose.push(activity);
         }
       }
     }
 
-    petState.activeActivity = {
-      kind: activity,
-      cameras: new Set([cameraName]),
-      startedAt: nowMs,
-      odomCameraId,
-    };
-
-    return written;
-  }
-
-  if (event.type === 'update') {
-    petState.lastSeen = { camera: cameraName, zone, at: nowMs };
-    return written;
-  }
-
-  // -------------------------------------------------------------------------
-  // event.type === 'end'
-  // Remove this camera from the active-activity set. Only proceed to the
-  // pending-end / flush logic when all cameras have ended this activity.
-  // -------------------------------------------------------------------------
-  if (petState.activeActivity) {
-    petState.activeActivity.cameras.delete(cameraName);
-    if (petState.activeActivity.cameras.size > 0) {
-      // Other cameras are still reporting the same activity — not done yet.
-      petState.lastSeen = { camera: cameraName, zone, at: nowMs };
-      return written;
+    for (const activity of midTrackToClose) {
+      const visit = petState.zoneVisits.get(activity);
+      if (!visit) continue;
+      petState.zoneVisits.delete(activity);
+      // Mid-track close: emit immediately (no transition-window needed).
+      const deferred = prepareCloseVisit(visit, activity, cameraName, occurredAtMs);
+      const entry = await commitDeferred(deferred, deps);
+      if (entry) written.push(entry);
     }
-    // All cameras ended; fall through to the pending-end logic below.
-    // The odomCameraId from the active activity is what we need for flush.
   }
 
-  // Buffer the end briefly to see if a different-camera 'new' arrives (that
-  // would be a A→B transition rather than a genuine stop).
-  if (petState.pending) {
-    // Flush whatever was pending first — defensive against rapid-fire ends.
-    const flushed = await flushPending(petKey, petState.pending, deps);
-    if (flushed) written.push(flushed);
-  }
-  const activity = classifyActivity(event.after);
-  // Carry the odomCameraId from the activity tracker into the pending object
-  // so flushPending ends the right session.
-  const odomCameraId = petState.activeActivity?.odomCameraId ?? null;
-  petState.activeActivity = null;
+  // -------------------------------------------------------------------------
+  // 'end' event: remove this camera from ALL visits. Collect visits that empty.
+  //
+  // TWO SUB-CASES based on whether other zone visits remain after this camera
+  // departs:
+  //
+  //   A. zoneVisits still has other entries after this camera is removed:
+  //      The pet is still visible on other cameras. Emit the closed visits
+  //      IMMEDIATELY — no cross-camera transition possible from this 'end'.
+  //
+  //   B. zoneVisits becomes empty (this was the last camera):
+  //      Queue a PendingEnd for transition-window deferral. A follow-up 'new'
+  //      on a different camera within transitionWindowMs → TRANSITION entry.
+  //      Otherwise the timer fires and deferred entries are committed.
+  //
+  // This is the ONLY close path for 'end' events (mid-track path above is
+  // skipped for 'end').
+  // -------------------------------------------------------------------------
+  if (event.type === 'end') {
+    // Collect (activity, visit) pairs before mutating the map.
+    const toClose: Array<{ activity: Activity; visit: ZoneVisit }> = [];
+    for (const [activity, visit] of petState.zoneVisits) {
+      if (visit.cameras.has(cameraName)) {
+        visit.cameras.delete(cameraName);
+        if (visit.cameras.size === 0) {
+          toClose.push({ activity, visit });
+        }
+      }
+    }
+    for (const { activity } of toClose) {
+      petState.zoneVisits.delete(activity);
+    }
 
-  const pending: PendingEnd = {
-    event,
-    activity,
-    at: occurredAtMs,
-    startedAt: startMs,
-    odomCameraId,
-    // Placeholder; assigned below.
-    timer: undefined as unknown as NodeJS.Timeout,
-  };
-  pending.timer = setTimeout(() => {
-    void flushPending(petKey, pending, deps);
-  }, tuning.transitionWindowMs);
-  // Don't keep the event loop alive for these timers.
-  pending.timer.unref?.();
-  petState.pending = pending;
+    if (petState.zoneVisits.size > 0) {
+      // Sub-case A: other visits still alive — emit immediately.
+      for (const { activity, visit } of toClose) {
+        const deferred = prepareCloseVisit(visit, activity, cameraName, occurredAtMs);
+        const entry = await commitDeferred(deferred, deps);
+        if (entry) written.push(entry);
+      }
+    } else {
+      // Sub-case B: all visits closed — queue PendingEnd.
+
+      // Flush any existing pending first (defensive against rapid-fire ends on
+      // concurrent same-pet tracks that would otherwise overwrite each other).
+      if (petState.pending) {
+        clearTimeout(petState.pending.timer);
+        const prevPending = petState.pending;
+        petState.pending = null;
+        const flushed = await flushPending(petKey, prevPending, deps);
+        for (const e of flushed) written.push(e);
+      }
+
+      const endActivity = classifyActivity(event.after);
+      const trackEndDeferred = toClose.map(({ activity, visit }) =>
+        prepareCloseVisit(visit, activity, cameraName, occurredAtMs),
+      );
+
+      // If there were no zone visits to close (e.g. Frigate missed the 'new'
+      // and we only see the 'end'), synthesise a deferred entry from the event
+      // so the detection isn't silently dropped.
+      const deferred: DeferredEntry[] =
+        trackEndDeferred.length > 0
+          ? trackEndDeferred
+          : [
+              {
+                activity: endActivity,
+                durationMs: occurredAtMs - startMs,
+                occurredAt: occurredAtMs,
+                cameraId: cameraIdByName(cameraName),
+                details: { camera: cameraName },
+              },
+            ];
+
+      const pending: PendingEnd = {
+        activity: endActivity,
+        camera: cameraName,
+        at: occurredAtMs,
+        startedAt: startMs,
+        deferred,
+        timer: undefined as unknown as NodeJS.Timeout,
+      };
+      pending.timer = setTimeout(() => {
+        // commitDeferred inside flushPending calls deps.onEntryWritten for each
+        // written entry — no further wiring needed here.
+        void flushPending(petKey, pending, deps);
+      }, tuning.transitionWindowMs);
+      pending.timer.unref?.();
+      petState.pending = pending;
+    }
+  }
+
+  // Update lastSeen.
   petState.lastSeen = { camera: cameraName, zone, at: nowMs };
+
   return written;
 }
 
@@ -690,10 +884,22 @@ export async function flushPendingEntries(): Promise<db.DiaryEntryRow[]> {
     onEntryWritten: defaultDeps.onEntryWritten,
   };
   const out: db.DiaryEntryRow[] = [];
+  const nowMs = deps.now();
   for (const [petKey, s] of state.entries()) {
+    // Flush any open zone visits that were never closed (e.g. process killed
+    // mid-track).
+    for (const [activity, visit] of s.zoneVisits) {
+      const representativeCamera = [...visit.cameras][0];
+      if (!representativeCamera) continue;
+      const deferred = prepareCloseVisit(visit, activity, representativeCamera, nowMs);
+      const entry = await commitDeferred(deferred, deps);
+      if (entry) out.push(entry);
+    }
+    s.zoneVisits.clear();
+    // Flush any pending transition-window entries.
     if (s.pending) {
-      const written = await flushPending(petKey, s.pending, deps);
-      if (written) out.push(written);
+      const entries = await flushPending(petKey, s.pending, deps);
+      out.push(...entries);
     }
   }
   return out;

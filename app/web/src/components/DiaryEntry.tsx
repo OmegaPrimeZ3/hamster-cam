@@ -8,11 +8,11 @@
 // Additional variant: activity === 'recap' — text-only, larger type (18px),
 // distinct warm-gold accent. Sorted to top of the day in Diary.tsx.
 //
-// Whimsy pass: each card gets a deterministic micro-rotation (seeded by
-// entry.id so it doesn't dance on re-render), a 4px left stripe and a soft
-// emoji badge keyed to entry.activity, plus a near-invisible watercolour
-// tint layered over var(--surface). Hover lift via framer-motion; rotation
-// and lift are both gated on prefers-reduced-motion.
+// Whimsy pass: each card gets a 4px left stripe and a soft emoji badge keyed
+// to entry.activity, plus a near-invisible watercolour tint layered over
+// var(--surface). Hover lift via framer-motion, gated on
+// prefers-reduced-motion. (Cards sit flat — no rotation: the slight "cant"
+// read as a layout bug, so it was removed.)
 //
 // TTS button: when isTTSAvailable() and ttsEnabled prop is true, shows a
 // Volume2 / Square icon button that speaks the narrative aloud.
@@ -38,15 +38,6 @@ export interface DiaryEntryProps {
   ttsEnabled?: boolean;
   /** From settings.distance_unit — defaults to 'mi' until the backend ships. */
   distanceUnit?: 'mi' | 'km';
-}
-
-// Stable ±1deg jitter from entry.id so the list looks hand-pinned but never
-// shuffles between re-renders. sin(id)·constants is a cheap deterministic
-// hash — we only need "looks random", not crypto.
-function rotationForId(id: number): number {
-  const x = Math.sin(id * 9301 + 49297) * 10000;
-  const frac = x - Math.floor(x); // [0, 1)
-  return frac * 2 - 1; // [-1, 1] degrees
 }
 
 // Narrative templates start with an emoji (e.g. "🥕 {pet} had a snack!"); the
@@ -86,7 +77,6 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
   const relative = relativeTime(entry.occurred_at, now);
   const duration = entry.duration_ms != null ? formatDuration(entry.duration_ms) : null;
   const style = activityStyle(entry.activity ?? null);
-  const rotation = reduced ? 0 : rotationForId(entry.id);
   const isRecap = entry.activity === 'recap';
 
   // Wheel distance suffix — parsed defensively from entry.details (JSON string).
@@ -118,7 +108,6 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
       data-kind={entry.kind}
       data-activity={entry.activity ?? undefined}
       initial={false}
-      animate={{ rotate: rotation }}
       whileHover={reduced ? undefined : { y: -2 }}
       whileTap={reduced ? undefined : { scale: 0.99 }}
       transition={{ type: 'spring', stiffness: 260, damping: 22 }}

@@ -247,6 +247,8 @@ interface Statements {
   diaryInsert: Database.Statement;
   diaryById: Database.Statement;
   diaryDelete: Database.Statement;
+  diaryLatest: Database.Statement;
+  diaryExtend: Database.Statement;
   diaryListBetween: Database.Statement;
   diaryListByKindBetween: Database.Statement;
   diaryUpsertTimelapseForDate: Database.Statement;
@@ -451,6 +453,15 @@ function statements(): Statements {
     `),
     diaryById: db.prepare('SELECT * FROM diary_entries WHERE id = ?'),
     diaryDelete: db.prepare('DELETE FROM diary_entries WHERE id = ?'),
+    // Most recent entry by wall-clock time — backs narrator same-activity
+    // coalescing (id DESC breaks ties so the truly-latest row wins).
+    diaryLatest: db.prepare(
+      'SELECT * FROM diary_entries ORDER BY occurred_at DESC, id DESC LIMIT 1',
+    ),
+    // Extend an existing entry to absorb a back-to-back same-activity visit.
+    diaryExtend: db.prepare(
+      'UPDATE diary_entries SET occurred_at = @occurred_at, duration_ms = @duration_ms WHERE id = @id',
+    ),
     diaryListBetween: db.prepare(`
       SELECT * FROM diary_entries
        WHERE occurred_at >= ? AND occurred_at < ?
@@ -1084,6 +1095,27 @@ export function createDiaryEntry(input: CreateDiaryEntryInput): DiaryEntryRow {
 
 export function getDiaryEntryById(id: number): DiaryEntryRow | null {
   return (statements().diaryById.get(id) as DiaryEntryRow | undefined) ?? null;
+}
+
+/** Most recent diary entry across all kinds, or null when the diary is empty. */
+export function getLatestDiaryEntry(): DiaryEntryRow | null {
+  return (statements().diaryLatest.get() as DiaryEntryRow | undefined) ?? null;
+}
+
+/**
+ * Extend an existing entry's span (used by the narrator to coalesce a
+ * back-to-back same-activity visit into the prior entry). Only the end time
+ * and duration change — the narrative sentence is preserved.
+ */
+export function extendDiaryEntry(
+  id: number,
+  occurredAt: number,
+  durationMs: number | null,
+): DiaryEntryRow {
+  statements().diaryExtend.run({ id, occurred_at: occurredAt, duration_ms: durationMs });
+  const row = statements().diaryById.get(id) as DiaryEntryRow | undefined;
+  if (!row) throw new Error(`extendDiaryEntry: row ${id} not found`);
+  return row;
 }
 
 export function deleteDiaryEntry(id: number): void {
