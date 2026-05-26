@@ -55,3 +55,9 @@ __pycache__/
 *.onnx
 *.pt
 /scripts/pet-model/pets/*.local.yaml
+
+# EXCEPTION: curated, versioned detector releases under models/ ARE tracked on
+# purpose (the deployable ONNX + labelmap + training weights for each version).
+# This overrides the *.onnx / *.pt ignore above for this directory only.
+!/models/
+!/models/**
