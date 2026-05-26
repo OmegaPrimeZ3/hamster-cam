@@ -104,10 +104,16 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
       style={{
         position: 'relative',
         display: 'flex',
-        flexDirection: entry.kind === 'timelapse' ? 'column' : 'row',
+        // Snapshots sit beside the text while collapsed, but an expanded
+        // snapshot stacks on top (like timelapse) so the enlarged image gets
+        // the full card width instead of fighting the text for the row.
+        flexDirection:
+          entry.kind === 'timelapse' || (entry.kind === 'snapshot' && expanded)
+            ? 'column'
+            : 'row',
         gap: 12,
         alignItems:
-          entry.kind === 'timelapse'
+          entry.kind === 'timelapse' || (entry.kind === 'snapshot' && expanded)
             ? 'stretch'
             : entry.kind === 'snapshot'
               ? 'center'
@@ -292,6 +298,10 @@ function SnapshotBody({
         background: 'transparent',
         flexShrink: 0,
         cursor: 'pointer',
+        // When expanded the card stacks (column), so take the full width and
+        // center the enlarged image within it.
+        width: expanded ? '100%' : undefined,
+        textAlign: expanded ? 'center' : undefined,
       }}
     >
       <img
