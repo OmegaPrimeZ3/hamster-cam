@@ -108,7 +108,7 @@ objects:
   filters:
     hamster:
       min_score: 0.55
-      threshold: 0.80
+      threshold: 0.75
 
 ffmpeg:
   # Detect AND record consume the LOCAL go2rtc restream over loopback (see
