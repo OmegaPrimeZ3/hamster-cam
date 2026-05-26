@@ -141,8 +141,17 @@ export interface NotificationPreferencesRow {
 }
 
 export interface BadgeRow {
+  id: number;
   badge_id: string;
   earned_at: number;
+  earned_day: string;
+}
+
+export interface BadgeSummaryRow {
+  badge_id: string;
+  count: number;
+  first_earned_at: number;
+  last_earned_at: number;
 }
 
 export interface AuditLogRow {
@@ -262,9 +271,11 @@ interface Statements {
   diaryUpdateThumbnailPath: Database.Statement;
   diaryUpdateClipPath: Database.Statement;
   // badges
-  badgeInsert: Database.Statement;
+  badgeInsertDaily: Database.Statement;
+  badgeInsertOnce: Database.Statement;
+  badgeHasAny: Database.Statement;
   badgeList: Database.Statement;
-  badgeHas: Database.Statement;
+  badgeSummarize: Database.Statement;
   // audit
   auditInsert: Database.Statement;
   auditList: Database.Statement;
@@ -294,6 +305,9 @@ interface Statements {
   // notification preferences
   notifPrefsGet: Database.Statement;
   notifPrefsUpsert: Database.Statement;
+  // diary activity counts (badge evaluation)
+  diaryCountActivityAllTime: Database.Statement;
+  diaryCountDistinctActiveDaysAllTime: Database.Statement;
 }
 
 let statementsCache: { db: Database.Database; s: Statements } | null = null;
@@ -506,11 +520,29 @@ function statements(): Statements {
     ),
 
     // badges -----------------------------------------------------------
-    badgeInsert: db.prepare(
-      'INSERT OR IGNORE INTO badges_earned (badge_id, earned_at) VALUES (?, ?)',
+    // Daily policy: INSERT OR IGNORE on the UNIQUE(badge_id, earned_day) key.
+    // The earning day is provided by the caller (derived from `when` in local time).
+    badgeInsertDaily: db.prepare(
+      'INSERT OR IGNORE INTO badges_earned (badge_id, earned_at, earned_day) VALUES (?, ?, ?)',
     ),
+    // Once-ever policy: insert only when NO row exists for this badge_id at all.
+    // Uses INSERT OR IGNORE with a WHERE NOT EXISTS guard so it stays atomic.
+    badgeInsertOnce: db.prepare(`
+      INSERT OR IGNORE INTO badges_earned (badge_id, earned_at, earned_day)
+      SELECT ?, ?, ?
+       WHERE NOT EXISTS (SELECT 1 FROM badges_earned WHERE badge_id = ?)
+    `),
+    // Check whether any row exists for a badge_id (used by earnBadge once-check).
+    badgeHasAny: db.prepare('SELECT 1 AS hit FROM badges_earned WHERE badge_id = ?'),
     badgeList: db.prepare('SELECT * FROM badges_earned ORDER BY earned_at DESC'),
-    badgeHas: db.prepare('SELECT 1 AS hit FROM badges_earned WHERE badge_id = ?'),
+    badgeSummarize: db.prepare(`
+      SELECT badge_id,
+             COUNT(*)     AS count,
+             MIN(earned_at) AS first_earned_at,
+             MAX(earned_at) AS last_earned_at
+        FROM badges_earned
+       GROUP BY badge_id
+    `),
 
     // audit ------------------------------------------------------------
     auditInsert: db.prepare(`
@@ -642,6 +674,20 @@ function statements(): Statements {
         quiet_start_minute = excluded.quiet_start_minute,
         quiet_end_minute   = excluded.quiet_end_minute,
         rare_only          = excluded.rare_only
+    `),
+
+    // diary activity counts ------------------------------------------------
+    // Returns the all-time COUNT(*) for a given activity value. Used by badge
+    // rules that track cumulative milestones (snack_attack, wheel_veteran).
+    diaryCountActivityAllTime: db.prepare(`
+      SELECT COUNT(*) AS n FROM diary_entries WHERE activity = ?
+    `),
+    // Counts distinct local calendar days on which any diary entry exists.
+    // Uses the same localtime convention as the migration-generated earned_day:
+    // date(occurred_at/1000,'unixepoch','localtime'). Used by regular/loyal_friend.
+    diaryCountDistinctActiveDaysAllTime: db.prepare(`
+      SELECT COUNT(DISTINCT date(occurred_at / 1000, 'unixepoch', 'localtime')) AS n
+        FROM diary_entries
     `),
   };
 
@@ -1286,8 +1332,41 @@ export function bestWheelSessionMeters(): number {
 // Badges
 // ---------------------------------------------------------------------------
 
-export function earnBadge(badgeId: string, when: number = Date.now()): boolean {
-  const info = statements().badgeInsert.run(badgeId, when);
+/**
+ * Compute the local-time calendar date string (YYYY-MM-DD) for a given
+ * epoch-millisecond timestamp. Matches the SQLite `date(...,'localtime')`
+ * expression used in the migration so existing rows are consistent.
+ */
+function epochMsToLocalDay(when: number): string {
+  const d = new Date(when);
+  const yyyy = d.getFullYear().toString().padStart(4, '0');
+  const mm = (d.getMonth() + 1).toString().padStart(2, '0');
+  const dd = d.getDate().toString().padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/**
+ * Attempt to earn a badge.
+ *
+ * - repeat === 'daily': INSERT OR IGNORE on UNIQUE(badge_id, earned_day);
+ *   returns true only when a row was actually inserted (i.e. not yet earned today).
+ * - repeat === 'once': inserts only when no row for this badge_id exists at all;
+ *   returns true on the very first earn, false on every subsequent call.
+ *
+ * Both paths are idempotent and prepared-statement based.
+ */
+export function earnBadge(
+  badgeId: string,
+  when: number = Date.now(),
+  repeat: 'daily' | 'once' = 'once',
+): boolean {
+  const earnedDay = epochMsToLocalDay(when);
+  if (repeat === 'daily') {
+    const info = statements().badgeInsertDaily.run(badgeId, when, earnedDay);
+    return info.changes > 0;
+  }
+  // once: guard via WHERE NOT EXISTS so it stays a single atomic statement.
+  const info = statements().badgeInsertOnce.run(badgeId, when, earnedDay, badgeId);
   return info.changes > 0;
 }
 
@@ -1296,7 +1375,37 @@ export function listBadges(): BadgeRow[] {
 }
 
 export function hasBadge(badgeId: string): boolean {
-  return statements().badgeHas.get(badgeId) !== undefined;
+  return statements().badgeHasAny.get(badgeId) !== undefined;
+}
+
+/**
+ * Aggregate view of all earned badges: one row per badge_id with the
+ * cumulative count and first/last earn timestamps. Backs the tRPC
+ * `badges.earned` query.
+ */
+export function summarizeBadges(): BadgeSummaryRow[] {
+  return statements().badgeSummarize.all() as BadgeSummaryRow[];
+}
+
+/**
+ * Count all diary entries of a given activity across all time. Used by
+ * once-ever badge rules that track cumulative activity milestones
+ * (e.g. snack_attack, wheel_veteran).
+ */
+export function countDiaryActivityAllTime(activity: DiaryActivity): number {
+  const row = statements().diaryCountActivityAllTime.get(activity) as { n: number };
+  return row.n;
+}
+
+/**
+ * Count the number of distinct local calendar days on which any diary entry
+ * exists. Used by the regular / loyal_friend once-ever badges.
+ * The local day is computed identically to the migration-generated earned_day:
+ *   date(occurred_at / 1000, 'unixepoch', 'localtime')
+ */
+export function countDistinctActiveDaysAllTime(): number {
+  const row = statements().diaryCountDistinctActiveDaysAllTime.get() as { n: number };
+  return row.n;
 }
 
 // ---------------------------------------------------------------------------

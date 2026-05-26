@@ -288,7 +288,9 @@ export type DiaryEntryDTO = z.infer<typeof diaryEntrySchema>;
 
 const badgeSchema = z.object({
   badge_id: z.string(),
-  earned_at: z.number().int(),
+  count: z.number().int(),
+  first_earned_at: z.number().int(),
+  last_earned_at: z.number().int(),
 });
 export type BadgeDTO = z.infer<typeof badgeSchema>;
 
@@ -1042,7 +1044,7 @@ const badgesRouter = router({
   earned: protectedProcedure
     .input(z.void())
     .output(z.array(badgeSchema))
-    .query(() => db.listBadges()),
+    .query(() => db.summarizeBadges()),
 });
 
 // ---------------------------------------------------------------------------

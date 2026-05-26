@@ -19,6 +19,7 @@ import { Header } from './components/Header';
 import { LiveStatus } from './components/LiveStatus';
 import { StatsStrip } from './components/StatsStrip';
 import { WheelRecordsCard } from './components/WheelRecordsCard';
+import { BadgesSection } from './components/BadgesSection';
 import { CameraGrid } from './components/CameraGrid';
 import { Diary } from './components/Diary';
 import { BadgePopover } from './components/BadgePopover';
@@ -168,6 +169,7 @@ export function AppShell(): JSX.Element {
             setSettingsOpen(true);
           } : undefined}
         />
+        <BadgesSection />
         <Diary
           readAloud={settings.data?.read_aloud ?? false}
           petName={settings.data?.pet_name?.trim() || cachedBrand.petName}
