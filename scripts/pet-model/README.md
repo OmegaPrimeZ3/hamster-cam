@@ -50,6 +50,37 @@ All large artifacts (venv, datasets, training runs, weights, ONNX) land under th
 config's `work_dir` (default `~/pet-models/<pet>/`), which the wrapper **refuses
 to place inside the git repo**. Nothing heavy is committed.
 
+### Mixing in your own frames (local sources)
+
+Beyond Roboflow, the build step can fold in **local image dirs** you harvested
+yourself (e.g. real frames pulled off the live Frigate host) — this is the single
+biggest accuracy lever for a specific cage. Add a `local_sources:` list to the pet
+config:
+
+```yaml
+local_sources:
+  - path: ~/pet-models/hamster/local/cage_pos   # images/ + labels/ (YOLOv8 layout)
+    role: positive
+  - path: ~/pet-models/hamster/local/cage_neg   # images/ only
+    role: negative
+local_oversample: 4    # duplicate local samples Nx in TRAIN (val untouched)
+```
+
+- **`role: positive`** — `images/` + `labels/`; labels are remapped to class 0 like
+  any other source.
+- **`role: negative`** — `images/` only; each image is emitted as a YOLO **background**
+  example (empty label) so the model learns **not** to fire on reflections, glints,
+  and empty-cage frames. Keep negatives to ≲30–40% of positives.
+- **`local_oversample`** — local frames are usually far outnumbered by public images;
+  this duplicates them in the **train** split only (val is never oversampled, so mAP
+  stays honest). `1` = off; try `3–5` once you have cage frames.
+
+Local sources are de-duped (content hash) against the Roboflow merge and each other,
+and spread across the train/val split deterministically. With **no** `local_sources`
+configured the output is identical to the Roboflow-only build. See
+[`docs/HAMSTER_MODEL_TUNING.md`](../../docs/HAMSTER_MODEL_TUNING.md) Phases F–H for the
+full harvest → review → fine-tune workflow.
+
 ### Re-export without retraining
 
 ```sh

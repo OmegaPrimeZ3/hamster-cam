@@ -32,6 +32,26 @@ datasets:
     project: hamster-0ip1u
     version: 2
 
+# --- TUNING (docs/HAMSTER_MODEL_TUNING.md) — left commented until "execute" ---
+# Bigger public sets to broaden the base (confirm each version(N) on Universe
+# "Download -> YOLOv8" before enabling — the pipeline fails loudly on a 404):
+#   - workspace: pet-monitor        # ~1521 imgs, cage/pet-monitor domain (closest match)
+#     project: hamster-k5ngx
+#     version: 1
+#   - workspace: guagua             # ~443 imgs
+#     project: hamster
+#     version: 1
+#
+# Real cage frames harvested off the live host (Phases G+H). Positives reviewed
+# by hand; negatives are reflection/empty-cage stills as background. Harvest ONLY
+# from 2026-05-25 19:00 onward (first footage clean of the mains-flicker fix).
+# local_sources:
+#   - path: ~/pet-models/hamster/local/cage_pos
+#     role: positive
+#   - path: ~/pet-models/hamster/local/cage_neg
+#     role: negative
+# local_oversample: 4   # up-weight scarce cage frames vs the larger public pool
+
 base_model: yolov9t.pt
 imgsz: 320
 epochs: 120
