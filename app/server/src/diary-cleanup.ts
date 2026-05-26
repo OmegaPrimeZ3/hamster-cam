@@ -50,60 +50,100 @@ interface Plan {
   runsCollapsed: number;
 }
 
+interface PassRow {
+  id: number;
+  activity: string | null;
+  start: number;
+  end: number;
+}
+
 /**
- * Walk every narrative entry in chronological order and replay the narrator's
- * single-step coalescing (it only ever compares against the immediately
- * preceding entry). A survivor accumulates consecutive same-activity visits
- * whose gaps each stay within the window; anything else starts a fresh run.
+ * One chronological sweep replaying the narrator's single-step coalescing (it
+ * only ever compares against the immediately preceding entry). A survivor
+ * accumulates consecutive same-activity visits whose gaps each stay within the
+ * window; anything else starts a fresh run. Returns, per run that collapsed,
+ * the survivor's new span and the ids it absorbed.
  */
-function planCoalesce(rows: db.DiaryEntryRow[]): Plan {
-  const updates: Plan['updates'] = [];
+function singlePass(rows: PassRow[]): { extend: PassRow[]; deleteIds: number[] } {
+  const extend: PassRow[] = [];
   const deleteIds: number[] = [];
-  let runsCollapsed = 0;
+  let survivor: PassRow | null = null;
+  let absorbed = 0;
 
-  // The last surviving entry, with a mutable end/duration as it absorbs more.
-  let survivor: { id: number; activity: string | null; start: number; end: number } | null = null;
-  let survivorAbsorbed = 0;
-
-  const flushSurvivor = () => {
-    if (survivor && survivorAbsorbed > 0) {
-      updates.push({
-        id: survivor.id,
-        occurred_at: survivor.end,
-        duration_ms: survivor.end - survivor.start,
-      });
-      runsCollapsed += 1;
-    }
-    survivorAbsorbed = 0;
+  const flush = () => {
+    if (survivor && absorbed > 0) extend.push({ ...survivor });
+    absorbed = 0;
   };
 
   for (const e of rows) {
-    if (e.kind !== 'narrative') continue;
-    const start = e.occurred_at - (e.duration_ms ?? 0);
-
     const coalescible =
       survivor !== null &&
       survivor.activity === e.activity &&
       e.activity != null &&
       COALESCIBLE.has(e.activity) &&
-      e.occurred_at > survivor.end &&
-      start - survivor.end <= COALESCE_WINDOW_MS;
+      e.start - survivor.end <= COALESCE_WINDOW_MS;
 
     if (coalescible && survivor) {
-      // Absorb e into the survivor: its span now ends where e ended.
-      survivor.end = e.occurred_at;
-      survivorAbsorbed += 1;
+      // Absorb e. Use max() so a nested/earlier-ending overlap (possible with
+      // concurrent multi-camera tracks) is deleted without shrinking the span.
+      survivor.end = Math.max(survivor.end, e.end);
+      absorbed += 1;
       deleteIds.push(e.id);
       continue;
     }
-
-    // New run head. Bank the previous survivor's growth first.
-    flushSurvivor();
-    survivor = { id: e.id, activity: e.activity, start, end: e.occurred_at };
+    flush();
+    survivor = { ...e };
   }
-  flushSurvivor();
+  flush();
+  return { extend, deleteIds };
+}
 
-  return { updates, deleteIds, runsCollapsed };
+/**
+ * Iterate {@link singlePass} to a fixpoint. Extending a survivor's end forward
+ * can bring it within the window of a run that was previously out of reach, so
+ * a single sweep is not idempotent — we re-sweep the projected post-state until
+ * nothing more collapses. The narrator never hits this (it coalesces visit-by-
+ * visit as events arrive); only a batch backfill over historical rows does.
+ */
+function planCoalesce(rows: db.DiaryEntryRow[]): Plan {
+  // Sort by visit START, not by occurred_at (which is the END). Overlapping
+  // multi-camera tracks mean end-order != start-order, and coalescing compares
+  // a visit's start against the survivor's end — so the sweep must run in start
+  // order. Starts never change as survivors grow, so this sort holds across
+  // every pass.
+  let projection: PassRow[] = rows
+    .filter((e) => e.kind === 'narrative')
+    .map((e) => ({
+      id: e.id,
+      activity: e.activity,
+      start: e.occurred_at - (e.duration_ms ?? 0),
+      end: e.occurred_at,
+    }))
+    .sort((a, b) => a.start - b.start || a.id - b.id);
+
+  const finalSpan = new Map<number, PassRow>(); // survivor id → its grown span
+  const deleted = new Set<number>();
+
+  for (;;) {
+    const { extend, deleteIds } = singlePass(projection);
+    if (deleteIds.length === 0) break;
+    for (const s of extend) finalSpan.set(s.id, s);
+    for (const id of deleteIds) {
+      deleted.add(id);
+      finalSpan.delete(id); // a former survivor can itself be absorbed later
+    }
+    const removed = new Set(deleteIds);
+    projection = projection
+      .filter((r) => !removed.has(r.id))
+      .map((r) => finalSpan.get(r.id) ?? r);
+  }
+
+  const updates = [...finalSpan.values()].map((s) => ({
+    id: s.id,
+    occurred_at: s.end,
+    duration_ms: s.end - s.start,
+  }));
+  return { updates, deleteIds: [...deleted], runsCollapsed: updates.length };
 }
 
 function fmt(ms: number): string {

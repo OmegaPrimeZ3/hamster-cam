@@ -27,6 +27,8 @@ function entry(activity: string | null, at: number, durMs = 5_000): DiaryEntryRo
     details: null,
     ai_model: null,
     created_by: null,
+    thumbnail_path: null,
+    clip_path: null,
   };
 }
 
@@ -92,6 +94,24 @@ describe('planCoalesce', () => {
     ];
     const plan = planCoalesce(rows);
     expect(plan.deleteIds).toEqual([]);
+  });
+
+  it('reaches a fixpoint: overlapping/out-of-end-order entries all collapse in one plan', () => {
+    // end-order != start-order: a long visit and a nested shorter one, plus a
+    // follow-on that only becomes reachable once the survivor's end grows. A
+    // naive end-ordered single sweep would leave a residual; the start-ordered
+    // fixpoint must absorb everything at once.
+    const rows = [
+      entry('exploring', T + 100_000, 100_000), // start T,      end T+100s (long)
+      entry('exploring', T + 60_000, 10_000), //   start T+50s,  end T+60s (nested, ends earlier)
+      entry('exploring', T + 200_000, 5_000), //   start T+195s, end T+200s (gap 95s from T+100s)
+    ];
+    const plan = planCoalesce(rows);
+    expect(plan.deleteIds).toHaveLength(2);
+    expect(plan.updates).toHaveLength(1);
+    const survivorId = plan.updates[0]!.id;
+    expect(plan.deleteIds).not.toContain(survivorId);
+    expect(plan.updates[0]!.occurred_at).toBe(T + 200_000);
   });
 
   it('chains a long run measured gap-to-gap from the growing survivor', () => {
