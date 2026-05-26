@@ -2,10 +2,11 @@
 // Nightly retention sweep. PLAN §8.
 
 import { readdir, stat, unlink } from 'node:fs/promises';
-import { join, isAbsolute } from 'node:path';
+import { join } from 'node:path';
 
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
+import { deleteFileBestEffort } from '../fs-utils.js';
 import { childLogger } from '../logger.js';
 
 const logger = childLogger('retention-job');
@@ -29,16 +30,6 @@ function readSettingInt(key: string, fallback: number): number {
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-async function deleteFileBestEffort(absOrRel: string): Promise<void> {
-  const cfg = getConfig();
-  const abs = isAbsolute(absOrRel) ? absOrRel : join(cfg.STORAGE_PATH, absOrRel);
-  await unlink(abs).catch((err: NodeJS.ErrnoException) => {
-    if (err.code !== 'ENOENT') {
-      logger.warn({ path: abs, err: err.message }, 'failed to delete retention file');
-    }
-  });
 }
 
 export async function runRetentionJob(): Promise<RetentionRunResult> {

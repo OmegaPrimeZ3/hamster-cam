@@ -73,6 +73,7 @@ function makeDiaryEntry(
     media_path: null,
     details: null,
     ai_model: null,
+    created_by: null,
     ...overrides,
   };
 }

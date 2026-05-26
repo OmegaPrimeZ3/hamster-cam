@@ -718,6 +718,8 @@ export async function saveManualSnapshot(input: {
   takenAt: number;
   mediaPath: string;
   rng?: () => number;
+  /** User who triggered the snapshot. Omit or null for system-generated entries. */
+  userId?: number | null;
 }): Promise<db.DiaryEntryRow> {
   const snapshot = db.createSnapshot({
     camera_id: input.cameraId,
@@ -739,6 +741,7 @@ export async function saveManualSnapshot(input: {
     snapshot_id: snapshot.id,
     media_path: input.mediaPath,
     details: null,
+    created_by: input.userId ?? null,
   });
   await evaluateBadges();
   return entry;
