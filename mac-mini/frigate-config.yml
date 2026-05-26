@@ -54,6 +54,15 @@ model:
   path: /config/model_cache/hamster_y9.onnx
   labelmap_path: /config/model_cache/hamster.txt
 
+# Detection defaults applied to every camera. enabled: true is the master
+# on-switch for the detect pipeline — the per-camera detect: blocks below only
+# set the stream geometry/fps, not whether detection runs. Stated explicitly so
+# every camera BOOTS with detection on regardless of Frigate's version default.
+# NOTE: toggling detection off in the UI / via MQTT is a runtime override that
+# Frigate persists separately; this value is only the startup default.
+detect:
+  enabled: true
+
 # Defaults applied to every camera unless overridden. Per-PLAN §8 retention
 # math: continuous = 3 days, event clips = 30 days.
 record:
