@@ -5,7 +5,7 @@
 // until queued → sent | failed.
 
 import * as Dialog from '@radix-ui/react-dialog';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { trpc, RouterOutputs } from '../trpc';
 
 type Entry = RouterOutputs['activity']['today'][number];
@@ -29,12 +29,15 @@ export function ShareDialog({ entry, open, onOpenChange }: ShareDialogProps): JS
     },
   );
 
+  // Stable reset callback — sendMut is a new object on every render so it must
+  // not appear in the dep array; we only care when `open` changes.
+  const resetSend = useCallback(() => sendMut.reset(), []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!open) {
       setPendingId(null);
-      sendMut.reset();
+      resetSend();
     }
-  }, [open, sendMut]);
+  }, [open, resetSend]);
 
   const lastStatus = status.data;
   const closeable = !sendMut.isLoading && !(pendingId != null && lastStatus?.status === 'queued');
