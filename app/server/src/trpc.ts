@@ -19,6 +19,7 @@ import { initTRPC, TRPCError } from '@trpc/server';
 import type { CreateFastifyContextOptions } from '@trpc/server/adapters/fastify';
 import { z } from 'zod';
 
+import { deleteFileBestEffort } from './fs-utils.js';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRetentionJob } from './jobs/retention.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
@@ -278,6 +279,7 @@ const diaryEntrySchema = z.object({
   media_path: z.string().nullable(),
   ai_model: z.string().nullable(),
   details: z.string().nullable(),
+  created_by: z.number().int().nullable(),
 });
 export type DiaryEntryDTO = z.infer<typeof diaryEntrySchema>;
 
@@ -360,6 +362,7 @@ function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
     media_path: row.media_path,
     ai_model: row.ai_model ?? null,
     details: row.details ?? null,
+    created_by: row.created_by ?? null,
   };
 }
 
@@ -747,7 +750,7 @@ const activityRouter = router({
   snapshot: protectedProcedure
     .input(z.object({ camera_id: z.number().int() }))
     .output(diaryEntrySchema)
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
       const camera = db.getCameraById(input.camera_id);
       if (!camera) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'camera not found' });
@@ -763,6 +766,7 @@ const activityRouter = router({
         cameraId: camera.id,
         takenAt: now,
         mediaPath: snap.path,
+        userId: ctx.user.id,
       });
       return diaryToDTO(entry);
     }),
@@ -780,6 +784,69 @@ const activityRouter = router({
       at: z.number().int(),
     })))
     .query(() => getRecentEvents()),
+
+  /**
+   * Delete a diary entry and its associated media file.
+   *
+   * Authorization:
+   *   - Admin: may delete any entry of any kind.
+   *   - Non-admin: may only delete snapshot entries they personally captured
+   *     (entry.kind === 'snapshot' && entry.created_by === ctx.user.id).
+   *
+   * Side-effects:
+   *   - Best-effort unlink of entry.media_path if set.
+   *   - Hard delete of the linked snapshots row if entry.snapshot_id is set
+   *     (the snapshot file is the same as media_path — unlinked once above).
+   *   - Audit log row written for every deletion (admin or non-admin path).
+   */
+  delete: protectedProcedure
+    .input(z.object({ id: z.number().int() }))
+    .output(z.object({ ok: z.literal(true) }))
+    .mutation(async ({ ctx, input }) => {
+      const entry = db.getDiaryEntryById(input.id);
+      if (!entry) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'diary entry not found' });
+      }
+
+      if (ctx.user.role !== 'admin') {
+        if (entry.kind !== 'snapshot' || entry.created_by !== ctx.user.id) {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message: 'you can only delete your own snapshots',
+          });
+        }
+      }
+
+      // Best-effort unlink — ENOENT is silently ignored.
+      if (entry.media_path) {
+        await deleteFileBestEffort(entry.media_path);
+      }
+
+      // Remove the snapshots table row. The file was already handled above.
+      if (entry.snapshot_id !== null) {
+        db.deleteSnapshot(entry.snapshot_id);
+      }
+
+      // Hard delete the diary row.
+      db.deleteDiaryEntry(input.id);
+
+      // Audit every deletion regardless of role — the audit middleware only
+      // fires automatically for adminProcedure. We write explicitly here so
+      // non-admin self-deletions are also tracked.
+      db.insertAudit({
+        actor_user_id: ctx.user.id,
+        action: 'diary.delete',
+        target_type: 'diary_entry',
+        target_id: String(input.id),
+        details: {
+          kind: entry.kind,
+          created_by: entry.created_by,
+          was_admin: ctx.user.role === 'admin',
+        },
+      });
+
+      return { ok: true } as const;
+    }),
 });
 
 // ---------------------------------------------------------------------------

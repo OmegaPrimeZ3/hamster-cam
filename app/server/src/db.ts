@@ -113,6 +113,8 @@ export interface DiaryEntryRow {
   media_path: string | null;
   details: string | null;
   ai_model: string | null;
+  /** User who triggered this entry manually. NULL for auto-generated entries. */
+  created_by: number | null;
 }
 
 export interface PushSubscriptionRow {
@@ -236,6 +238,7 @@ interface Statements {
   // snapshots
   snapshotInsert: Database.Statement;
   snapshotById: Database.Statement;
+  snapshotDelete: Database.Statement;
   snapshotListByCamera: Database.Statement;
   snapshotListByDay: Database.Statement;
   snapshotDeleteOlderThan: Database.Statement;
@@ -243,6 +246,7 @@ interface Statements {
   // diary
   diaryInsert: Database.Statement;
   diaryById: Database.Statement;
+  diaryDelete: Database.Statement;
   diaryListBetween: Database.Statement;
   diaryListByKindBetween: Database.Statement;
   diaryUpsertTimelapseForDate: Database.Statement;
@@ -418,6 +422,7 @@ function statements(): Statements {
       VALUES (@camera_id, @taken_at, @path)
     `),
     snapshotById: db.prepare('SELECT * FROM snapshots WHERE id = ?'),
+    snapshotDelete: db.prepare('DELETE FROM snapshots WHERE id = ?'),
     snapshotListByCamera: db.prepare(`
       SELECT * FROM snapshots
        WHERE camera_id = ?
@@ -437,14 +442,15 @@ function statements(): Statements {
       INSERT INTO diary_entries (
         occurred_at, kind, activity, narrative, pet_name,
         camera_id, from_camera_id, to_camera_id,
-        duration_ms, snapshot_id, media_path, details, ai_model
+        duration_ms, snapshot_id, media_path, details, ai_model, created_by
       ) VALUES (
         @occurred_at, @kind, @activity, @narrative, @pet_name,
         @camera_id, @from_camera_id, @to_camera_id,
-        @duration_ms, @snapshot_id, @media_path, @details, @ai_model
+        @duration_ms, @snapshot_id, @media_path, @details, @ai_model, @created_by
       )
     `),
     diaryById: db.prepare('SELECT * FROM diary_entries WHERE id = ?'),
+    diaryDelete: db.prepare('DELETE FROM diary_entries WHERE id = ?'),
     diaryListBetween: db.prepare(`
       SELECT * FROM diary_entries
        WHERE occurred_at >= ? AND occurred_at < ?
@@ -1038,6 +1044,10 @@ export function countSnapshotsSince(sinceMs: number): number {
   return row.n;
 }
 
+export function deleteSnapshot(id: number): void {
+  statements().snapshotDelete.run(id);
+}
+
 // ---------------------------------------------------------------------------
 // Diary entries
 // ---------------------------------------------------------------------------
@@ -1056,12 +1066,15 @@ export interface CreateDiaryEntryInput {
   media_path: string | null;
   details: string | null;
   ai_model?: string | null;
+  /** User who triggered this entry. Omit or null for auto-generated entries. */
+  created_by?: number | null;
 }
 
 export function createDiaryEntry(input: CreateDiaryEntryInput): DiaryEntryRow {
   const result = statements().diaryInsert.run({
     ...input,
     ai_model: input.ai_model ?? null,
+    created_by: input.created_by ?? null,
   });
   const id = Number(result.lastInsertRowid);
   const row = statements().diaryById.get(id) as DiaryEntryRow | undefined;
@@ -1071,6 +1084,10 @@ export function createDiaryEntry(input: CreateDiaryEntryInput): DiaryEntryRow {
 
 export function getDiaryEntryById(id: number): DiaryEntryRow | null {
   return (statements().diaryById.get(id) as DiaryEntryRow | undefined) ?? null;
+}
+
+export function deleteDiaryEntry(id: number): void {
+  statements().diaryDelete.run(id);
 }
 
 export function listDiaryEntriesBetween(fromMs: number, toMs: number): DiaryEntryRow[] {

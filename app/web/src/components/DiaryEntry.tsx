@@ -19,14 +19,16 @@
 
 import { useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { Share2, Play, Volume2, Square } from 'lucide-react';
+import { Share2, Play, Volume2, Square, Trash2 } from 'lucide-react';
 import type { RouterOutputs } from '../trpc';
+import { trpc } from '../trpc';
 import { relativeTime, formatDuration } from '../lib/time';
 import { activityStyle } from '../lib/activity-style';
 import { ShareDialog } from './ShareDialog';
 import { isTTSAvailable, speak } from '../lib/tts';
 import { parseWheelMeters } from '../lib/trpc-extensions';
 import { formatMeters } from '../lib/distance';
+import { useAuth } from '../hooks/useAuth';
 
 type Entry = RouterOutputs['activity']['today'][number];
 
@@ -60,7 +62,26 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
   const [expanded, setExpanded] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const reduced = useReducedMotion();
+
+  const { user, isAdmin } = useAuth();
+  const utils = trpc.useUtils();
+  const del = trpc.activity.delete.useMutation({
+    onSuccess: async () => {
+      setConfirmDelete(false);
+      await utils.activity.today.invalidate();
+      await utils.activity.range.invalidate();
+    },
+    onError: (err) => {
+      setConfirmDelete(false);
+      setDeleteError(err.message ?? 'Could not delete this memory. Try again.');
+    },
+  });
+
+  const canDelete =
+    isAdmin || (entry.kind === 'snapshot' && entry.created_by === user?.id);
 
   const relative = relativeTime(entry.occurred_at, now);
   const duration = entry.duration_ms != null ? formatDuration(entry.duration_ms) : null;
@@ -195,7 +216,7 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
             {duration ? ` · ${duration}` : ''}
             {distanceSuffix}
           </small>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button
               type="button"
               className="hc-btn"
@@ -231,7 +252,35 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
                 )}
               </button>
             )}
+            {canDelete && (
+              <button
+                type="button"
+                className={confirmDelete ? 'hc-btn hc-btn-danger' : 'hc-btn'}
+                aria-label={confirmDelete ? 'Are you sure? This memory will be gone forever' : 'Delete memory'}
+                disabled={del.isLoading}
+                onClick={() => {
+                  if (confirmDelete) {
+                    setDeleteError(null);
+                    del.mutate({ id: entry.id });
+                  } else {
+                    setConfirmDelete(true);
+                    window.setTimeout(
+                      () => setConfirmDelete((c) => (c ? false : c)),
+                      3500,
+                    );
+                  }
+                }}
+              >
+                <Trash2 aria-hidden size={16} />
+                {confirmDelete ? 'Delete this memory?' : 'Delete'}
+              </button>
+            )}
           </div>
+          {deleteError !== null && (
+            <small style={{ color: 'var(--color-danger, #d32f2f)', marginTop: 4 }}>
+              {deleteError}
+            </small>
+          )}
         </div>
       </div>
 
