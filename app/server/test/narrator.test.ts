@@ -6,7 +6,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { migrate } from '../src/migrate.js';
 
 let workdir: string;
 const baseEnv = { ...process.env };
@@ -862,4 +865,368 @@ describe('narrator multi-camera dedup', () => {
     void db;
     vi.doUnmock('node:child_process');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests: cameraIdByName resolution via live_src (bug fix)
+// ---------------------------------------------------------------------------
+
+describe('cameraIdByName — live_src resolution', () => {
+  /**
+   * Seed cameras that mirror the production situation:
+   *   Camera 1  (name='Camera 1',  live_src='hamster_cam_1')
+   *   Camera 2  (name='Camera 2',  live_src='hamster_cam_2')
+   * Frigate events carry the live_src value, not the name.
+   */
+  async function seedProductionCameras() {
+    const db = await import('../src/db.js');
+    const cam1 = db.createCamera({
+      name: 'Camera 1',
+      emoji: '📷',
+      stream_url: 'rtsp://x/cam1',
+      live_src: 'hamster_cam_1',
+      enabled: true,
+    });
+    const cam2 = db.createCamera({
+      name: 'Camera 2',
+      emoji: '📷',
+      stream_url: 'rtsp://x/cam2',
+      live_src: 'hamster_cam_2',
+      enabled: true,
+    });
+    db.setSetting('pet_name', 'Remy');
+    return { cam1Id: cam1.id, cam2Id: cam2.id };
+  }
+
+  it('resolves a Frigate live_src identifier to the correct camera id (primary match)', async () => {
+    const db = await import('../src/db.js');
+    const ids = await seedProductionCameras();
+    // handleFrigateEvent internally calls cameraIdByName with the Frigate camera
+    // name. After the fix, diary entries should carry the correct camera_id.
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    vi.useFakeTimers();
+    const t0 = 1_700_000_000_000;
+    // Frigate sends live_src as the camera identifier.
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'hamster_cam_1', zones: ['food'], startSec: 1_700_000_000, endSec: 1_700_000_005 }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    // This is the regression assertion: camera_id must NOT be null.
+    expect(entries[0]?.camera_id).toBe(ids.cam1Id);
+    void ids;
+    vi.useRealTimers();
+  });
+
+  it('resolves case-insensitively and trims whitespace on live_src', async () => {
+    const db = await import('../src/db.js');
+    // Camera with live_src that has mixed case.
+    const cam = db.createCamera({
+      name: 'Wide View',
+      emoji: '📷',
+      stream_url: 'rtsp://x/wide',
+      live_src: 'Hamster_CAM_Wide',
+      enabled: true,
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    vi.useFakeTimers();
+    const t0 = 1_700_000_500_000;
+    // Frigate sends the identifier in lower_snake_case — must still match.
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'hamster_cam_wide', zones: ['food'], startSec: 1_700_000_500, endSec: 1_700_000_505 }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.camera_id).toBe(cam.id);
+    vi.useRealTimers();
+  });
+
+  it('falls back to name match when live_src is null', async () => {
+    const db = await import('../src/db.js');
+    // Camera with no live_src configured.
+    const cam = db.createCamera({
+      name: 'wheel',
+      emoji: '🎡',
+      stream_url: 'rtsp://x/wheel',
+      enabled: true,
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    vi.useFakeTimers();
+    const t0 = 1_700_001_000_000;
+    // Frigate camera name matches cameras.name exactly (legacy single-cam setup).
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: 1_700_001_000, endSec: 1_700_001_005 }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.camera_id).toBe(cam.id);
+    vi.useRealTimers();
+  });
+
+  it('live_src match takes priority over name match when both would match different cameras', async () => {
+    const db = await import('../src/db.js');
+    // Camera A: name='hamster_cam_1', live_src='actual_cam' — name collision with Frigate id.
+    const camA = db.createCamera({
+      name: 'hamster_cam_1',
+      emoji: '📷',
+      stream_url: 'rtsp://x/a',
+      live_src: 'actual_cam',
+      enabled: true,
+    });
+    // Camera B: name='decoy', live_src='hamster_cam_1' — the correct one.
+    const camB = db.createCamera({
+      name: 'decoy',
+      emoji: '📷',
+      stream_url: 'rtsp://x/b',
+      live_src: 'hamster_cam_1',
+      enabled: true,
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    vi.useFakeTimers();
+    const t0 = 1_700_002_000_000;
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'hamster_cam_1', zones: ['food'], startSec: 1_700_002_000, endSec: 1_700_002_005 }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    // live_src match (camB) must win over name match (camA).
+    expect(entries[0]?.camera_id).toBe(camB.id);
+    void camA;
+    vi.useRealTimers();
+  });
+
+  it('wheel session starts when Frigate sends live_src identifier for a wheel-enabled camera', async () => {
+    // Regression test for symptom (2): wheel sessions never started because
+    // cameraIdByName returned null, so startWheelSession was never called.
+    const spawnMock = vi.fn(() => makeFakeProc());
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+
+    const db = await import('../src/db.js');
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const { _activeSessions } = await import('../src/wheel-odometer.js');
+
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    // Production-style camera: name='Camera 1', live_src='hamster_cam_1'.
+    const cam = db.createCamera({
+      name: 'Camera 1',
+      emoji: '📷',
+      stream_url: 'rtsp://x/cam1',
+      live_src: 'hamster_cam_1',
+      enabled: true,
+      wheel_mark_enabled: true,
+      wheel_diameter_mm: 152.0,
+      wheel_band_y_pct: 50.0,
+      wheel_band_height_pct: 10.0,
+      wheel_threshold_pct: 50.0,
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    vi.useFakeTimers();
+    const t0 = 1_700_003_000_000;
+    const deps = { now: () => t0, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Frigate sends the live_src value as camera name.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'hamster_cam_1', zones: ['wheel'], startSec: 1_700_003_000 }),
+      deps,
+    );
+
+    // With the fix, the camera resolves → odometer session starts.
+    expect(_activeSessions.size).toBe(1);
+    expect(_activeSessions.has(cam.id)).toBe(true);
+
+    void cam;
+    vi.useRealTimers();
+    vi.doUnmock('node:child_process');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Migration 0021 backfill tests
+// ---------------------------------------------------------------------------
+
+describe('migration 0021 — backfill diary camera_ids from details JSON', () => {
+  /**
+   * Strategy: migrate(path) once to get full schema + apply 0021. Insert broken
+   * rows (camera_id = NULL with details.camera). Delete the _migrations bookkeeping
+   * row for 0021 so the runner thinks it hasn't run. Close. Call migrate(path) again
+   * — it re-applies 0021 UPDATEs to the inserted rows. Assert camera_id populated.
+   */
+  function openMigratedDb(dbPath: string): Database.Database {
+    return migrate(dbPath);
+  }
+
+  it('populates camera_id for non-transition entries that have details.camera matching a live_src', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hamster-mig021-'));
+    const dbPath = join(dir, 'test.db');
+    try {
+      const db = openMigratedDb(dbPath);
+
+      db.prepare(
+        `INSERT INTO cameras (name, emoji, stream_url, live_src, enabled, created_at)
+         VALUES ('Camera 1','cam1','rtsp://x/cam1','hamster_cam_1',1,1700000000000)`,
+      ).run();
+      const camId = (db.prepare(`SELECT id FROM cameras WHERE live_src = 'hamster_cam_1'`).get() as { id: number }).id;
+
+      // Simulate a pre-fix row: camera_id IS NULL, details has the live_src value.
+      db.prepare(
+        `INSERT INTO diary_entries (occurred_at, kind, activity, narrative, camera_id, details)
+         VALUES (1700000005000,'narrative','food','Remy nibbled.',NULL,'{"camera":"hamster_cam_1"}')`,
+      ).run();
+      const entryId = (db.prepare('SELECT id FROM diary_entries').get() as { id: number }).id;
+
+      // Delete the 0021 _migrations row so migrate() re-applies it.
+      db.prepare(`DELETE FROM _migrations WHERE name LIKE '%0021%'`).run();
+      db.close();
+
+      // Re-run migrate so 0021 UPDATEs fire against our inserted row.
+      const db2 = openMigratedDb(dbPath);
+      const row = db2.prepare('SELECT camera_id FROM diary_entries WHERE id = ?').get(entryId) as { camera_id: number | null };
+      expect(row.camera_id).toBe(camId);
+      db2.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('populates from_camera_id and to_camera_id for transition entries, leaves camera_id null', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hamster-mig021b-'));
+    const dbPath = join(dir, 'test.db');
+    try {
+      const db = openMigratedDb(dbPath);
+
+      db.prepare(
+        `INSERT INTO cameras (name, emoji, stream_url, live_src, enabled, created_at)
+         VALUES ('Camera 1','cam1','rtsp://x/cam1','hamster_cam_1',1,1700000000000)`,
+      ).run();
+      db.prepare(
+        `INSERT INTO cameras (name, emoji, stream_url, live_src, enabled, created_at)
+         VALUES ('Camera 2','cam2','rtsp://x/cam2','hamster_cam_2',1,1700000000001)`,
+      ).run();
+      const cam1Id = (db.prepare(`SELECT id FROM cameras WHERE live_src = 'hamster_cam_1'`).get() as { id: number }).id;
+      const cam2Id = (db.prepare(`SELECT id FROM cameras WHERE live_src = 'hamster_cam_2'`).get() as { id: number }).id;
+
+      db.prepare(
+        `INSERT INTO diary_entries (occurred_at, kind, activity, narrative, camera_id, from_camera_id, to_camera_id, details)
+         VALUES (1700000010000,'narrative','transition','Remy moved.',NULL,NULL,NULL,
+                 '{"from":"hamster_cam_1","to":"hamster_cam_2","dwell_ms":5000}')`,
+      ).run();
+      const entryId = (db.prepare(`SELECT id FROM diary_entries WHERE activity = 'transition'`).get() as { id: number }).id;
+
+      db.prepare(`DELETE FROM _migrations WHERE name LIKE '%0021%'`).run();
+      db.close();
+
+      const db2 = openMigratedDb(dbPath);
+      const row = db2.prepare(
+        'SELECT camera_id, from_camera_id, to_camera_id FROM diary_entries WHERE id = ?',
+      ).get(entryId) as { camera_id: number | null; from_camera_id: number | null; to_camera_id: number | null };
+
+      expect(row.camera_id).toBeNull();
+      expect(row.from_camera_id).toBe(cam1Id);
+      expect(row.to_camera_id).toBe(cam2Id);
+      db2.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is a no-op for entries whose camera_id is already correctly set', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hamster-mig021c-'));
+    const dbPath = join(dir, 'test.db');
+    try {
+      const db = openMigratedDb(dbPath);
+
+      db.prepare(
+        `INSERT INTO cameras (name, emoji, stream_url, live_src, enabled, created_at)
+         VALUES ('Camera 1','cam1','rtsp://x/cam1','hamster_cam_1',1,1700000000000)`,
+      ).run();
+      const camId = (db.prepare(`SELECT id FROM cameras WHERE live_src = 'hamster_cam_1'`).get() as { id: number }).id;
+
+      // Entry already has the correct camera_id — migration must not disturb it.
+      db.prepare(
+        `INSERT INTO diary_entries (occurred_at, kind, activity, narrative, camera_id, details)
+         VALUES (1700000020000,'narrative','wheel','Remy ran.',${camId},'{"camera":"hamster_cam_1"}')`,
+      ).run();
+      const entryId = (db.prepare('SELECT id FROM diary_entries').get() as { id: number }).id;
+
+      db.prepare(`DELETE FROM _migrations WHERE name LIKE '%0021%'`).run();
+      db.close();
+
+      const db2 = openMigratedDb(dbPath);
+      const row = db2.prepare('SELECT camera_id FROM diary_entries WHERE id = ?').get(entryId) as { camera_id: number | null };
+      expect(row.camera_id).toBe(camId);
+      db2.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is a no-op when no camera matches the details.camera value', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hamster-mig021d-'));
+    const dbPath = join(dir, 'test.db');
+    try {
+      const db = openMigratedDb(dbPath);
+
+      // No cameras inserted — subquery returns NULL, camera_id stays NULL.
+      db.prepare(
+        `INSERT INTO diary_entries (occurred_at, kind, activity, narrative, camera_id, details)
+         VALUES (1700000030000,'narrative','food','Remy ate.',NULL,'{"camera":"unknown_cam"}')`,
+      ).run();
+      const entryId = (db.prepare('SELECT id FROM diary_entries').get() as { id: number }).id;
+
+      db.prepare(`DELETE FROM _migrations WHERE name LIKE '%0021%'`).run();
+      db.close();
+
+      const db2 = openMigratedDb(dbPath);
+      const row = db2.prepare('SELECT camera_id FROM diary_entries WHERE id = ?').get(entryId) as { camera_id: number | null };
+      expect(row.camera_id).toBeNull();
+      db2.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
 });

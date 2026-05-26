@@ -420,9 +420,30 @@ function petName(): string {
   return db.getSetting('pet_name') ?? '';
 }
 
+/**
+ * Resolve a Frigate camera identifier to a local camera row id.
+ *
+ * Frigate (and go2rtc) uses the `live_src` value as the camera identifier in
+ * MQTT event payloads (e.g. "hamster_cam_1"), NOT the human-readable `name`
+ * column (e.g. "Camera 1"). We therefore match against `live_src` first.
+ * Comparison is case-insensitive and whitespace-trimmed on both sides so
+ * minor config typos do not silently break resolution.
+ *
+ * Falls back to matching against `name` so single-camera setups that never
+ * set `live_src` (or that use the camera name as the Frigate source name)
+ * continue to work without migration.
+ */
 function cameraIdByName(name: string): number | null {
-  const found = db.listCameras().find((c) => c.name === name);
-  return found?.id ?? null;
+  const needle = name.trim().toLowerCase();
+  const cameras = db.listCameras();
+  // Primary: match on live_src (the value Frigate sends).
+  const byLiveSrc = cameras.find(
+    (c) => c.live_src !== null && c.live_src.trim().toLowerCase() === needle,
+  );
+  if (byLiveSrc) return byLiveSrc.id;
+  // Fallback: match on name (covers setups where live_src was never configured).
+  const byName = cameras.find((c) => c.name.trim().toLowerCase() === needle);
+  return byName?.id ?? null;
 }
 
 function isCameraWheelEnabled(cameraId: number): boolean {
