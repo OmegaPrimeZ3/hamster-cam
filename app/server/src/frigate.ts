@@ -462,10 +462,10 @@ export interface ExtractClipInput {
 }
 
 /**
- * Pulls a clip from Frigate's `/api/<cam>/recordings/<start>-<end>/clip.mp4`
- * endpoint, writes it under `STORAGE_PATH/clips/`, returns the absolute path.
- * Re-encoding is left to the caller (or skipped for performance — Frigate
- * already returns playable MP4 fragments).
+ * Pulls a clip from Frigate's `/api/<cam>/start/<startSec>/end/<endSec>/clip.mp4`
+ * endpoint (Frigate 0.17.x), writes it under `STORAGE_PATH/clips/`, returns
+ * the absolute path. Re-encoding is left to the caller (or skipped for
+ * performance — Frigate already returns playable MP4 fragments).
  *
  * Why not pure ffmpeg with a local file? Frigate stores recordings in
  * sharded ts segments; their REST API hides that and serves a single MP4.
@@ -488,8 +488,10 @@ export async function extractClip(input: ExtractClipInput): Promise<ExtractedCli
     `${input.cameraName}-${startSec}-${endSec}.mp4`,
   );
 
+  // Frigate 0.17.x recording-clip endpoint:
+  //   /api/<camera_name>/start/<startSec>/end/<endSec>/clip.mp4
   const sourceUrl = new URL(
-    `/api/${encodeURIComponent(input.cameraName)}/recordings/${startSec}-${endSec}/clip.mp4`,
+    `/api/${encodeURIComponent(input.cameraName)}/start/${startSec}/end/${endSec}/clip.mp4`,
     cfg.FRIGATE_URL,
   ).toString();
 
@@ -581,8 +583,10 @@ export async function extractFrame(input: {
   const width = input.widthPx ?? 480;
   const sec = Math.floor(input.atMs / 1000);
   const endSec = sec + 1;
+  // Frigate 0.17.x recording-clip endpoint (same route as extractClip):
+  //   /api/<camera_name>/start/<sec>/end/<endSec>/clip.mp4
   const sourceUrl = new URL(
-    `/api/${encodeURIComponent(input.cameraName)}/recordings/${sec}-${endSec}/clip.mp4`,
+    `/api/${encodeURIComponent(input.cameraName)}/start/${sec}/end/${endSec}/clip.mp4`,
     cfg.FRIGATE_URL,
   ).toString();
 

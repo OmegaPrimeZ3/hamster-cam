@@ -21,9 +21,11 @@ import { z } from 'zod';
 
 import { ensureClip } from './clips.js';
 import { deleteFileBestEffort } from './fs-utils.js';
+import { FfmpegError } from './frigate.js';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRetentionJob } from './jobs/retention.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
+import { childLogger } from './logger.js';
 import {
   getVapidPublicKey,
   sendPushToUser,
@@ -359,14 +361,26 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
   };
 }
 
+// Mirrors record.retain.days=3 in mac-mini/frigate-config.yml.
+// Entries older than this window cannot have live footage pulled from Frigate;
+// only already-extracted clip_path files or timelapse mp4s remain accessible.
+// Update this constant if you change record.retain.days in Frigate's config.
+const FRIGATE_RECORDING_RETENTION_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+
 function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
-  // clip_available: true when any extraction path is viable. Mirrors the
-  // resolution order in ensureClip() so the frontend can hide the button
-  // before ever making a clip.get call.
-  const clip_available =
-    row.clip_path != null ||
-    (row.media_path != null && row.media_path.toLowerCase().endsWith('.mp4')) ||
-    row.camera_id != null;
+  // clip_available resolution order (mirrors ensureClip):
+  //   1. Already extracted and cached on disk → always available regardless of age.
+  //   2. Timelapse mp4 via media_path → always available regardless of age.
+  //   3. camera_id set AND entry is recent enough for Frigate to still have footage.
+  //      Entries older than FRIGATE_RECORDING_RETENTION_MS will 404 on Frigate
+  //      and produce a doomed ffmpeg exit-1; suppress the button proactively.
+  const hasExtractedClip = row.clip_path != null;
+  const hasTimelapseMedia =
+    row.media_path != null && row.media_path.toLowerCase().endsWith('.mp4');
+  const withinRetentionWindow =
+    row.camera_id != null &&
+    Date.now() - row.occurred_at <= FRIGATE_RECORDING_RETENTION_MS;
+  const clip_available = hasExtractedClip || hasTimelapseMedia || withinRetentionWindow;
 
   return {
     id: row.id,
@@ -1646,6 +1660,7 @@ const clipRouter = router({
       duration_ms: z.number().int().nullable(),
     }))
     .query(async ({ input }) => {
+      const clipLog = childLogger('clip.get');
       const entry = db.getDiaryEntryById(input.diary_entry_id);
       if (!entry) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'diary entry not found' });
@@ -1655,12 +1670,35 @@ const clipRouter = router({
         return { url: `/${relPath}`, duration_ms: entry.duration_ms ?? null };
       } catch (err) {
         if (err instanceof TRPCError) throw err;
+
+        // ffmpeg failure: footage may have aged out of Frigate's 3-day
+        // continuous-recording retention, or the clip endpoint returned 404.
+        // Log the stderr for diagnostics but surface a friendly message.
+        if (err instanceof FfmpegError) {
+          clipLog.warn(
+            { diary_entry_id: input.diary_entry_id, ffmpegCode: err.code, stderr: err.stderr },
+            'clip extraction failed — footage likely outside Frigate retention window',
+          );
+          throw new TRPCError({
+            code: 'PRECONDITION_FAILED',
+            message: "This clip isn't available anymore.",
+          });
+        }
+
         const message = err instanceof Error ? err.message : 'clip extraction failed';
         // Entries with no camera_id and no mp4 media are structurally unable to
         // produce a clip — this is a client bug (button shown when clip_available
         // is false). Surface as 412 so the frontend can handle it gracefully.
         const isUnavailable =
           message.includes('no camera_id') || message.includes('cannot produce a clip');
+
+        if (!isUnavailable) {
+          clipLog.error(
+            { diary_entry_id: input.diary_entry_id, err },
+            'unexpected clip extraction error',
+          );
+        }
+
         throw new TRPCError({
           code: isUnavailable ? 'PRECONDITION_FAILED' : 'INTERNAL_SERVER_ERROR',
           message: isUnavailable
