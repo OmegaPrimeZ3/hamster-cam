@@ -254,6 +254,7 @@ interface Statements {
   snapshotDelete: Database.Statement;
   snapshotListByCamera: Database.Statement;
   snapshotListByDay: Database.Statement;
+  snapshotListByCameraAndDay: Database.Statement;
   snapshotDeleteOlderThan: Database.Statement;
   snapshotCountSince: Database.Statement;
   // diary
@@ -456,6 +457,11 @@ function statements(): Statements {
     snapshotListByDay: db.prepare(`
       SELECT * FROM snapshots
        WHERE taken_at >= ? AND taken_at < ?
+       ORDER BY taken_at ASC
+    `),
+    snapshotListByCameraAndDay: db.prepare(`
+      SELECT * FROM snapshots
+       WHERE camera_id = ? AND taken_at >= ? AND taken_at < ?
        ORDER BY taken_at ASC
     `),
     snapshotDeleteOlderThan: db.prepare('DELETE FROM snapshots WHERE taken_at < ?'),
@@ -1118,6 +1124,14 @@ export function listSnapshotsByCamera(cameraId: number, limit: number = 100): Sn
 
 export function listSnapshotsBetween(fromMs: number, toMs: number): SnapshotRow[] {
   return statements().snapshotListByDay.all(fromMs, toMs) as SnapshotRow[];
+}
+
+export function listSnapshotsBetweenForCamera(
+  cameraId: number,
+  fromMs: number,
+  toMs: number,
+): SnapshotRow[] {
+  return statements().snapshotListByCameraAndDay.all(cameraId, fromMs, toMs) as SnapshotRow[];
 }
 
 export function deleteSnapshotsOlderThan(cutoffMs: number): number {
