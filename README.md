@@ -4,10 +4,6 @@
 > on-device AI, a storybook activity diary, and a tiny AI ghostwriter
 > that tucks your hamster in at night.
 
-<!-- Hero placeholder — drop a 5-second GIF of the tablet view here once the
-     UI is screen-recordable. -->
-![Hero — tablet view of the camera grid + diary](docs/hero.png)
-
 ## The story
 
 I built this for my daughter. She loves Remy, her hamster. Remy lives in
@@ -50,17 +46,24 @@ If you build one, please send a photo.
   boxes flag wheel, food bowl, water, tunnel, hideaway, and more.
 - **Kid-friendly storybook diary** translates raw events into prose:
   *"Remy went for a run on the wheel — 8 min!"*
-  Each entry is a torn-page card with a soft watercolor tint.
+  Each entry is a torn-page card with a soft watercolor tint, an
+  auto-generated thumbnail, and — for recent moments — a tap-to-play
+  video clip pulled straight from Frigate's recordings.
 - **Playful badges** earned automatically: Night Owl, Marathon Runner,
   Foodie, Early Bird, Memory Keeper, Hat Trick — plus distance badges
   (Mile High Club, Marathon Club, Ultra) when the wheel odometer is on.
+  Some badges repeat and carry a count; tap any badge to see what it
+  represents.
 - **Wheel odometer** *(optional, see below)*: stick a piece of dark
   tape on the wheel rim and the app counts rotations from the camera
   feed. The diary then says *"… ran on the wheel for 8 min · 0.27 mi"*
-  and the stats strip shows weekly distance.
+  and the stats strip shows today's and this week's distance and time.
 - **One-tap snapshot button** saves the moment to a Memory Keeper feed.
-- **Nightly time-lapse** stitches the day's snapshots into a 25–35s MP4,
-  watermarked and tucked into the diary the next morning.
+- **Nightly recap video** stitches the night's snapshots into a
+  ~60-second highlight reel that intelligently follows the camera where
+  your pet was most active — no jarring camera-flipping — holding each
+  frame a couple of seconds. Watermarked and tucked into the diary the
+  next morning.
 
 ### Sharing & access
 
@@ -81,9 +84,10 @@ If you build one, please send a photo.
 - **Read-aloud TTS** on every diary card. Pre-readers tap the speaker
   icon and the browser narrates the storybook sentence. No backend, no
   cost, no tracking — pure `SpeechSynthesis`.
-- **AI daily storybook recap** *(optional, see below)*: each night
-  Google Gemini writes one warm paragraph summarizing the day's events.
-  Kids wake up to a fresh recap pinned to the top of yesterday's diary.
+- **AI overnight storybook recap** *(optional, see below)*: every
+  morning Google Gemini writes one warm paragraph summarizing the
+  overnight hours. Kids wake up to a fresh recap pinned to the top of
+  the morning diary, right beside the recap video.
 - **Push notifications** *(optional, see below)*: rare-moment alerts
   — first-of-day, waking-up, long wheel runs — straight to your phone or
   tablet. Per-activity toggles, quiet hours, browser-native Web Push.
@@ -268,15 +272,17 @@ Every optional feature has a safety gate: if the configuration is
 missing, the feature stays silent and the rest of the app keeps
 working. Nothing crashes the server.
 
-### AI daily storybook recap (Google Gemini)
+### AI overnight storybook recap (Google Gemini)
 
-**What it does.** Every night at 23:58 local, the backend reads the
-day's diary entries and asks Gemini to write one warm 2–4 sentence
-storybook paragraph. The result lands as a `recap` diary entry pinned
-above the time-lapse — kids wake up to a fresh recap of yesterday.
+**What it does.** Every morning at 06:10 local, the backend reads the
+diary entries from the overnight window (9pm–6am) and asks Gemini to
+write one warm 2–4 sentence storybook paragraph. The result lands as a
+`recap` diary entry pinned to the top of the morning feed, beside the
+night recap video — kids wake up to a fresh recap of what their pet got
+up to overnight.
 
-> *"Remy had a busy day! He ran on his wheel for fourteen minutes,
-> visited the food bowl four times, and finished the evening curled
+> *"Remy had a busy night! He ran on his wheel for fourteen minutes,
+> visited the food bowl four times, and finished the morning curled
 > up in his cozy nest. A very small fuzzy adventurer."*
 
 **How to enable.**
@@ -335,7 +341,7 @@ detects an iOS browser that isn't running standalone.
 
 **What it does.** Counts real wheel rotations *optically* and converts them to
 distance. You put one high-contrast mark on the wheel rim; the backend watches a
-thin horizontal band of the camera frame where that mark passes and counts each
+small box of the camera frame where that mark passes and counts each
 pass as one rotation. Distance is just circumference × rotations:
 
 ```
@@ -343,20 +349,20 @@ metres = rotations × π × wheel_diameter_mm ÷ 1000
 ```
 
 The narrator attaches each session's distance to that wheel diary entry; the
-StatsStrip shows cumulative distance (today / this week, in your chosen units);
-and three lifetime badges unlock at 1 mile, a marathon, and 100 miles.
+StatsStrip shows today's and this week's distance and time (in your chosen
+units); and three lifetime badges unlock at 1 mile, a marathon, and 100 miles.
 
 **How the counting works.** When the hamster enters the **wheel zone** (so that
 zone must be drawn — see [SETUP_MAC_MINI §8.5](./docs/SETUP_MAC_MINI.md)), the
-backend opens a session: samples the camera's RTSP at 10 fps, crops to the
-configured band, and runs a debounced state machine — `LIGHT → DARK` (mark
-entered the band) `→ LIGHT` (mark left) = **one rotation** (an 80 ms / 3-frame
+backend opens a session: samples the camera feed at 10 fps, crops to a small
+detection box you position over the spot where the tape passes, counts the dark
+pixels inside it, and runs a debounced state machine — `LIGHT → DARK` (mark
+entered the box) `→ LIGHT` (mark left) = **one rotation** (an 80 ms / 3-frame
 debounce rejects flicker). When the hamster leaves the wheel the session closes
 and the distance lands on the diary entry. Sessions auto-stop after 2 h.
 
-**Requirements.** The backend needs (a) `ffmpeg` available, and (b) a camera
-RTSP source it can reach. See the **Known gap** at the bottom of this section —
-both moved under recent refactors and need a one-time fix to re-enable this.
+**Requirements.** A camera the backend can reach and `ffmpeg` (bundled in the
+app container). Both are in place out of the box.
 
 **Setup.**
 1. **Mark the wheel** — ~1–2 cm of dark gaffer/electrical tape (or a Sharpie
@@ -367,29 +373,20 @@ both moved under recent refactors and need a one-time fix to re-enable this.
 4. Toggle **Enable wheel odometer** on.
 5. **Wheel diameter (mm)** — match your wheel (default 152 = 6"; measure the
    outer rim — this is what converts rotations to distance).
-6. **Detection band Y position (%)** — slide the band over the rim arc where the
-   tape passes; **band height (%)** (default 10) — keep it thin so only the tape
-   darkens it.
-7. **Dark threshold (%)** (default 50) — a frame reads "mark present" when its
-   band is darker than `255 × (1 − threshold/100)`.
-8. **Test detection** — grabs one frame, shows the cropped band + its dark-pixel
-   ratio. With the tape sitting in the band the ratio should jump above the
-   threshold ("Tape visible"); without it, stay low. Tune band/threshold until
+6. **Detection box** — position and size the box (X / width %, Y / height %)
+   over the small arc of rim where the tape passes once per turn. Keep it small
+   so only the tape darkens it.
+7. **Dark threshold (%)** (default 50) — the box reads "mark present" when it's
+   darker than `255 × (1 − threshold/100)`.
+8. **Test detection** — grabs one frame, shows the cropped box + its dark-pixel
+   ratio. With the tape sitting in the box the ratio should jump above the
+   threshold ("Tape visible"); without it, stay low. Tune the box/threshold until
    that's clean, then **Save**. From the next wheel session, diary cards carry a
    distance note and the StatsStrip distance climbs.
 
 **Privacy / cost.** Zero — detection runs locally against the camera feed; no
 frames leave your network. **Per camera, off by default** — disabled cameras are
 silent and the diary still works without distance numbers.
-
-> **⚠️ Known gap (introduced by the Docker + edge-H264 migrations).** This
-> feature — and **Send-a-Clip** and the **nightly time-lapse**, which also shell
-> out to `ffmpeg` — needs two fixes to run in the current container deployment:
-> (1) the `hamster-app` image (`app/Dockerfile`, `node:24-slim`) doesn't bundle
-> `ffmpeg`; (2) the per-camera RTSP field (`stream_url`) was emptied when cameras
-> moved to a go2rtc `live_src`, so the odometer's `ffmpeg -i` has no source. Fix:
-> add `ffmpeg` to the runtime image, and source the stream from the go2rtc relay
-> (`rtsp://frigate:8554/<live_src>`) instead of `stream_url`.
 
 ### Send-a-Clip email sharing
 
@@ -430,8 +427,8 @@ Pi Zero 2 W ──────────────────────�
                                       │  │  SQLite (./db bind-mount)││
                                       │  │  MQTT subscriber         ││
                                       │  │  /live/ws WS proxy       ││ ← auth-gated
-                                      │  │  Cron: timelapse 23:55   ││
-                                      │  │  Cron: recap*  23:58     ││
+                                      │  │  Cron: timelapse 06:05   ││
+                                      │  │  Cron: recap*  06:10     ││
                                       │  │  Cron: retention 02:00   ││
                                       │  │  Cron: disk-watch 03:00  ││
                                       │  │  React SPA served here   ││
@@ -569,8 +566,7 @@ PRs welcome, especially:
 - Hardware variant guides (Raspberry Pi 5, NUC, Coral-only setups)
 - Translations of the diary templates
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) (coming in v0.2) for the
-basics.
+Open an issue or PR with a short description of what you built and why.
 
 ## Acknowledgments
 
