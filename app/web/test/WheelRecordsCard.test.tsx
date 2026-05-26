@@ -33,6 +33,9 @@ const BASE_DATA: WheelRecordsData = {
     { date: '2026-05-20', meters: 1200 },
     { date: '2026-05-21', meters: 500 },
   ],
+  todaySeconds: 480,
+  weekSeconds: 3600,
+  allTimeSeconds: 18000,
 };
 
 describe('WheelRecordsContent', () => {

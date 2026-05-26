@@ -3,11 +3,10 @@
 // Wheel personal-records card placed near the StatsStrip.
 //
 // Queries `stats.wheelRecords` (refetch every 60 s). Shows:
-//   - Today / this week / all-time distances in the user's preferred unit
+//   - Today / this week / all-time distance AND time in the user's preferred unit
 //   - Best day + best session highlights
 //   - A 14-day SVG sparkline (sparse series filled with 0 for missing days)
-//   - A "New record!" flourish (confetti via the existing BadgePopover pattern)
-//     when todayMeters >= bestDayMeters (and today > 0)
+//   - A "New record!" flourish (confetti) when todayMeters >= bestDayMeters
 //
 // Zero charting dependency — the sparkline is a hand-rolled inline SVG polyline.
 // Respects prefers-reduced-motion (no confetti when reduced).
@@ -18,6 +17,19 @@ import { useReducedMotion } from 'framer-motion';
 import { trpc } from '../trpc';
 import { formatMeters } from '../lib/distance';
 import { getDistanceUnit } from '../lib/trpc-extensions';
+
+// ---------------------------------------------------------------------------
+// Time formatting helper — produces kid-friendly strings like "12 min", "1 h 5 min"
+// ---------------------------------------------------------------------------
+
+export function formatSeconds(totalSeconds: number): string {
+  if (totalSeconds <= 0) return '0 min';
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  if (h === 0) return m <= 1 ? '1 min' : `${m} min`;
+  if (m === 0) return h === 1 ? '1 hr' : `${h} hr`;
+  return `${h} h ${m} min`;
+}
 
 // ---------------------------------------------------------------------------
 // Pure presentation — exported so tests can render without tRPC
@@ -31,6 +43,9 @@ export interface WheelRecordsData {
   bestDayDate: string | null;
   bestSessionMeters: number;
   dailySeries: Array<{ date: string; meters: number }>;
+  todaySeconds: number;
+  weekSeconds: number;
+  allTimeSeconds: number;
 }
 
 export interface WheelRecordsContentProps {
@@ -52,31 +67,50 @@ export function WheelRecordsContent({
       style={{
         background: 'var(--surface)',
         border: '1px solid var(--border)',
-        borderRadius: 18,
-        padding: '16px 18px',
+        borderRadius: 20,
+        padding: '18px 20px 16px',
         display: 'flex',
         flexDirection: 'column',
-        gap: 14,
+        gap: 16,
         position: 'relative',
         overflow: 'hidden',
+        boxShadow: '0 4px 16px rgba(0, 0, 0, 0.06)',
       }}
     >
-      {/* New-record flourish */}
+      {/* Decorative background wheel — purely visual, aria-hidden */}
+      <div
+        aria-hidden
+        style={{
+          position: 'absolute',
+          top: -20,
+          right: -20,
+          fontSize: 110,
+          lineHeight: 1,
+          opacity: 0.05,
+          pointerEvents: 'none',
+          userSelect: 'none',
+        }}
+      >
+        🎡
+      </div>
+
+      {/* New-record badge */}
       {showRecord && (
         <div
           role="status"
           aria-live="polite"
           style={{
             position: 'absolute',
-            top: 12,
-            right: 14,
-            background: '#FF7AAF',
+            top: 14,
+            right: 16,
+            background: 'linear-gradient(135deg, #FF7AAF, #FF5A8A)',
             color: '#fff',
             borderRadius: 999,
-            padding: '4px 12px',
+            padding: '5px 14px',
             fontFamily: "'Fredoka', sans-serif",
             fontWeight: 700,
-            fontSize: 14,
+            fontSize: 13,
+            boxShadow: '0 2px 8px rgba(255, 90, 138, 0.4)',
             zIndex: 2,
           }}
         >
@@ -89,22 +123,47 @@ export function WheelRecordsContent({
         style={{
           fontFamily: "'Fredoka', sans-serif",
           fontWeight: 700,
-          fontSize: 18,
+          fontSize: 20,
           color: 'var(--text)',
           display: 'flex',
           alignItems: 'center',
           gap: 8,
+          lineHeight: 1,
         }}
       >
         <span aria-hidden>🎡</span>
         <span>Wheel Records</span>
       </div>
 
-      {/* Distance chips row */}
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-        <DistanceChip label="Today" value={fmt(data.todayMeters)} accent="#FF7AAF" />
-        <DistanceChip label="This week" value={fmt(data.weekMeters)} accent="#FFA94D" />
-        <DistanceChip label="All time" value={fmt(data.allTimeMeters)} accent="#4FB3E0" />
+      {/* Period stats — 3-column grid: Today / This week / All time */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(3, 1fr)',
+          gap: 10,
+        }}
+      >
+        <PeriodCell
+          label="Today"
+          distance={fmt(data.todayMeters)}
+          time={formatSeconds(data.todaySeconds)}
+          accent="#FF7AAF"
+          hasData={data.todayMeters > 0 || data.todaySeconds > 0}
+        />
+        <PeriodCell
+          label="This week"
+          distance={fmt(data.weekMeters)}
+          time={formatSeconds(data.weekSeconds)}
+          accent="#FFA94D"
+          hasData={data.weekMeters > 0 || data.weekSeconds > 0}
+        />
+        <PeriodCell
+          label="All time"
+          distance={fmt(data.allTimeMeters)}
+          time={formatSeconds(data.allTimeSeconds)}
+          accent="#4FB3E0"
+          hasData={data.allTimeMeters > 0 || data.allTimeSeconds > 0}
+        />
       </div>
 
       {/* Best-day + best-session highlights */}
@@ -133,6 +192,48 @@ export function WheelRecordsContent({
       {data.dailySeries.length > 0 && (
         <Sparkline series={data.dailySeries} />
       )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Empty state — rendered when there is no wheel data at all
+// ---------------------------------------------------------------------------
+
+function WheelEmptyState(): JSX.Element {
+  return (
+    <section
+      aria-label="Wheel records"
+      style={{
+        background: 'var(--surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 20,
+        padding: '22px 20px',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 10,
+        textAlign: 'center',
+        boxShadow: '0 4px 16px rgba(0, 0, 0, 0.06)',
+      }}
+    >
+      <span aria-hidden style={{ fontSize: 40, lineHeight: 1 }}>🎡</span>
+      <div>
+        <p
+          style={{
+            fontFamily: "'Fredoka', sans-serif",
+            fontWeight: 700,
+            fontSize: 18,
+            color: 'var(--text)',
+            margin: 0,
+          }}
+        >
+          Wheel Records
+        </p>
+        <p style={{ color: 'var(--text-muted)', margin: '4px 0 0', fontSize: 14 }}>
+          No wheel runs yet
+        </p>
+      </div>
     </section>
   );
 }
@@ -191,11 +292,18 @@ export function WheelRecordsCard(): JSX.Element | null {
 
   const data = records.data;
 
-  // No data (error or empty) — hide the card.
+  // If the query errored, skip the card quietly.
   if (!data) return null;
 
-  // Only show the card when there is some recorded wheel activity.
-  if (data.allTimeMeters === 0 && data.dailySeries.length === 0) return null;
+  // Determine whether there is ANY wheel data to show.
+  const hasAnyData =
+    data.allTimeMeters > 0 ||
+    data.allTimeSeconds > 0 ||
+    data.dailySeries.length > 0;
+
+  if (!hasAnyData) {
+    return <WheelEmptyState />;
+  }
 
   return (
     <WheelRecordsContent
@@ -210,49 +318,64 @@ export function WheelRecordsCard(): JSX.Element | null {
 // Sub-components
 // ---------------------------------------------------------------------------
 
-interface DistanceChipProps {
+interface PeriodCellProps {
   label: string;
-  value: string;
+  distance: string;
+  time: string;
   accent: string;
+  hasData: boolean;
 }
 
-function DistanceChip({ label, value, accent }: DistanceChipProps): JSX.Element {
+function PeriodCell({ label, distance, time, accent, hasData }: PeriodCellProps): JSX.Element {
   return (
     <div
       style={{
-        display: 'inline-flex',
+        display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
-        gap: 2,
-        padding: '8px 14px',
-        borderRadius: 12,
-        background: `color-mix(in srgb, ${accent} 12%, var(--surface))`,
-        border: `1.5px solid color-mix(in srgb, ${accent} 35%, transparent)`,
-        minWidth: 72,
+        gap: 6,
+        padding: '12px 8px',
+        borderRadius: 14,
+        background: `color-mix(in srgb, ${accent} 10%, var(--surface))`,
+        border: `1.5px solid color-mix(in srgb, ${accent} 28%, transparent)`,
+        textAlign: 'center',
       }}
     >
       <span
         style={{
-          fontFamily: "'Fredoka', sans-serif",
-          fontWeight: 700,
-          fontSize: 20,
-          color: 'var(--text)',
-          lineHeight: 1,
-        }}
-      >
-        {value}
-      </span>
-      <span
-        style={{
-          fontSize: 11,
-          fontWeight: 500,
+          fontSize: 10,
+          fontWeight: 600,
           textTransform: 'uppercase',
-          letterSpacing: '0.06em',
-          color: 'var(--text-muted)',
+          letterSpacing: '0.07em',
+          color: accent,
+          lineHeight: 1,
         }}
       >
         {label}
       </span>
+      <span
+        style={{
+          fontFamily: "'Fredoka', sans-serif",
+          fontWeight: 700,
+          fontSize: hasData ? 17 : 15,
+          color: hasData ? 'var(--text)' : 'var(--text-muted)',
+          lineHeight: 1,
+        }}
+      >
+        {hasData ? distance : '—'}
+      </span>
+      {hasData && (
+        <span
+          style={{
+            fontSize: 12,
+            fontWeight: 500,
+            color: 'var(--text-muted)',
+            lineHeight: 1,
+          }}
+        >
+          {time}
+        </span>
+      )}
     </div>
   );
 }
@@ -271,21 +394,22 @@ function HighlightChip({ emoji, label, value, date }: HighlightChipProps): JSX.E
         display: 'inline-flex',
         alignItems: 'center',
         gap: 8,
-        padding: '6px 12px',
-        borderRadius: 10,
-        background: 'var(--surface-raised, var(--surface))',
+        padding: '7px 12px',
+        borderRadius: 12,
+        background: 'var(--surface-raised, color-mix(in srgb, var(--surface) 85%, var(--bg)))',
         border: '1px solid var(--border)',
-        fontSize: 14,
+        fontSize: 13,
         fontWeight: 500,
         color: 'var(--text)',
       }}
     >
-      <span aria-hidden>{emoji}</span>
+      <span aria-hidden style={{ fontSize: 16, lineHeight: 1 }}>{emoji}</span>
       <span>
-        <span style={{ fontWeight: 600 }}>{label}:</span>{' '}
+        <span style={{ fontWeight: 600, fontFamily: "'Fredoka', sans-serif" }}>{label}</span>
+        {': '}
         {value}
-        {date && (
-          <span style={{ color: 'var(--text-muted)', marginLeft: 4 }}>
+        {date !== null && (
+          <span style={{ color: 'var(--text-muted)', marginLeft: 4, fontSize: 12 }}>
             ({date})
           </span>
         )}
@@ -308,9 +432,9 @@ interface SparklineProps {
 function Sparkline({ series }: SparklineProps): JSX.Element {
   const DAYS = 14;
   const W = 260;
-  const H = 48;
+  const H = 52;
   const PAD_X = 4;
-  const PAD_Y = 4;
+  const PAD_Y = 6;
 
   // Build a 14-day window ending today (UTC dates).
   const today = new Date();
@@ -345,31 +469,45 @@ function Sparkline({ series }: SparklineProps): JSX.Element {
 
   return (
     <div style={{ marginTop: 2 }}>
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          fontSize: 10,
+          fontWeight: 500,
+          color: 'var(--text-muted)',
+          marginBottom: 4,
+          letterSpacing: '0.03em',
+        }}
+      >
+        <span>14 days</span>
+        <span style={{ color: '#FF7AAF', fontWeight: 600 }}>today</span>
+      </div>
       <svg
         viewBox={`0 0 ${W} ${H}`}
         width="100%"
         height={H}
-        style={{ overflow: 'visible', display: 'block' }}
+        style={{ overflow: 'visible', display: 'block', borderRadius: 8 }}
         role="img"
         aria-label="14-day wheel distance sparkline"
       >
         <defs>
-          <linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#FF7AAF" stopOpacity="0.25" />
+          <linearGradient id="spark-grad-wrc" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#FF7AAF" stopOpacity="0.3" />
             <stop offset="100%" stopColor="#FF7AAF" stopOpacity="0.02" />
           </linearGradient>
         </defs>
         {/* Area fill */}
         <polygon
           points={`${PAD_X},${H - PAD_Y} ${points.join(' ')} ${W - PAD_X},${H - PAD_Y}`}
-          fill="url(#spark-grad)"
+          fill="url(#spark-grad-wrc)"
         />
         {/* Line */}
         <polyline
           points={points.join(' ')}
           fill="none"
           stroke="#FF7AAF"
-          strokeWidth="2"
+          strokeWidth="2.5"
           strokeLinejoin="round"
           strokeLinecap="round"
         />
@@ -378,26 +516,13 @@ function Sparkline({ series }: SparklineProps): JSX.Element {
           <circle
             cx={dotX}
             cy={dotY}
-            r={4}
+            r={4.5}
             fill="#FF7AAF"
             stroke="var(--surface)"
             strokeWidth="2"
           />
         )}
       </svg>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          fontSize: 10,
-          color: 'var(--text-muted)',
-          marginTop: 2,
-          paddingInline: PAD_X,
-        }}
-      >
-        <span>{filled[0]?.date?.slice(5) ?? ''}</span>
-        <span>today</span>
-      </div>
     </div>
   );
 }
