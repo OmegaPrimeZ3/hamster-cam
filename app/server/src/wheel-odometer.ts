@@ -45,15 +45,37 @@ function wheelRtspUrl(liveSrc: string | null): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Shared pixel-counting helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Count the number of pixels in `pixels` that are strictly below `cutoff`.
+ * Shared by PgmParser (live path) and computeDarkPixelRatio (test-tool path)
+ * so both use identical per-pixel logic.
+ */
+function countDarkPixels(pixels: Buffer, cutoff: number): { dark: number; total: number } {
+  let dark = 0;
+  for (let i = 0; i < pixels.length; i += 1) {
+    if ((pixels[i] ?? 255) < cutoff) dark += 1;
+  }
+  return { dark, total: pixels.length };
+}
+
+// ---------------------------------------------------------------------------
 // PGM streaming parser
 // ---------------------------------------------------------------------------
 
-type PgmCallback = (meanIntensity: number, frameMs: number) => void;
+/** Callback receives the dark-pixel ratio (0–1) for each complete frame. */
+type PgmCallback = (darkPixelRatio: number, frameMs: number) => void;
 
 /**
  * Stateful PGM stream parser. Feeds raw bytes from ffmpeg stdout; invokes
- * `onFrame` with the mean pixel intensity (0–255) of each complete frame and
+ * `onFrame` with the dark-pixel ratio (0–1) of each complete frame and
  * the wall-clock ms at which the frame was received.
+ *
+ * "Dark" pixels are those whose intensity is strictly below
+ * `255 * (1 − thresholdPct / 100)` — the same cutoff used by
+ * `computeDarkPixelRatio` and the Settings test-tool.
  *
  * PGM binary format (P5):
  *   P5\n<width> <height>\n255\n<width*height bytes>
@@ -62,8 +84,14 @@ export class PgmParser {
   private buf = Buffer.alloc(0);
   private frameBytes: number | null = null;
   private headerDone = false;
+  private readonly cutoff: number;
 
-  constructor(private readonly onFrame: PgmCallback) {}
+  constructor(
+    private readonly onFrame: PgmCallback,
+    thresholdPct: number,
+  ) {
+    this.cutoff = 255 * (1 - thresholdPct / 100);
+  }
 
   feed(chunk: Buffer): void {
     this.buf = Buffer.concat([this.buf, chunk]);
@@ -97,13 +125,10 @@ export class PgmParser {
       this.headerDone = false;
       this.frameBytes = null;
 
-      // Compute mean intensity.
-      let sum = 0;
-      for (let i = 0; i < frameData.length; i += 1) {
-        sum += frameData[i] ?? 0;
-      }
-      const mean = frameData.length > 0 ? sum / frameData.length : 128;
-      this.onFrame(mean, Date.now());
+      // Compute dark-pixel ratio using the shared helper.
+      const { dark, total } = countDarkPixels(frameData, this.cutoff);
+      const ratio = total > 0 ? dark / total : 0;
+      this.onFrame(ratio, Date.now());
     }
   }
 
@@ -144,15 +169,18 @@ export class PgmParser {
 type MarkState = 'light' | 'dark';
 
 /**
- * Stateful FSM that converts a stream of per-frame mean-intensity values into
- * a rotation count. "Dark" means the tape mark is in the band.
+ * Stateful FSM that converts a stream of per-frame dark-pixel ratios into
+ * a rotation count. "Dark" means the tape mark is in the ROI box.
  *
  * State transitions:
- *   LIGHT → DARK: falling edge — tape entered the band.
- *   DARK  → LIGHT: rising edge — tape left the band. One rotation counted.
+ *   LIGHT → DARK: falling edge — tape entered the box.
+ *   DARK  → LIGHT: rising edge — tape left the box. One rotation counted.
  *
  * Debounce: a state change is only committed after DEBOUNCE_FRAMES consecutive
  * frames agree on the new state.
+ *
+ * The "dark" threshold uses the same rule as the Settings test-tool:
+ *   darkPixelRatio * 100 >= thresholdPct → state is 'dark'.
  */
 export class RotationCounter {
   private state: MarkState = 'light';
@@ -162,11 +190,15 @@ export class RotationCounter {
 
   constructor(private readonly thresholdPct: number) {}
 
-  /** Feed one frame's mean intensity. Returns the updated total rotation count. */
-  feed(meanIntensity: number): number {
-    // "Dark" pixel: intensity below 255 * (1 − threshold/100).
-    const cutoff = 255 * (1 - this.thresholdPct / 100);
-    const newState: MarkState = meanIntensity < cutoff ? 'dark' : 'light';
+  /**
+   * Feed one frame's dark-pixel ratio (0–1). Returns the updated total
+   * rotation count.
+   *
+   * The frame is considered 'dark' when `ratio * 100 >= thresholdPct`,
+   * matching the test-tool's `darkPixelRatio * 100 >= thresholdPct` check.
+   */
+  feed(darkPixelRatio: number): number {
+    const newState: MarkState = darkPixelRatio * 100 >= this.thresholdPct ? 'dark' : 'light';
 
     if (newState === this.candidateState) {
       this.candidateCount += 1;
@@ -245,9 +277,9 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
   }
 
   const counter = new RotationCounter(thresholdPct);
-  const parser = new PgmParser((mean) => {
-    counter.feed(mean);
-  });
+  const parser = new PgmParser((ratio) => {
+    counter.feed(ratio);
+  }, thresholdPct);
 
   // ffmpeg crops to the band and emits grayscale PGM frames on stdout.
   // We use `ih*bandH/100` arithmetic inside the crop filter expression.
@@ -432,9 +464,13 @@ function cleanupSession(cameraId: number): void {
 }
 
 /**
- * Parse the PGM header from a buffer and compute the ratio of dark pixels.
- * "Dark" = mean intensity below `255 * (1 − thresholdPct/100)`.
+ * Parse the PGM header from a full buffer and compute the ratio of dark pixels.
+ * "Dark" = pixel intensity strictly below `255 * (1 − thresholdPct/100)`.
  * Returns 0 on parse failure.
+ *
+ * Used by `testWheelDetection` (Settings test-tool). The per-pixel cutoff is
+ * identical to what `PgmParser` applies to live frames — both delegate to
+ * `countDarkPixels`.
  */
 function computeDarkPixelRatio(pgmBuf: Buffer, thresholdPct: number): number {
   // Find the end of the three-line header.
@@ -454,11 +490,8 @@ function computeDarkPixelRatio(pgmBuf: Buffer, thresholdPct: number): number {
   if (pixels.length === 0) return 0;
 
   const cutoff = 255 * (1 - thresholdPct / 100);
-  let dark = 0;
-  for (let i = 0; i < pixels.length; i += 1) {
-    if ((pixels[i] ?? 255) < cutoff) dark += 1;
-  }
-  return dark / pixels.length;
+  const { dark, total } = countDarkPixels(pixels, cutoff);
+  return dark / total;
 }
 
 // Exported for tests.

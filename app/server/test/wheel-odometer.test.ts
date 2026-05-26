@@ -1,5 +1,5 @@
 // Unit tests for wheel-odometer.ts:
-//   - PgmParser: stream parsing and mean intensity computation
+//   - PgmParser: stream parsing and dark-pixel-ratio computation
 //   - RotationCounter: debounced FSM edge detection + rotation-to-metres math
 //   - Session lifecycle: start→end returns metres; double-start idempotent;
 //     end-without-start returns null; ffmpeg crash mid-session is logged and
@@ -23,23 +23,57 @@ describe('PgmParser', () => {
     vi.resetModules();
   });
 
-  it('parses a complete PGM frame and reports mean intensity', async () => {
+  // threshold=50 → cutoff = 255 * 0.5 = 127.5
+  // pixels below 127.5 are "dark".
+
+  it('parses a complete PGM frame and reports dark-pixel ratio', async () => {
     const { PgmParser } = await import('../src/wheel-odometer.js');
-    const intensities: number[] = [];
-    const parser = new PgmParser((mean) => intensities.push(mean));
+    const ratios: number[] = [];
+    // threshold=50, cutoff=127.5. Pixels [100,100,100,100] all < 127.5 → ratio=1.0.
+    const parser = new PgmParser((ratio) => ratios.push(ratio), 50);
 
     const header = Buffer.from('P5\n2 2\n255\n', 'ascii');
     const pixels = Buffer.from([100, 100, 100, 100]);
     parser.feed(Buffer.concat([header, pixels]));
 
-    expect(intensities).toHaveLength(1);
-    expect(intensities[0]).toBeCloseTo(100, 5);
+    expect(ratios).toHaveLength(1);
+    expect(ratios[0]).toBeCloseTo(1.0, 5);
+  });
+
+  it('reports partial dark-pixel ratio when only some pixels are dark', async () => {
+    const { PgmParser } = await import('../src/wheel-odometer.js');
+    const ratios: number[] = [];
+    // threshold=50, cutoff=127.5.
+    // 2 dark pixels (50 < 127.5) + 2 light pixels (200 >= 127.5) → ratio=0.5.
+    const parser = new PgmParser((ratio) => ratios.push(ratio), 50);
+
+    const header = Buffer.from('P5\n2 2\n255\n', 'ascii');
+    const pixels = Buffer.from([50, 50, 200, 200]);
+    parser.feed(Buffer.concat([header, pixels]));
+
+    expect(ratios).toHaveLength(1);
+    expect(ratios[0]).toBeCloseTo(0.5, 5);
+  });
+
+  it('reports ratio=0 when all pixels are light', async () => {
+    const { PgmParser } = await import('../src/wheel-odometer.js');
+    const ratios: number[] = [];
+    // threshold=50, cutoff=127.5. Pixels [200,200,200,200] all >= 127.5 → ratio=0.
+    const parser = new PgmParser((ratio) => ratios.push(ratio), 50);
+
+    const header = Buffer.from('P5\n2 2\n255\n', 'ascii');
+    const pixels = Buffer.from([200, 200, 200, 200]);
+    parser.feed(Buffer.concat([header, pixels]));
+
+    expect(ratios).toHaveLength(1);
+    expect(ratios[0]).toBeCloseTo(0.0, 5);
   });
 
   it('handles a frame split across two chunks', async () => {
     const { PgmParser } = await import('../src/wheel-odometer.js');
-    const intensities: number[] = [];
-    const parser = new PgmParser((mean) => intensities.push(mean));
+    const ratios: number[] = [];
+    // threshold=50, cutoff=127.5. Pixels [200,200,200,200] all light → ratio=0.
+    const parser = new PgmParser((ratio) => ratios.push(ratio), 50);
 
     const header = Buffer.from('P5\n2 2\n255\n', 'ascii');
     const pixels = Buffer.from([200, 200, 200, 200]);
@@ -48,36 +82,39 @@ describe('PgmParser', () => {
     parser.feed(full.slice(0, 7));
     parser.feed(full.slice(7));
 
-    expect(intensities).toHaveLength(1);
-    expect(intensities[0]).toBeCloseTo(200, 5);
+    expect(ratios).toHaveLength(1);
+    expect(ratios[0]).toBeCloseTo(0.0, 5);
   });
 
   it('parses two back-to-back frames from a single feed', async () => {
     const { PgmParser } = await import('../src/wheel-odometer.js');
-    const intensities: number[] = [];
-    const parser = new PgmParser((mean) => intensities.push(mean));
+    const ratios: number[] = [];
+    // threshold=50, cutoff=127.5.
+    // Frame 1: pixel 50 < 127.5 → ratio=1.0 (dark).
+    // Frame 2: pixel 220 >= 127.5 → ratio=0.0 (light).
+    const parser = new PgmParser((ratio) => ratios.push(ratio), 50);
 
-    const makeFrame = (intensity: number): Buffer => {
+    const makeFrame = (pixelValue: number): Buffer => {
       const header = Buffer.from('P5\n1 1\n255\n', 'ascii');
-      return Buffer.concat([header, Buffer.from([intensity])]);
+      return Buffer.concat([header, Buffer.from([pixelValue])]);
     };
 
     parser.feed(Buffer.concat([makeFrame(50), makeFrame(220)]));
-    expect(intensities).toHaveLength(2);
-    expect(intensities[0]).toBeCloseTo(50, 5);
-    expect(intensities[1]).toBeCloseTo(220, 5);
+    expect(ratios).toHaveLength(2);
+    expect(ratios[0]).toBeCloseTo(1.0, 5); // dark frame
+    expect(ratios[1]).toBeCloseTo(0.0, 5); // light frame
   });
 
   it('ignores corrupt headers gracefully', async () => {
     const { PgmParser } = await import('../src/wheel-odometer.js');
-    const intensities: number[] = [];
-    const parser = new PgmParser((mean) => intensities.push(mean));
+    const ratios: number[] = [];
+    const parser = new PgmParser((ratio) => ratios.push(ratio), 50);
 
     // P6 is colour PGM — our parser only handles P5. Should not throw.
     const badHeader = Buffer.from('P6\n2 2\n255\n', 'ascii');
     const pixels = Buffer.from([1, 2, 3, 4]);
     expect(() => parser.feed(Buffer.concat([badHeader, pixels]))).not.toThrow();
-    expect(intensities).toHaveLength(0);
+    expect(ratios).toHaveLength(0);
   });
 });
 
@@ -90,22 +127,54 @@ describe('RotationCounter', () => {
     vi.resetModules();
   });
 
+  // RotationCounter.feed() now takes a dark-pixel ratio (0–1).
+  // threshold=50 → frame is 'dark' when ratio * 100 >= 50, i.e. ratio >= 0.5.
+  // LIGHT_RATIO=0.0 (no dark pixels), DARK_RATIO=1.0 (all pixels dark).
+  const LIGHT_RATIO = 0.0;
+  const DARK_RATIO = 1.0;
+
   it('counts one rotation on a debounced DARK → LIGHT transition', async () => {
     const { RotationCounter } = await import('../src/wheel-odometer.js');
-    // threshold 50 % → cutoff = 255 * 0.5 = 127.5
     const counter = new RotationCounter(50);
 
     // 3 light frames first (initial state committed).
-    for (let i = 0; i < 3; i += 1) counter.feed(200);
+    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
     expect(counter.getRotations()).toBe(0);
 
     // 3 dark frames — falling edge committed.
-    for (let i = 0; i < 3; i += 1) counter.feed(50);
+    for (let i = 0; i < 3; i += 1) counter.feed(DARK_RATIO);
     expect(counter.getRotations()).toBe(0);
 
     // 3 light frames — rising edge committed = 1 rotation.
-    for (let i = 0; i < 3; i += 1) counter.feed(200);
+    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
     expect(counter.getRotations()).toBe(1);
+  });
+
+  it('threshold boundary: ratio exactly at thresholdPct/100 is dark', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    // threshold=50 → ratio >= 0.5 is dark.
+    const counter = new RotationCounter(50);
+
+    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
+
+    // ratio=0.5 → 0.5*100=50 >= 50 → dark.
+    for (let i = 0; i < 3; i += 1) counter.feed(0.5);
+    expect(counter.getRotations()).toBe(0); // still in dark state, no rising edge yet.
+
+    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
+    expect(counter.getRotations()).toBe(1);
+  });
+
+  it('threshold boundary: ratio just below thresholdPct/100 is light', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    // threshold=50 → ratio < 0.5 is light.
+    const counter = new RotationCounter(50);
+
+    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
+
+    // ratio=0.49 → 0.49*100=49 < 50 → light (never goes dark).
+    for (let i = 0; i < 6; i += 1) counter.feed(0.49);
+    expect(counter.getRotations()).toBe(0);
   });
 
   it('debounces noise — fewer than 3 consecutive frames does not change state', async () => {
@@ -113,18 +182,18 @@ describe('RotationCounter', () => {
     const counter = new RotationCounter(50);
 
     // Establish light state.
-    for (let i = 0; i < 3; i += 1) counter.feed(200);
+    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
 
     // Two dark (below debounce threshold) then back to light.
-    counter.feed(50);
-    counter.feed(50);
-    counter.feed(200);
+    counter.feed(DARK_RATIO);
+    counter.feed(DARK_RATIO);
+    counter.feed(LIGHT_RATIO);
 
     // Two more dark, two more light — never 3 consecutive.
-    counter.feed(50);
-    counter.feed(50);
-    counter.feed(200);
-    counter.feed(200);
+    counter.feed(DARK_RATIO);
+    counter.feed(DARK_RATIO);
+    counter.feed(LIGHT_RATIO);
+    counter.feed(LIGHT_RATIO);
 
     expect(counter.getRotations()).toBe(0);
   });
@@ -134,12 +203,28 @@ describe('RotationCounter', () => {
     const counter = new RotationCounter(50);
 
     for (let r = 0; r < 3; r += 1) {
-      for (let i = 0; i < 3; i += 1) counter.feed(200);
-      for (let i = 0; i < 3; i += 1) counter.feed(50);
-      for (let i = 0; i < 3; i += 1) counter.feed(200);
+      for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
+      for (let i = 0; i < 3; i += 1) counter.feed(DARK_RATIO);
+      for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
     }
 
     expect(counter.getRotations()).toBe(3);
+  });
+
+  it('test-tool and live-counter agree: partial dark-pixel frame above threshold is dark', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    // Simulate the real bug scenario: tape occupies ~50% of the ROI box.
+    // threshold=40 → ratio >= 0.4 is dark.
+    const counter = new RotationCounter(40);
+
+    for (let i = 0; i < 3; i += 1) counter.feed(0.0); // light
+
+    // ratio=0.5 → 0.5*100=50 >= 40 → dark (this is what the test-tool would show as "visible")
+    for (let i = 0; i < 3; i += 1) counter.feed(0.5);
+
+    for (let i = 0; i < 3; i += 1) counter.feed(0.0); // light again
+
+    expect(counter.getRotations()).toBe(1);
   });
 
   it('converts rotations to correct metres (maths check)', () => {
