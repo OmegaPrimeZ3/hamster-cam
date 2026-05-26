@@ -92,18 +92,23 @@ snapshots:
 #     +0.05 from 0.50 is intentionally conservative because genuine detections
 #     are currently under-reported; do not exceed 0.60 without verifying true
 #     positives in the debug view first.
-#   threshold 0.70 — confirmation score (running average of recent frames).
-#     Reflections are temporally inconsistent and score <0.65 averaged; a real
-#     hamster holds ≥0.70 across multiple frames. Raising to 0.75+ risks
-#     clipping fast-moving or partially-occluded hamsters — leave at 0.70 until
-#     the under-reporting bug is resolved.
+#
+# Threshold raised 0.70 → 0.80 (2026-05-26):
+#   Observed false positives on STATIC cage furniture clustering just above 0.70:
+#     white bedding fluff  — top ~74%, snapshot ~57%
+#     wooden hamster house — top ~71%, snapshot ~77%
+#   0.80 filters them with clear margin. NOTE: this is a band-aid. The durable
+#   fix is retraining the model with these objects as hard negatives (see
+#   docs/HAMSTER_MODEL_TUNING.md). Also tunable: if real hamster events dry up
+#   after this change, the model cannot sustain 0.80 — dial back toward 0.75
+#   pending a retrain rather than leaving detection dark.
 objects:
   track:
     - hamster
   filters:
     hamster:
       min_score: 0.55
-      threshold: 0.70
+      threshold: 0.80
 
 ffmpeg:
   # Detect AND record consume the LOCAL go2rtc restream over loopback (see
@@ -152,8 +157,9 @@ cameras:
           # Per-camera thresholds mirror the global values above; kept here so
           # each camera can be tuned independently once the operator has debug
           # data. These must be >= the global min_score / threshold to have effect.
+          # threshold raised 0.70 → 0.80 (2026-05-26): see global objects comment.
           min_score: 0.55
-          threshold: 0.70
+          threshold: 0.80
           # --- Size / aspect-ratio filters (anti-reflection, 1280×720) ---
           # All values are STARTING POINTS — dial in from the debug view.
           # min_area: reject tiny glints (reflections off glass, water surface,
@@ -233,8 +239,9 @@ cameras:
           # Per-camera thresholds mirror the global values above; kept here so
           # each camera can be tuned independently once the operator has debug
           # data. These must be >= the global min_score / threshold to have effect.
+          # threshold raised 0.70 → 0.80 (2026-05-26): see global objects comment.
           min_score: 0.55
-          threshold: 0.70
+          threshold: 0.80
           # --- Size / aspect-ratio filters (anti-reflection, 1280×720) ---
           # All values are STARTING POINTS — dial in from the debug view.
           # min_area: reject tiny glints (reflections off glass, water surface,
