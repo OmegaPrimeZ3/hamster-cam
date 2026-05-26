@@ -63,10 +63,9 @@ local_sources:
     role: negative
   # - path: ~/pet-models/hamster/local/cage_pos   # enable after box-review (recall pass)
   #   role: positive
-local_oversample: 1   # 600 harvested negatives are ~18-22% of the ~2700 public
-                      # positives already — a healthy background ratio. Oversampling
-                      # would push past the runbook's ≤40% ceiling and collapse the
-                      # model toward "never fire." Keep at 1x.
+local_oversample: 2   # 200 culled negatives ×2 ≈ 400 (~15% of the ~2700 public
+                      # positives) — enough weight to suppress the fluff/house false
+                      # fires without nearing the runbook's ≤40% collapse ceiling.
 
 # Phase I domain augmentation — forwarded to Ultralytics model.train() verbatim.
 # Simulates the day↔night/IR brightness range and the camera's ~45° angle.
