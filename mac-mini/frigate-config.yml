@@ -86,13 +86,24 @@ snapshots:
 
 # Single custom class from the hamster model. min_score is a real threshold now
 # (the old 0.30 was a hack to coax detections out of the wrong COCO classes).
+#
+# Anti-reflection tuning (2026-05-25):
+#   min_score 0.55 — cuts low-confidence glint detections (one-frame flickers);
+#     +0.05 from 0.50 is intentionally conservative because genuine detections
+#     are currently under-reported; do not exceed 0.60 without verifying true
+#     positives in the debug view first.
+#   threshold 0.70 — confirmation score (running average of recent frames).
+#     Reflections are temporally inconsistent and score <0.65 averaged; a real
+#     hamster holds ≥0.70 across multiple frames. Raising to 0.75+ risks
+#     clipping fast-moving or partially-occluded hamsters — leave at 0.70 until
+#     the under-reporting bug is resolved.
 objects:
   track:
     - hamster
   filters:
     hamster:
-      min_score: 0.5
-      threshold: 0.6
+      min_score: 0.55
+      threshold: 0.70
 
 ffmpeg:
   # Detect AND record consume the LOCAL go2rtc restream over loopback (see
@@ -138,7 +149,48 @@ cameras:
         - hamster
       filters:
         hamster:
-          min_score: 0.5
+          # Per-camera thresholds mirror the global values above; kept here so
+          # each camera can be tuned independently once the operator has debug
+          # data. These must be >= the global min_score / threshold to have effect.
+          min_score: 0.55
+          threshold: 0.70
+          # --- Size / aspect-ratio filters (anti-reflection, 1280×720) ---
+          # All values are STARTING POINTS — dial in from the debug view.
+          # min_area: reject tiny glints (reflections off glass, water surface,
+          #   cage bars). A hamster at any reasonable depth fills ≥~40×38 px;
+          #   a glint is typically 10–20 px on a side (100–400 px²).
+          #   Raise this if tiny blobs still trigger; lower if cam is far away.
+          min_area: 1500
+          # max_area: reject large smear artifacts (full-frame reflections,
+          #   blown-out highlights). Beyond ~1/9 of 720p frame area the box is
+          #   implausibly large for a hamster in this enclosure.
+          #   Lower this if the hamster is always far from camera.
+          max_area: 80000
+          # min_ratio (width/height): hamsters are ~round to slightly elongated;
+          #   horizontal smears (water surface, glass reflections) are very flat
+          #   (ratio < 0.3). 0.4 cuts them while leaving room for a flattened pose.
+          min_ratio: 0.4
+          # max_ratio (width/height): a hamster stretched or standing is ~2:1 at
+          #   most. Cage-bar vertical artifacts are very tall/thin (ratio > 2.5).
+          #   Raise slightly if the wheel produces tall bounding boxes.
+          max_ratio: 2.2
+          # --- Object mask scaffolding ---
+          # Once the operator identifies specific reflective regions in the debug
+          # view (Frigate UI → camera → Debug → click bounding boxes to get
+          # normalized x,y coordinates), paste polygon coordinates here to
+          # permanently exclude those regions from object detection.
+          #
+          # Format: each mask is a list of normalized (0.0–1.0) x,y pairs,
+          # top-left origin, listed clockwise. Multiple masks are supported.
+          # Uncomment and replace the placeholder coords with real values.
+          #
+          # mask:
+          #   # Glass front reflection band (example — replace with real coords):
+          #   - 0.00,0.90,1.00,0.90,1.00,1.00,0.00,1.00
+          #   # Water bowl glint zone (example — replace with real coords):
+          #   - 0.60,0.55,0.75,0.55,0.75,0.65,0.60,0.65
+          #   # Cage bar vertical artifact (example — replace with real coords):
+          #   - 0.48,0.00,0.52,0.00,0.52,1.00,0.48,1.00
     zones:
       wheel:
         coordinates: 0.02,0.05,0.48,0.05,0.48,0.35,0.02,0.35
@@ -178,7 +230,48 @@ cameras:
         - hamster
       filters:
         hamster:
-          min_score: 0.5
+          # Per-camera thresholds mirror the global values above; kept here so
+          # each camera can be tuned independently once the operator has debug
+          # data. These must be >= the global min_score / threshold to have effect.
+          min_score: 0.55
+          threshold: 0.70
+          # --- Size / aspect-ratio filters (anti-reflection, 1280×720) ---
+          # All values are STARTING POINTS — dial in from the debug view.
+          # min_area: reject tiny glints (reflections off glass, water surface,
+          #   cage bars). A hamster at any reasonable depth fills ≥~40×38 px;
+          #   a glint is typically 10–20 px on a side (100–400 px²).
+          #   Raise this if tiny blobs still trigger; lower if cam is far away.
+          min_area: 1500
+          # max_area: reject large smear artifacts (full-frame reflections,
+          #   blown-out highlights). Beyond ~1/9 of 720p frame area the box is
+          #   implausibly large for a hamster in this enclosure.
+          #   Lower this if the hamster is always far from camera.
+          max_area: 80000
+          # min_ratio (width/height): hamsters are ~round to slightly elongated;
+          #   horizontal smears (water surface, glass reflections) are very flat
+          #   (ratio < 0.3). 0.4 cuts them while leaving room for a flattened pose.
+          min_ratio: 0.4
+          # max_ratio (width/height): a hamster stretched or standing is ~2:1 at
+          #   most. Cage-bar vertical artifacts are very tall/thin (ratio > 2.5).
+          #   Raise slightly if the wheel produces tall bounding boxes.
+          max_ratio: 2.2
+          # --- Object mask scaffolding ---
+          # Once the operator identifies specific reflective regions in the debug
+          # view (Frigate UI → camera → Debug → click bounding boxes to get
+          # normalized x,y coordinates), paste polygon coordinates here to
+          # permanently exclude those regions from object detection.
+          #
+          # Format: each mask is a list of normalized (0.0–1.0) x,y pairs,
+          # top-left origin, listed clockwise. Multiple masks are supported.
+          # Uncomment and replace the placeholder coords with real values.
+          #
+          # mask:
+          #   # Glass front reflection band (example — replace with real coords):
+          #   - 0.00,0.90,1.00,0.90,1.00,1.00,0.00,1.00
+          #   # Water bowl glint zone (example — replace with real coords):
+          #   - 0.60,0.55,0.75,0.55,0.75,0.65,0.60,0.65
+          #   # Cage bar vertical artifact (example — replace with real coords):
+          #   - 0.48,0.00,0.52,0.00,0.52,1.00,0.48,1.00
     zones:
       wheel:
         coordinates: 0.02,0.05,0.48,0.05,0.48,0.35,0.02,0.35
