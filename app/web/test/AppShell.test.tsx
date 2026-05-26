@@ -80,6 +80,9 @@ function makeWrapper(opts: {
       bestDayDate: null,
       bestSessionMeters: 0,
       dailySeries: [],
+      todaySeconds: 0,
+      weekSeconds: 0,
+      allTimeSeconds: 0,
     });
     queryClient.setQueryData([['pet', 'currentStatus'], { type: 'query' }], {
       activity: null,
@@ -168,6 +171,9 @@ describe('AppShell — post-login loading splash', () => {
       bestDayDate: null,
       bestSessionMeters: 0,
       dailySeries: [],
+      todaySeconds: 0,
+      weekSeconds: 0,
+      allTimeSeconds: 0,
     }));
     mockQuery('pet.currentStatus', () => ({
       activity: null,
@@ -205,6 +211,9 @@ describe('AppShell — post-login loading splash', () => {
       bestDayDate: null,
       bestSessionMeters: 0,
       dailySeries: [],
+      todaySeconds: 0,
+      weekSeconds: 0,
+      allTimeSeconds: 0,
     });
     queryClient.setQueryData([['pet', 'currentStatus'], { type: 'query' }], {
       activity: null,

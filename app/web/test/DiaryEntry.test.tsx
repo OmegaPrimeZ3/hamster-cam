@@ -33,6 +33,7 @@ function makeEntry(overrides: Partial<Entry>): Entry {
     ai_model: null,
     details: null,
     created_by: null,
+    clip_available: true,
     ...overrides,
   };
 }

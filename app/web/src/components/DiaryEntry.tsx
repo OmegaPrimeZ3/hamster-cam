@@ -92,10 +92,13 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
 
   const showTTS = ttsEnabled && isTTSAvailable();
 
-  // Show "View clip" for narrative entries (always have camera footage) and
-  // timelapse entries (already have an MP4). Exclude snapshot (image shown
-  // inline) and recap (text-only daily summary, no associated footage).
-  const showViewClip = entry.kind === 'narrative' || entry.kind === 'timelapse';
+  // Show "View clip" only when the backend confirms a clip can be produced
+  // (clip_available === true). This guards against transition/orphaned entries
+  // that have no camera_id or extractable media (backend would 412 otherwise).
+  // We still restrict to kinds that make sense — timelapse and narrative only.
+  const showViewClip =
+    entry.clip_available === true &&
+    (entry.kind === 'narrative' || entry.kind === 'timelapse');
 
   function handleTTS(): void {
     if (speaking) {
@@ -173,7 +176,11 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
       ) : entry.kind === 'snapshot' ? (
         <SnapshotBody entry={entry} expanded={expanded} onToggle={() => setExpanded((v) => !v)} />
       ) : (
-        <NarrativeBody entry={entry} onOpenClip={() => setClipOpen(true)} />
+        <NarrativeBody
+          entry={entry}
+          clipAvailable={showViewClip}
+          onOpenClip={() => setClipOpen(true)}
+        />
       )}
 
       <div
@@ -305,12 +312,27 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
 
 function NarrativeBody({
   entry,
+  clipAvailable,
   onOpenClip,
 }: {
   entry: Entry;
+  clipAvailable: boolean;
   onOpenClip: () => void;
 }): JSX.Element | null {
   if (!entry.thumbnail_url) return null;
+  // If clip is not available, render the thumbnail as a non-interactive image
+  // so the user can see the frame but can't trigger a failing clip request.
+  if (!clipAvailable) {
+    return (
+      <img
+        src={entry.thumbnail_url}
+        alt=""
+        aria-hidden
+        loading="lazy"
+        style={{ width: 120, height: 80, objectFit: 'cover', borderRadius: 10, display: 'block', flexShrink: 0 }}
+      />
+    );
+  }
   return (
     <button
       type="button"
