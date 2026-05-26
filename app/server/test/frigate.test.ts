@@ -1,12 +1,17 @@
-// Unit tests for the SSRF guard in cameras.testStream (Security-Review F2).
-//
-// We don't bother spinning up Fastify here — testStream is a pure function
-// modulo `fetch` + `dns.lookup`, and we inject both via the optional `deps`
-// argument so we never touch the host's resolver or network.
+// Unit tests for:
+//   1. SSRF guard in cameras.testStream (Security-Review F2).
+//   2. Background stats poller + getCachedCameraStats sync read.
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { isInternalHost, testStream } from '../src/frigate.js';
+import {
+  getCachedCameraStats,
+  isInternalHost,
+  pollFrigateStats,
+  stopFrigateStatsPoller,
+  testStream,
+} from '../src/frigate.js';
+import { resetMqttStateForTests, setMqttHeartbeatForTests } from '../src/mqtt.js';
 
 function makeFetchStub(impl: (url: string) => Response | Promise<Response>): typeof fetch {
   return ((input: string | URL | Request): Promise<Response> => {
@@ -200,5 +205,130 @@ describe('testStream', () => {
   it('malformed URLs are rejected', async () => {
     const out = await testStream('not-a-url');
     expect(out).toEqual({ ok: false, status: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Background stats poller + getCachedCameraStats
+//
+// These tests use the optional `deps` injection on `pollFrigateStats` so they
+// never touch global.fetch, process.env, or getConfig(). Fully isolated.
+// ---------------------------------------------------------------------------
+
+const FAKE_FRIGATE_URL = 'http://frigate.local:5000';
+
+function makeStatsFetch(
+  cameras: Record<string, { camera_fps?: number; last_frame_time?: number }>,
+): typeof fetch {
+  return (async () =>
+    new Response(JSON.stringify({ cameras }), { status: 200 })) as typeof fetch;
+}
+
+describe('frigate stats poller + getCachedCameraStats', () => {
+  beforeEach(() => {
+    // Ensure the poller is stopped and cache is clear before each test.
+    stopFrigateStatsPoller();
+    // Clear any MQTT heartbeats so fallback tests are deterministic.
+    resetMqttStateForTests();
+  });
+
+  afterEach(() => {
+    stopFrigateStatsPoller();
+  });
+
+  it('pollFrigateStats populates the cache and getCachedCameraStats returns the parsed value', async () => {
+    const fetchFn = makeStatsFetch({
+      'cam1': { last_frame_time: 1_700_000_000, camera_fps: 5 },
+      'cam2': { camera_fps: 10 },
+    });
+
+    const result = await pollFrigateStats({ frigateUrl: FAKE_FRIGATE_URL, fetchFn });
+
+    // pollFrigateStats returns the parsed map.
+    expect(result.size).toBe(2);
+    expect(result.get('cam1')).toMatchObject({
+      lastFrameAt: Math.round(1_700_000_000 * 1000),
+      fps: 5,
+    });
+    // cam2 has no last_frame_time but fps > 0 → lastFrameAt ≈ Date.now().
+    const cam2 = result.get('cam2');
+    expect(cam2).toBeDefined();
+    expect(cam2?.lastFrameAt).not.toBeNull();
+    expect(cam2?.fps).toBe(10);
+
+    // getCachedCameraStats reads from the cache synchronously — no network.
+    const cached = getCachedCameraStats('cam1');
+    expect(cached.lastFrameAt).toBe(Math.round(1_700_000_000 * 1000));
+    expect(cached.fps).toBe(5);
+  });
+
+  it('getCachedCameraStats falls back to null when no cache entry and no MQTT heartbeat', () => {
+    // No poll has run — cache is empty. MQTT heartbeat is also absent.
+    const result = getCachedCameraStats('cam-no-data');
+    expect(result).toEqual({ lastFrameAt: null, fps: null });
+  });
+
+  it('pollFrigateStats returns empty map and does not throw when Frigate is unreachable', async () => {
+    const fetchFn = (async () => {
+      throw new Error('ECONNREFUSED');
+    }) as typeof fetch;
+
+    const result = await pollFrigateStats({ frigateUrl: FAKE_FRIGATE_URL, fetchFn });
+    // Network error is caught internally → empty map, no throw.
+    expect(result.size).toBe(0);
+  });
+
+  it('pollFrigateStats returns empty map when frigateUrl is absent (no Frigate configured)', async () => {
+    // Passing no frigateUrl and no getConfig() fallback — the function must
+    // short-circuit cleanly with an empty result.
+    // We supply a fetchFn that would throw if called to detect any accidental fetch.
+    const fetchFn = (async () => {
+      throw new Error('should not be called');
+    }) as typeof fetch;
+
+    // frigateUrl is deliberately omitted; production path calls getConfig()
+    // but the module-level cache guard is what matters. We test via explicit
+    // empty string equivalent by passing frigateUrl = '' (falsy).
+    const result = await pollFrigateStats({ frigateUrl: '', fetchFn });
+    expect(result.size).toBe(0);
+  });
+
+  it('regression: present-but-null cache entry must NOT mask a fresher MQTT heartbeat', async () => {
+    // Frigate reports the camera but camera_fps=0 and no last_frame_time →
+    // parseStatsCameraEntry yields { lastFrameAt: null, fps: 0 }.
+    // The old getCameraStats would have fallen back to the MQTT heartbeat in
+    // this case. The new getCachedCameraStats must do the same — a present cache
+    // entry with null lastFrameAt is NOT sufficient to suppress the heartbeat.
+    const staleEntry = { camera_fps: 0 };
+    const fetchFn = makeStatsFetch({ 'stale-cam': staleEntry });
+    await pollFrigateStats({ frigateUrl: FAKE_FRIGATE_URL, fetchFn });
+
+    // Confirm the cache was populated with a null lastFrameAt.
+    // (If this assertion breaks it means parseStatsCameraEntry changed — update accordingly.)
+    // We don't export the raw cache, so we exercise it via getCachedCameraStats
+    // before injecting a heartbeat.
+    const beforeHeartbeat = getCachedCameraStats('stale-cam');
+    expect(beforeHeartbeat.lastFrameAt).toBeNull();
+    expect(beforeHeartbeat.fps).toBe(0);
+
+    // Now a fresh MQTT heartbeat arrives for the same camera.
+    const heartbeatTs = 1_700_005_000_000;
+    setMqttHeartbeatForTests('stale-cam', heartbeatTs);
+
+    // getCachedCameraStats must return the heartbeat timestamp, not null.
+    const after = getCachedCameraStats('stale-cam');
+    expect(after.lastFrameAt).toBe(heartbeatTs);
+    // fps still comes from the REST cache (0 in this case, not null).
+    expect(after.fps).toBe(0);
+  });
+
+  it('cache empty → falls back to MQTT heartbeat when present', () => {
+    // No poll has run. Inject a heartbeat for the camera.
+    const heartbeatTs = 1_700_010_000_000;
+    setMqttHeartbeatForTests('cam-heartbeat-only', heartbeatTs);
+
+    const result = getCachedCameraStats('cam-heartbeat-only');
+    expect(result.lastFrameAt).toBe(heartbeatTs);
+    expect(result.fps).toBeNull();
   });
 });

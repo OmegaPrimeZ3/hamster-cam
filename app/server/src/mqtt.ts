@@ -31,6 +31,11 @@ export function resetMqttStateForTests(): void {
   cameraHeartbeats.clear();
 }
 
+/** Inject a heartbeat timestamp for a specific camera. Test-only. */
+export function setMqttHeartbeatForTests(cameraName: string, timestampMs: number): void {
+  cameraHeartbeats.set(cameraName, timestampMs);
+}
+
 export interface MqttSubscriber {
   /** Resolves once an initial connection is established (or immediately if disabled). */
   ready(): Promise<void>;
