@@ -63,7 +63,10 @@ local_sources:
     role: negative
   # - path: ~/pet-models/hamster/local/cage_pos   # enable after box-review (recall pass)
   #   role: positive
-local_oversample: 3   # up-weight the scarce local frames vs the ~2700 public pool
+local_oversample: 1   # 600 harvested negatives are ~18-22% of the ~2700 public
+                      # positives already — a healthy background ratio. Oversampling
+                      # would push past the runbook's ≤40% ceiling and collapse the
+                      # model toward "never fire." Keep at 1x.
 
 # Phase I domain augmentation — forwarded to Ultralytics model.train() verbatim.
 # Simulates the day↔night/IR brightness range and the camera's ~45° angle.
