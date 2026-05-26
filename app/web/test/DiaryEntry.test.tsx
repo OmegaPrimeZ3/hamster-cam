@@ -29,6 +29,7 @@ function makeEntry(overrides: Partial<Entry>): Entry {
     duration_ms: 8 * 60 * 1000,
     snapshot_id: null,
     media_path: null,
+    thumbnail_url: null,
     ai_model: null,
     details: null,
     created_by: null,

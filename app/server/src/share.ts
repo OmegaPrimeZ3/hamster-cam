@@ -11,8 +11,8 @@ import { join, isAbsolute, basename } from 'node:path';
 import { TRPCError } from '@trpc/server';
 
 import { getConfig } from './config.js';
+import { ensureClip } from './clips.js';
 import * as db from './db.js';
-import { extractClip } from './frigate.js';
 import { childLogger } from './logger.js';
 import { getZyphr } from './zyphr.js';
 
@@ -98,32 +98,11 @@ async function sendClip(
   if (!cfg.ZYPHR_FROM_EMAIL) {
     throw new Error('ZYPHR_FROM_EMAIL is not configured');
   }
-  let clipPath: string;
-  let clipName: string;
-  let cleanupPath: string | null = null;
 
-  if (entry.media_path) {
-    clipPath = isAbsolute(entry.media_path)
-      ? entry.media_path
-      : join(cfg.STORAGE_PATH, entry.media_path);
-    clipName = basename(clipPath);
-  } else {
-    // Pull a 10-second clip from Frigate recordings centred on the event.
-    if (entry.camera_id == null) {
-      throw new Error('diary entry has no camera_id; cannot extract clip');
-    }
-    const camera = db.getCameraById(entry.camera_id);
-    if (!camera) throw new Error('diary entry references a deleted camera');
-    const extracted = await extractClip({
-      // Frigate identifies cameras by their go2rtc/Frigate stream name (live_src),
-      // not the friendly display name. Fall back to name for legacy rows.
-      cameraName: camera.live_src ?? camera.name,
-      centerMs: entry.occurred_at,
-    });
-    clipPath = extracted.path;
-    clipName = basename(extracted.path);
-    cleanupPath = extracted.path;
-  }
+  // Resolve (or extract + cache) the clip via the shared layer.
+  const { relPath } = await ensureClip(entry);
+  const clipPath = isAbsolute(relPath) ? relPath : join(cfg.STORAGE_PATH, relPath);
+  const clipName = basename(clipPath);
 
   const fileStat = await stat(clipPath);
   if (fileStat.size > ATTACH_LIMIT_BYTES) {
@@ -157,10 +136,7 @@ async function sendClip(
     ],
   });
 
-  // Best-effort cleanup of temporary extracted clip.
-  if (cleanupPath) {
-    void readFile(cleanupPath).catch(() => undefined);
-  }
+  // Clips are now cached — we do NOT delete them after sending.
   logger.info(
     { shareId: shareRow.id, recipient: recipient.email, bytes: buf.length },
     'share clip sent',

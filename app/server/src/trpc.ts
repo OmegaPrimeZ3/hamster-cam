@@ -19,6 +19,7 @@ import { initTRPC, TRPCError } from '@trpc/server';
 import type { CreateFastifyContextOptions } from '@trpc/server/adapters/fastify';
 import { z } from 'zod';
 
+import { ensureClip } from './clips.js';
 import { deleteFileBestEffort } from './fs-utils.js';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRetentionJob } from './jobs/retention.js';
@@ -280,6 +281,8 @@ const diaryEntrySchema = z.object({
   ai_model: z.string().nullable(),
   details: z.string().nullable(),
   created_by: z.number().int().nullable(),
+  /** Relative-path URL to a ~480px JPEG thumbnail (e.g. `/thumbnails/entry-42-thumb.jpg`). */
+  thumbnail_url: z.string().nullable(),
 });
 export type DiaryEntryDTO = z.infer<typeof diaryEntrySchema>;
 
@@ -363,6 +366,8 @@ function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
     ai_model: row.ai_model ?? null,
     details: row.details ?? null,
     created_by: row.created_by ?? null,
+    // Expose thumbnail as a browser-ready URL path; clip_path stays internal.
+    thumbnail_url: row.thumbnail_path ? `/${row.thumbnail_path}` : null,
   };
 }
 
@@ -1451,6 +1456,7 @@ const adminRouter = router({
       timelapse_media_cleared: z.number().int().nonnegative(),
       audit_rows_deleted: z.number().int().nonnegative(),
       clips_deleted: z.number().int().nonnegative(),
+      thumbnails_deleted: z.number().int().nonnegative(),
     }))
     .mutation(() => runRetentionJob()),
 
@@ -1583,6 +1589,41 @@ const notificationsRouter = router({
 });
 
 // ---------------------------------------------------------------------------
+// clip.* — in-app video playback
+// ---------------------------------------------------------------------------
+
+const clipRouter = router({
+  /**
+   * Resolve (or extract + cache) a playable MP4 clip for a diary entry.
+   *
+   * Output:
+   *   url        — browser-ready path for <video src>  (e.g. `/clips/cam1-123-133.mp4`)
+   *   duration_ms — clip duration in ms (10 000 for extracted clips; null for timelapses)
+   */
+  get: protectedProcedure
+    .input(z.object({ diary_entry_id: z.number().int() }))
+    .output(z.object({
+      url: z.string(),
+      duration_ms: z.number().int().nullable(),
+    }))
+    .query(async ({ input }) => {
+      const entry = db.getDiaryEntryById(input.diary_entry_id);
+      if (!entry) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'diary entry not found' });
+      }
+      try {
+        const { relPath } = await ensureClip(entry);
+        return { url: `/${relPath}`, duration_ms: entry.duration_ms ?? null };
+      } catch (err) {
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: err instanceof Error ? err.message : 'clip extraction failed',
+        });
+      }
+    }),
+});
+
+// ---------------------------------------------------------------------------
 // App router — frozen surface
 // ---------------------------------------------------------------------------
 
@@ -1599,6 +1640,7 @@ export const appRouter = router({
   share: shareRouter,
   admin: adminRouter,
   notifications: notificationsRouter,
+  clip: clipRouter,
 });
 
 export type AppRouter = typeof appRouter;

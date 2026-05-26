@@ -74,6 +74,8 @@ function makeDiaryEntry(
     details: null,
     ai_model: null,
     created_by: null,
+    thumbnail_path: null,
+    clip_path: null,
     ...overrides,
   };
 }

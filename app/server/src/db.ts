@@ -115,6 +115,10 @@ export interface DiaryEntryRow {
   ai_model: string | null;
   /** User who triggered this entry manually. NULL for auto-generated entries. */
   created_by: number | null;
+  /** Relative path under STORAGE_PATH to a downscaled ~480px JPEG thumbnail. */
+  thumbnail_path: string | null;
+  /** Relative path under STORAGE_PATH to a cached extracted MP4 clip. */
+  clip_path: string | null;
 }
 
 export interface PushSubscriptionRow {
@@ -255,6 +259,8 @@ interface Statements {
   diaryUpsertRecapForDate: Database.Statement;
   diaryDeleteOlderThan: Database.Statement;
   diaryClearMediaOlderThan: Database.Statement;
+  diaryUpdateThumbnailPath: Database.Statement;
+  diaryUpdateClipPath: Database.Statement;
   // badges
   badgeInsert: Database.Statement;
   badgeList: Database.Statement;
@@ -492,6 +498,12 @@ function statements(): Statements {
          SET media_path = NULL
        WHERE kind = 'timelapse' AND occurred_at < ?
     `),
+    diaryUpdateThumbnailPath: db.prepare(
+      'UPDATE diary_entries SET thumbnail_path = @thumbnail_path WHERE id = @id',
+    ),
+    diaryUpdateClipPath: db.prepare(
+      'UPDATE diary_entries SET clip_path = @clip_path WHERE id = @id',
+    ),
 
     // badges -----------------------------------------------------------
     badgeInsert: db.prepare(
@@ -1170,6 +1182,16 @@ export function deleteOldSnapshotDiaryEntries(cutoffMs: number): number {
 export function clearOldTimelapseMedia(cutoffMs: number): number {
   const info = statements().diaryClearMediaOlderThan.run(cutoffMs);
   return info.changes;
+}
+
+/** Persist a generated thumbnail path onto an existing diary entry row. */
+export function updateDiaryEntryThumbnailPath(id: number, relPath: string): void {
+  statements().diaryUpdateThumbnailPath.run({ id, thumbnail_path: relPath });
+}
+
+/** Persist a cached clip path onto an existing diary entry row. */
+export function updateDiaryEntryClipPath(id: number, relPath: string): void {
+  statements().diaryUpdateClipPath.run({ id, clip_path: relPath });
 }
 
 /** Shared helper: sum wheel_meters from a set of detail rows. */

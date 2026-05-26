@@ -25,6 +25,7 @@ import { trpc } from '../trpc';
 import { relativeTime, formatDuration } from '../lib/time';
 import { activityStyle } from '../lib/activity-style';
 import { ShareDialog } from './ShareDialog';
+import { ClipPlayerDialog } from './ClipPlayerDialog';
 import { isTTSAvailable, speak } from '../lib/tts';
 import { parseWheelMeters } from '../lib/trpc-extensions';
 import { formatMeters } from '../lib/distance';
@@ -52,6 +53,7 @@ function stripLeadingEmoji(text: string): string {
 export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' }: DiaryEntryProps): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [clipOpen, setClipOpen] = useState(false);
   const [speaking, setSpeaking] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -89,6 +91,11 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
     wheelMeters !== null ? ` · ${formatMeters(wheelMeters, distanceUnit)}` : null;
 
   const showTTS = ttsEnabled && isTTSAvailable();
+
+  // Show "View clip" for narrative entries (always have camera footage) and
+  // timelapse entries (already have an MP4). Exclude snapshot (image shown
+  // inline) and recap (text-only daily summary, no associated footage).
+  const showViewClip = entry.kind === 'narrative' || entry.kind === 'timelapse';
 
   function handleTTS(): void {
     if (speaking) {
@@ -166,7 +173,7 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
       ) : entry.kind === 'snapshot' ? (
         <SnapshotBody entry={entry} expanded={expanded} onToggle={() => setExpanded((v) => !v)} />
       ) : (
-        <NarrativeBody entry={entry} />
+        <NarrativeBody entry={entry} onOpenClip={() => setClipOpen(true)} />
       )}
 
       <div
@@ -212,6 +219,17 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
             {distanceSuffix}
           </small>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {showViewClip && (
+              <button
+                type="button"
+                className="hc-btn"
+                onClick={() => setClipOpen(true)}
+                aria-label="View clip"
+              >
+                <Play aria-hidden size={16} />
+                View clip
+              </button>
+            )}
             <button
               type="button"
               className="hc-btn"
@@ -280,18 +298,41 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
       </div>
 
       <ShareDialog entry={entry} open={shareOpen} onOpenChange={setShareOpen} />
+      <ClipPlayerDialog entry={entry} open={clipOpen} onOpenChange={setClipOpen} />
     </motion.article>
   );
 }
 
-function NarrativeBody({ entry }: { entry: Entry }): JSX.Element | null {
-  if (!entry.media_path) return null;
+function NarrativeBody({
+  entry,
+  onOpenClip,
+}: {
+  entry: Entry;
+  onOpenClip: () => void;
+}): JSX.Element | null {
+  if (!entry.thumbnail_url) return null;
   return (
-    <img
-      src={entry.media_path}
-      alt=""
-      style={{ width: 120, height: 80, objectFit: 'cover', borderRadius: 10, flexShrink: 0 }}
-    />
+    <button
+      type="button"
+      onClick={onOpenClip}
+      aria-label="View clip"
+      style={{
+        padding: 0,
+        border: 'none',
+        background: 'transparent',
+        flexShrink: 0,
+        cursor: 'pointer',
+        borderRadius: 10,
+        overflow: 'hidden',
+      }}
+    >
+      <img
+        src={entry.thumbnail_url}
+        alt=""
+        loading="lazy"
+        style={{ width: 120, height: 80, objectFit: 'cover', borderRadius: 10, display: 'block' }}
+      />
+    </button>
   );
 }
 
@@ -367,6 +408,7 @@ function TimelapseBody({ entry }: { entry: Entry }): JSX.Element {
           playsInline
           preload="metadata"
           src={entry.media_path}
+          poster={entry.thumbnail_url ?? undefined}
           style={{ width: '100%', height: '100%', objectFit: 'contain' }}
         />
       ) : (

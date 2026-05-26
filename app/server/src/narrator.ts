@@ -379,6 +379,10 @@ const defaultDeps: Required<NarratorDeps> = {
   onEntryWritten: async (entry) => {
     await evaluateBadges();
     await evaluatePushForEntry(entry);
+    // Fire-and-forget: generate thumbnail eagerly; never blocks the narrator.
+    void import('./thumbnails.js').then(({ generateThumbnailForEntry }) =>
+      generateThumbnailForEntry(entry),
+    );
   },
 };
 
@@ -950,6 +954,10 @@ export async function saveManualSnapshot(input: {
     created_by: input.userId ?? null,
   });
   await evaluateBadges();
+  // Fire-and-forget: generate thumbnail eagerly for the snapshot entry.
+  void import('./thumbnails.js').then(({ generateThumbnailForEntry }) =>
+    generateThumbnailForEntry(entry),
+  );
   return entry;
 }
 

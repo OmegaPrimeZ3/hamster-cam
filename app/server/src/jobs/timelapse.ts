@@ -13,6 +13,7 @@ import * as db from '../db.js';
 import { runFfmpeg } from '../frigate.js';
 import { childLogger } from '../logger.js';
 import { pickTemplate, render } from '../narratives.js';
+import { generateThumbnailForEntry } from '../thumbnails.js';
 
 const logger = childLogger('timelapse-job');
 
@@ -152,6 +153,8 @@ export async function runTimelapseJob(now?: Date): Promise<TimelapseRunResult> {
       { night: isoDate, frames: sampled.length, fps, path: outAbs, entry: entry.id },
       'timelapse produced',
     );
+    // Fire-and-forget: generate thumbnail from the timelapse's first frame.
+    void generateThumbnailForEntry(entry);
     return {
       date: isoDate,
       produced: true,

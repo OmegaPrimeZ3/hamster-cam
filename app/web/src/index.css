@@ -251,6 +251,11 @@ img, video, svg { max-width: 100%; display: block; }
   color: var(--accent-text);
 }
 
+/* Generic spin — used by ClipPlayerDialog loading state */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 /* Visually-hidden but screen-reader-available */
 .hc-sr-only {
   position: absolute;

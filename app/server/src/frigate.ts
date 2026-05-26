@@ -542,6 +542,73 @@ export interface CaptureSnapshotResult {
   captured: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Frame extraction — grabs a single JPEG at a specific moment for thumbnails.
+// ---------------------------------------------------------------------------
+
+export interface ExtractFrameResult {
+  /** Relative path under STORAGE_PATH where the JPEG was written. */
+  path: string;
+  /** True iff ffmpeg produced a non-zero-byte JPEG. */
+  captured: boolean;
+}
+
+/**
+ * Pulls a 1-second clip from Frigate's recordings API centered on `atMs` and
+ * extracts the first video frame as a downscaled JPEG. Writes the result under
+ * `STORAGE_PATH/thumbnails/<cameraName>-<atMs>.jpg`.
+ *
+ * Returns `captured: false` and still writes a zero-byte placeholder when
+ * Frigate is unreachable, ffmpeg fails, or the output is empty — never throws
+ * to the caller.
+ */
+export async function extractFrame(input: {
+  cameraName: string;
+  atMs: number;
+  widthPx?: number;
+}): Promise<ExtractFrameResult> {
+  const cfg = getConfig();
+  const thumbsDir = join(cfg.STORAGE_PATH, 'thumbnails');
+  await mkdir(thumbsDir, { recursive: true });
+  const relPath = join('thumbnails', `${input.cameraName}-${input.atMs}.jpg`);
+  const absPath = join(cfg.STORAGE_PATH, relPath);
+
+  if (!cfg.FRIGATE_URL) {
+    await writeFile(absPath, Buffer.alloc(0));
+    return { path: relPath, captured: false };
+  }
+
+  const width = input.widthPx ?? 480;
+  const sec = Math.floor(input.atMs / 1000);
+  const endSec = sec + 1;
+  const sourceUrl = new URL(
+    `/api/${encodeURIComponent(input.cameraName)}/recordings/${sec}-${endSec}/clip.mp4`,
+    cfg.FRIGATE_URL,
+  ).toString();
+
+  try {
+    await runFfmpeg([
+      '-y',
+      '-i', sourceUrl,
+      '-frames:v', '1',
+      '-vf', `scale=${width}:-1`,
+      absPath,
+    ]);
+
+    // Verify the output is non-empty (ffmpeg may exit 0 but write nothing).
+    const { stat } = await import('node:fs/promises');
+    const st = await stat(absPath);
+    if (st.size > 0) {
+      return { path: relPath, captured: true };
+    }
+  } catch {
+    // ffmpeg failed or file missing — fall through to placeholder.
+  }
+
+  await writeFile(absPath, Buffer.alloc(0));
+  return { path: relPath, captured: false };
+}
+
 export async function captureLatestSnapshot(
   cameraName: string,
   takenAtMs: number,
