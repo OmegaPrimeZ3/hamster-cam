@@ -76,7 +76,7 @@ describe('narrator', () => {
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
     const db = await import('../src/db.js');
-    setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000 });
+    setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000, transitionEntriesEnabled: true });
     resetNarratorState();
     await seedCameras();
 
@@ -431,7 +431,7 @@ describe('narrator multi-camera dedup', () => {
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
     const db = await import('../src/db.js');
-    setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000 });
+    setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000, transitionEntriesEnabled: true });
     resetNarratorState();
     await seedCameras(); // wheel + food cameras
 
@@ -638,7 +638,7 @@ describe('narrator multi-camera dedup', () => {
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
     const db = await import('../src/db.js');
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 500 });
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 500, exploringMinDwellMs: 500 });
     resetNarratorState();
 
     db.createCamera({ name: 'cam-wide', emoji: '📷', stream_url: 'rtsp://x/wide', enabled: true });

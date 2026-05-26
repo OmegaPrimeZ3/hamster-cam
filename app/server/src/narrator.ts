@@ -80,12 +80,29 @@ import { startWheelSession, endWheelSession } from './wheel-odometer.js';
 // update). Defaults track PLAN §5.4.
 // ---------------------------------------------------------------------------
 
-interface NarratorTuning {
+export interface NarratorTuning {
   transitionWindowMs: number;
   minDwellMs: number;
+  /**
+   * Minimum dwell before an 'exploring' visit is written to the diary.
+   * Defaults to 60 000 ms (1 minute) — much higher than minDwellMs so casual
+   * cage wandering is suppressed and only sustained exploration gets logged.
+   */
+  exploringMinDwellMs: number;
+  /**
+   * When false (the default), cross-camera transition entries are dropped
+   * entirely — they are connective filler that buries meaningful events.
+   * Set to true in settings to restore them.
+   */
+  transitionEntriesEnabled: boolean;
 }
 
-let tuning: NarratorTuning = { transitionWindowMs: 8_000, minDwellMs: 2_000 };
+let tuning: NarratorTuning = {
+  transitionWindowMs: 8_000,
+  minDwellMs: 2_000,
+  exploringMinDwellMs: 60_000,
+  transitionEntriesEnabled: false,
+};
 
 /**
  * Back-to-back same-activity coalescing window. When a non-wheel zone visit
@@ -102,18 +119,31 @@ export function refreshNarratorTunings(): void {
   try {
     const transition = Number.parseInt(db.getSetting('transition_window_ms') ?? '8000', 10);
     const dwell = Number.parseInt(db.getSetting('min_dwell_ms') ?? '2000', 10);
+    const exploringDwell = Number.parseInt(db.getSetting('exploring_min_dwell_ms') ?? '60000', 10);
+    const transitionEnabled = db.getSetting('transition_entries_enabled');
     tuning = {
       transitionWindowMs: Number.isFinite(transition) ? transition : 8_000,
       minDwellMs: Number.isFinite(dwell) ? dwell : 2_000,
+      exploringMinDwellMs: Number.isFinite(exploringDwell) ? exploringDwell : 60_000,
+      transitionEntriesEnabled: transitionEnabled === 'true' || transitionEnabled === '1',
     };
   } catch {
     // DB not yet initialised — keep defaults.
   }
 }
 
-/** Test helper to force tunables without touching the DB. */
-export function setNarratorTuningsForTests(t: NarratorTuning): void {
-  tuning = { ...t };
+/**
+ * Test helper to force tunables without touching the DB.
+ * Accepts a partial — unspecified fields keep the current default.
+ */
+export function setNarratorTuningsForTests(t: Partial<NarratorTuning>): void {
+  tuning = {
+    transitionWindowMs: 8_000,
+    minDwellMs: 2_000,
+    exploringMinDwellMs: 60_000,
+    transitionEntriesEnabled: false,
+    ...t,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +595,13 @@ async function commitDeferred(
   deferred: DeferredEntry,
   deps: ScheduledFlushDeps,
 ): Promise<db.DiaryEntryRow | null> {
-  if (deferred.durationMs < tuning.minDwellMs) return null;
+  // Activity-specific dwell threshold: exploring requires a much longer dwell
+  // than other activities so casual cage wandering is suppressed.
+  const dwellThreshold =
+    deferred.activity === 'exploring'
+      ? tuning.exploringMinDwellMs
+      : tuning.minDwellMs;
+  if (deferred.durationMs < dwellThreshold) return null;
 
   // Back-to-back same-activity coalescing: if the most recent diary entry is
   // the SAME non-wheel activity and the pet returned to it within
@@ -691,7 +727,10 @@ export async function handleFrigateEvent(
       clearTimeout(pending.timer);
       petState.pending = null;
       const dwellMs = pending.at - pending.startedAt;
-      if (dwellMs >= tuning.minDwellMs) {
+      // Only write a transition diary entry when enabled in settings (default: off)
+      // AND the dwell is long enough to be meaningful. Even when suppressed we
+      // still discard the deferred entries — the transition already happened.
+      if (tuning.transitionEntriesEnabled && dwellMs >= tuning.minDwellMs) {
         const fromZone = pending.activity;
         const toZone = classifyActivity(event.after);
         const entry = writeEntry({

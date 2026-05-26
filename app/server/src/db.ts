@@ -297,6 +297,8 @@ interface Statements {
   diaryWheelEntriesBetween: Database.Statement;
   diaryWheelEntriesGroupedByDay: Database.Statement;
   diaryWheelBestSession: Database.Statement;
+  diaryWheelDurationAll: Database.Statement;
+  diaryWheelDurationBetween: Database.Statement;
   // push subscriptions
   pushSubUpsert: Database.Statement;
   pushSubDeleteByEndpointForUser: Database.Statement;
@@ -636,6 +638,21 @@ function statements(): Statements {
        WHERE activity = 'wheel'
          AND details IS NOT NULL
          AND json_extract(details, '$.wheel_meters') IS NOT NULL
+    `),
+    // Sum duration_ms directly from the row (not from the JSON details blob)
+    // for all-time and bounded wheel-time aggregation.
+    diaryWheelDurationAll: db.prepare(`
+      SELECT COALESCE(SUM(duration_ms), 0) AS total_ms
+        FROM diary_entries
+       WHERE activity = 'wheel'
+         AND duration_ms IS NOT NULL
+    `),
+    diaryWheelDurationBetween: db.prepare(`
+      SELECT COALESCE(SUM(duration_ms), 0) AS total_ms
+        FROM diary_entries
+       WHERE activity = 'wheel'
+         AND duration_ms IS NOT NULL
+         AND occurred_at >= ? AND occurred_at < ?
     `),
 
     // push subscriptions -----------------------------------------------
@@ -1326,6 +1343,24 @@ export function listWheelMetersByDay(sinceMs: number): WheelDaySeries[] {
 export function bestWheelSessionMeters(): number {
   const row = statements().diaryWheelBestSession.get() as { best: number | null };
   return typeof row.best === 'number' && Number.isFinite(row.best) ? row.best : 0;
+}
+
+/**
+ * Sum all wheel diary entry `duration_ms` values across all time.
+ * Returns milliseconds; treat null duration_ms rows as 0 (skipped via COALESCE).
+ */
+export function sumAllWheelDurationMs(): number {
+  const row = statements().diaryWheelDurationAll.get() as { total_ms: number };
+  return typeof row.total_ms === 'number' && Number.isFinite(row.total_ms) ? row.total_ms : 0;
+}
+
+/**
+ * Sum wheel diary entry `duration_ms` within a time range [fromMs, toMs).
+ * Returns milliseconds.
+ */
+export function sumWheelDurationMsBetween(fromMs: number, toMs: number): number {
+  const row = statements().diaryWheelDurationBetween.get(fromMs, toMs) as { total_ms: number };
+  return typeof row.total_ms === 'number' && Number.isFinite(row.total_ms) ? row.total_ms : 0;
 }
 
 // ---------------------------------------------------------------------------

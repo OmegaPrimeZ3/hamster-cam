@@ -283,6 +283,14 @@ const diaryEntrySchema = z.object({
   created_by: z.number().int().nullable(),
   /** Relative-path URL to a ~480px JPEG thumbnail (e.g. `/thumbnails/entry-42-thumb.jpg`). */
   thumbnail_url: z.string().nullable(),
+  /**
+   * True when a playable clip can be produced for this entry:
+   *   - clip_path is already cached on disk, OR
+   *   - media_path ends with .mp4 (timelapse), OR
+   *   - camera_id is set (Frigate extraction is possible).
+   * False when none of the above apply — the frontend should hide "View Clip".
+   */
+  clip_available: z.boolean(),
 });
 export type DiaryEntryDTO = z.infer<typeof diaryEntrySchema>;
 
@@ -352,6 +360,14 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
 }
 
 function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
+  // clip_available: true when any extraction path is viable. Mirrors the
+  // resolution order in ensureClip() so the frontend can hide the button
+  // before ever making a clip.get call.
+  const clip_available =
+    row.clip_path != null ||
+    (row.media_path != null && row.media_path.toLowerCase().endsWith('.mp4')) ||
+    row.camera_id != null;
+
   return {
     id: row.id,
     occurred_at: row.occurred_at,
@@ -370,6 +386,7 @@ function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
     created_by: row.created_by ?? null,
     // Expose thumbnail as a browser-ready URL path; clip_path stays internal.
     thumbnail_url: row.thumbnail_path ? `/${row.thumbnail_path}` : null,
+    clip_available,
   };
 }
 
@@ -392,6 +409,10 @@ const settingsSchema = z.object({
   disk_critical_pct: z.number().int().min(0).max(100),
   transition_window_ms: z.number().int().nonnegative(),
   min_dwell_ms: z.number().int().nonnegative(),
+  /** Minimum dwell (ms) before an 'exploring' visit is written. Defaults to 60000 (1 min). */
+  exploring_min_dwell_ms: z.number().int().nonnegative(),
+  /** Whether cross-camera transition entries are written to the diary. Defaults to false. */
+  transition_entries_enabled: z.boolean(),
   share_rate_limit_per_hour: z.number().int().nonnegative(),
   /** Distance unit for wheel odometer display. */
   distance_unit: z.enum(['mi', 'km']),
@@ -432,6 +453,8 @@ function parseSettingsKV(kv: db.SettingsKV): SettingsDTO {
     disk_critical_pct: num('disk_critical_pct', 95),
     transition_window_ms: num('transition_window_ms', 8000),
     min_dwell_ms: num('min_dwell_ms', 2000),
+    exploring_min_dwell_ms: num('exploring_min_dwell_ms', 60000),
+    transition_entries_enabled: bool('transition_entries_enabled', false),
     share_rate_limit_per_hour: num('share_rate_limit_per_hour', 10),
     distance_unit: rawDistUnit === 'km' ? 'km' : 'mi',
     recap_enabled: bool('recap_enabled', true),
@@ -920,7 +943,7 @@ const statsRouter = router({
     .output(z.object({
       /** Total wheel metres run today (local calendar day). */
       todayMeters: z.number(),
-      /** Total wheel metres in the current 7-day window (Mon–Sun local week, Sun-origin). */
+      /** Total wheel metres in the current 7-day window (Sun-origin local week). */
       weekMeters: z.number(),
       /** All-time cumulative wheel metres. */
       allTimeMeters: z.number(),
@@ -935,6 +958,12 @@ const statsRouter = router({
         date: z.string(),
         meters: z.number(),
       })),
+      /** Total wheel time today in whole seconds (sum of wheel diary entry duration_ms). */
+      todaySeconds: z.number().int(),
+      /** Total wheel time this week in whole seconds. */
+      weekSeconds: z.number().int(),
+      /** All-time total wheel time in whole seconds. */
+      allTimeSeconds: z.number().int(),
     }))
     .query(() => {
       const now = Date.now();
@@ -947,6 +976,11 @@ const statsRouter = router({
       const todayMeters = db.sumWheelMetersBetween(todayStart, todayEnd);
       const weekMeters = db.sumWheelMetersBetween(weekStart, now);
       const allTimeMeters = db.sumAllWheelMeters();
+
+      // Wheel time in seconds (truncated, not rounded, to stay conservative).
+      const todaySeconds = Math.trunc(db.sumWheelDurationMsBetween(todayStart, todayEnd) / 1000);
+      const weekSeconds = Math.trunc(db.sumWheelDurationMsBetween(weekStart, now) / 1000);
+      const allTimeSeconds = Math.trunc(db.sumAllWheelDurationMs() / 1000);
 
       // Daily series for the last 14 days.
       const fourteenDaysAgo = todayStart - 13 * 24 * 60 * 60 * 1000;
@@ -974,6 +1008,9 @@ const statsRouter = router({
         bestDayDate,
         bestSessionMeters,
         dailySeries,
+        todaySeconds,
+        weekSeconds,
+        allTimeSeconds,
       };
     }),
 });
@@ -1617,9 +1654,18 @@ const clipRouter = router({
         const { relPath } = await ensureClip(entry);
         return { url: `/${relPath}`, duration_ms: entry.duration_ms ?? null };
       } catch (err) {
+        if (err instanceof TRPCError) throw err;
+        const message = err instanceof Error ? err.message : 'clip extraction failed';
+        // Entries with no camera_id and no mp4 media are structurally unable to
+        // produce a clip — this is a client bug (button shown when clip_available
+        // is false). Surface as 412 so the frontend can handle it gracefully.
+        const isUnavailable =
+          message.includes('no camera_id') || message.includes('cannot produce a clip');
         throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: err instanceof Error ? err.message : 'clip extraction failed',
+          code: isUnavailable ? 'PRECONDITION_FAILED' : 'INTERNAL_SERVER_ERROR',
+          message: isUnavailable
+            ? 'No video is available for this diary entry.'
+            : message,
         });
       }
     }),
