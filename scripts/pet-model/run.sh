@@ -38,13 +38,15 @@ if [[ -z "${ROBOFLOW_API_KEY:-}" ]]; then
   exit 1
 fi
 
-# --- resolve work_dir from the config (need a tiny bit of python; system python ok) ---
-WORK_DIR="$(python3 - "$CONFIG" <<'PY'
-import os, sys, yaml
-cfg = yaml.safe_load(open(sys.argv[1]))
-print(os.path.expanduser(cfg["work_dir"]))
-PY
-)"
+# --- resolve work_dir from the config (pure bash — no system-python/pyyaml dep,
+#     since the venv that has pyyaml doesn't exist yet at this point) ---
+WORK_DIR="$(sed -n 's/^work_dir:[[:space:]]*//p' "$CONFIG" | head -1 \
+  | sed 's/[[:space:]]*#.*$//' | tr -d "\"'" | tr -d '[:space:]')"
+WORK_DIR="${WORK_DIR/#\~/$HOME}"   # expand a leading ~
+if [[ -z "$WORK_DIR" ]]; then
+  echo "FATAL: could not read 'work_dir:' from $CONFIG" >&2
+  exit 1
+fi
 echo "[run] work_dir = $WORK_DIR"
 mkdir -p "$WORK_DIR"
 

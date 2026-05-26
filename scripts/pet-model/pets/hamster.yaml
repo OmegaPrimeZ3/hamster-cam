@@ -31,20 +31,27 @@ datasets:
   - workspace: test-pq3k6
     project: hamster-0ip1u
     version: 2
+  # --- Phase F expansion (versions verified live via the Roboflow API) ---
+  - workspace: pet-monitor          # ~1521 imgs, cage/pet-monitor domain (closest match)
+    project: hamster-k5ngx
+    version: 1
+  - workspace: guagua               # ~443 imgs
+    project: hamster
+    version: 2
+  - workspace: rat01                # ~75 imgs (2024)
+    project: hamster-xqr4j
+    version: 2
 
-# --- TUNING (docs/HAMSTER_MODEL_TUNING.md) — left commented until "execute" ---
-# Bigger public sets to broaden the base (confirm each version(N) on Universe
-# "Download -> YOLOv8" before enabling — the pipeline fails loudly on a 404):
-#   - workspace: pet-monitor        # ~1521 imgs, cage/pet-monitor domain (closest match)
-#     project: hamster-k5ngx
-#     version: 1
-#   - workspace: guagua             # ~443 imgs
-#     project: hamster
-#     version: 1
+# --- TUNING (docs/HAMSTER_MODEL_TUNING.md) — cage fine-tune held pending review ---
+# Multi-rodent set — guinea-pig boxes remap to `hamster` (class 0). Enable only if
+# Phase J shows it doesn't add confusing non-hamster shapes:
+#   - workspace: tpicos-2-maurcio
+#     project: hamster-and-guinea-pig
+#     version: 3
 #
-# Real cage frames harvested off the live host (Phases G+H). Positives reviewed
-# by hand; negatives are reflection/empty-cage stills as background. Harvest ONLY
-# from 2026-05-25 19:00 onward (first footage clean of the mains-flicker fix).
+# Real cage frames harvested off the live host (Phases G+H). NIGHT batch of 523
+# positives already staged at ~/pet-models/hamster/local/cage_pos (auto-labeled,
+# AWAITING [HUMAN] box-review + daytime frames). Enable after review:
 # local_sources:
 #   - path: ~/pet-models/hamster/local/cage_pos
 #     role: positive
