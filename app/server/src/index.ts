@@ -115,6 +115,9 @@ export async function buildServer(): Promise<AppServer> {
   // /clips/*     — MP4s extracted by clips.ts / frigate.extractClip
   //                Range requests enabled so iOS Safari can scrub without full download.
   registerPrivateMedia(app, 'clips', new Set(['.mp4']));
+  // /timelapse/* — nightly MP4s stitched by jobs/timelapse.ts
+  //                Range requests required so iOS Safari can scrub the full reel.
+  registerPrivateMedia(app, 'timelapse', new Set(['.mp4']));
 
   // SPA static handler: serves the built React app for all GET requests that
   // don't match an existing API route. Registered via setNotFoundHandler so it
