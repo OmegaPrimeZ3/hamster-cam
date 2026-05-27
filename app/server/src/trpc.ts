@@ -711,6 +711,32 @@ const camerasRouter = router({
       return db.listCameras().map((row) => cameraToDTO(row, null));
     }),
 
+  /**
+   * Flip a single camera's enabled flag without touching any other field.
+   * Designed for a one-tap toggle in the Settings camera list.
+   */
+  setEnabled: adminProcedure
+    .meta({
+      audit: {
+        action: 'cameras.setEnabled',
+        targetType: 'camera',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['id'] === 'number' ? input['id'] : null,
+        detailsFrom: (input) => {
+          if (!isRecord(input)) return null;
+          return { id: input['id'], enabled: input['enabled'] };
+        },
+      },
+    })
+    .input(z.object({ id: z.number().int(), enabled: z.boolean() }))
+    .output(cameraSchema)
+    .mutation(({ input }) => {
+      const row = db.setCameraEnabled(input.id, input.enabled);
+      if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'camera not found' });
+      const stats = frigate.getCachedCameraStats(row.live_src ?? row.name);
+      return cameraToDTO(row, stats.lastFrameAt);
+    }),
+
   // Proxied helpers — Frigate-dependent.
   discover: adminProcedure
     .meta({ audit: false })

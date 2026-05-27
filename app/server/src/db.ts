@@ -245,6 +245,7 @@ interface Statements {
   cameraListEnabled: Database.Statement;
   cameraInsert: Database.Statement;
   cameraUpdate: Database.Statement;
+  cameraSetEnabled: Database.Statement;
   cameraDelete: Database.Statement;
   cameraSetPosition: Database.Statement;
   cameraMaxPosition: Database.Statement;
@@ -437,6 +438,7 @@ function statements(): Statements {
              wheel_threshold_pct   = @wheel_threshold_pct
        WHERE id = @id
     `),
+    cameraSetEnabled: db.prepare('UPDATE cameras SET enabled = ? WHERE id = ?'),
     cameraDelete: db.prepare('DELETE FROM cameras WHERE id = ?'),
     cameraSetPosition: db.prepare('UPDATE cameras SET position = ? WHERE id = ?'),
     cameraMaxPosition: db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM cameras'),
@@ -1064,6 +1066,15 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
     wheel_threshold_pct: input.wheel_threshold_pct ?? existing?.wheel_threshold_pct ?? 50.0,
   });
   return getCameraById(input.id);
+}
+
+/**
+ * Toggle a camera's enabled state without touching any other column.
+ * Returns the updated row, or null when no camera with the given id exists.
+ */
+export function setCameraEnabled(id: number, enabled: boolean): CameraRow | null {
+  statements().cameraSetEnabled.run(enabled ? 1 : 0, id);
+  return getCameraById(id);
 }
 
 /**
