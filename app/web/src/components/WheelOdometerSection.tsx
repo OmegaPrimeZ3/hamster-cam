@@ -9,11 +9,12 @@
 // `onChange` callback and includes them in the same cameras.update mutation it
 // already fires.
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { ChevronDown, ChevronUp, Loader2, Eye, EyeOff } from 'lucide-react';
 import { trpc } from '../trpc';
 import { LiveStream } from './LiveStream';
 import type { DistanceUnit } from '../lib/trpc-extensions';
+import { formatMeters } from '../lib/distance';
 
 // -----------------------------------------------------------------------
 // Types
@@ -57,16 +58,48 @@ export interface WheelOdometerSectionProps {
 // Component
 // -----------------------------------------------------------------------
 
+// Duration options for the rotation test (seconds).
+const ROTATION_DURATION_OPTIONS = [10, 15, 30] as const;
+type RotationDurationS = (typeof ROTATION_DURATION_OPTIONS)[number];
+
 export function WheelOdometerSection({
   cameraId,
   config,
   onChange,
+  distanceUnit = 'mi',
   liveSrc,
 }: WheelOdometerSectionProps): JSX.Element {
   // Change A: expand by default.
   const [open, setOpen] = useState(true);
   const [targetingOpen, setTargetingOpen] = useState(false);
   const testMutation = trpc.cameras.testWheelDetection.useMutation();
+
+  // ---- Rotation test state ----
+  const rotationMutation = trpc.cameras.testWheelRotation.useMutation();
+  const [rotationDurationS, setRotationDurationS] = useState<RotationDurationS>(15);
+  const [elapsed, setElapsed] = useState(0);
+  const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Start / clear elapsed ticker when the rotation mutation state changes.
+  useEffect(() => {
+    if (rotationMutation.isLoading) {
+      setElapsed(0);
+      elapsedRef.current = setInterval(() => {
+        setElapsed((prev) => prev + 1);
+      }, 1000);
+    } else {
+      if (elapsedRef.current !== null) {
+        clearInterval(elapsedRef.current);
+        elapsedRef.current = null;
+      }
+    }
+    return () => {
+      if (elapsedRef.current !== null) {
+        clearInterval(elapsedRef.current);
+        elapsedRef.current = null;
+      }
+    };
+  }, [rotationMutation.isLoading]);
 
   function set<K extends keyof WheelConfig>(key: K, value: WheelConfig[K]): void {
     onChange({ ...config, [key]: value });
@@ -475,10 +508,340 @@ export function WheelOdometerSection({
               </p>
             )}
           </FieldRow>
+
+          {/* ---- Test rotation count ---- */}
+          <RotationTestBlock
+            durationS={rotationDurationS}
+            distanceUnit={distanceUnit}
+            isRunning={rotationMutation.isLoading}
+            elapsed={elapsed}
+            result={rotationMutation.data ?? null}
+            error={rotationMutation.error}
+            onDurationChange={(d) => setRotationDurationS(d)}
+            onRun={() => {
+              rotationMutation.reset();
+              rotationMutation.mutate({ cameraId, durationS: rotationDurationS });
+            }}
+          />
         </div>
       )}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// RotationTestResultProps (declared early so RotationTestBlockProps can ref it)
+// ---------------------------------------------------------------------------
+
+export interface RotationTestResultProps {
+  result: {
+    rotations: number;
+    sampledDurationS: number;
+    sampleFps: number;
+    framesSampled: number;
+    ratioTrace: number[];
+    thresholdRatio: number;
+    distanceMeters: number;
+    diameterMm: number;
+  };
+  distanceUnit: DistanceUnit;
+}
+
+// ---------------------------------------------------------------------------
+// RotationTestBlock
+// ---------------------------------------------------------------------------
+
+interface RotationTestBlockProps {
+  durationS: RotationDurationS;
+  distanceUnit: DistanceUnit;
+  isRunning: boolean;
+  elapsed: number;
+  result: RotationTestResultProps['result'] | null;
+  error: { message: string } | null;
+  onDurationChange: (d: RotationDurationS) => void;
+  onRun: () => void;
+}
+
+function RotationTestBlock({
+  durationS,
+  distanceUnit,
+  isRunning,
+  elapsed,
+  result,
+  error,
+  onDurationChange,
+  onRun,
+}: RotationTestBlockProps): JSX.Element {
+  return (
+    <FieldRow>
+      {/* Row: button + duration selector */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <button
+          type="button"
+          className="hc-btn"
+          disabled={isRunning}
+          aria-label={`Test rotation count over ${durationS} seconds`}
+          onClick={onRun}
+          style={{ alignSelf: 'flex-start', minWidth: 64, minHeight: 44 }}
+        >
+          {isRunning ? (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <Loader2 aria-hidden size={14} className="spin" />
+              {elapsed}s&nbsp;/&nbsp;{durationS}s
+            </span>
+          ) : (
+            'Test rotation count'
+          )}
+        </button>
+
+        {/* Duration picker */}
+        <div
+          role="group"
+          aria-label="Sample duration"
+          style={{ display: 'flex', gap: 4 }}
+        >
+          {ROTATION_DURATION_OPTIONS.map((d) => (
+            <button
+              key={d}
+              type="button"
+              disabled={isRunning}
+              aria-pressed={durationS === d}
+              onClick={() => onDurationChange(d)}
+              style={{
+                padding: '4px 10px',
+                borderRadius: 6,
+                border: '1px solid var(--border)',
+                background: durationS === d ? 'var(--accent, #f59e0b)' : 'var(--surface-raised)',
+                color: durationS === d ? '#000' : 'var(--text)',
+                fontWeight: durationS === d ? 700 : 400,
+                cursor: isRunning ? 'not-allowed' : 'pointer',
+                fontSize: 13,
+                minHeight: 32,
+              }}
+            >
+              {d}s
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* In-progress message */}
+      {isRunning && (
+        <p style={{ margin: '6px 0 0', color: 'var(--text-muted)', fontSize: 13 }} aria-live="polite">
+          Watching the wheel for {durationS}s — give it a spin or let {'✨'} run.
+        </p>
+      )}
+
+      {/* Error state */}
+      {error != null && !isRunning && (
+        <p role="alert" style={{ color: 'var(--danger)', margin: '6px 0 0' }}>
+          {error.message}
+        </p>
+      )}
+
+      {/* Result state */}
+      {result != null && !isRunning && (
+        <RotationTestResult result={result} distanceUnit={distanceUnit} />
+      )}
+
+      <HelpText>
+        Runs a live sample and counts full wheel rotations. Spin the wheel during
+        the window. If rotations show 0, check the detection test above to confirm
+        the tape is visible.
+      </HelpText>
+    </FieldRow>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RotationTestResult + RatioSparkline
+// (exported so tests can render them in isolation)
+// ---------------------------------------------------------------------------
+
+export function RotationTestResult({ result, distanceUnit }: RotationTestResultProps): JSX.Element {
+  const {
+    rotations,
+    sampledDurationS,
+    sampleFps,
+    framesSampled,
+    ratioTrace,
+    thresholdRatio,
+    distanceMeters,
+  } = result;
+
+  const formattedDistance = formatMeters(distanceMeters, distanceUnit);
+  const isZero = rotations === 0;
+
+  return (
+    <div
+      data-testid="rotation-test-result"
+      style={{
+        marginTop: 10,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10,
+        padding: '12px 14px',
+        borderRadius: 10,
+        border: '1px solid var(--border)',
+        background: 'var(--surface-raised)',
+      }}
+    >
+      {/* Primary readout */}
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+        <span
+          aria-label={`${rotations} rotation${rotations === 1 ? '' : 's'} counted`}
+          style={{
+            fontFamily: "'Fredoka', sans-serif",
+            fontSize: 28,
+            fontWeight: 700,
+            color: isZero ? 'var(--text-muted)' : 'var(--success, #22c55e)',
+            lineHeight: 1,
+          }}
+        >
+          {rotations}
+        </span>
+        <span style={{ fontWeight: 600, fontSize: 15, color: 'var(--text)' }}>
+          rotation{rotations === 1 ? '' : 's'}
+        </span>
+        {!isZero && (
+          <span
+            aria-label={`distance ${formattedDistance}`}
+            style={{ fontSize: 15, color: 'var(--text-muted)' }}
+          >
+            &nbsp;&mdash;&nbsp;{formattedDistance}
+          </span>
+        )}
+      </div>
+
+      {/* Small print: frame stats */}
+      <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+        {framesSampled} frames sampled over {sampledDurationS}s @ {sampleFps.toFixed(1)} fps
+      </p>
+
+      {/* Trace visualization */}
+      {ratioTrace.length > 0 && (
+        <RatioSparkline
+          trace={ratioTrace}
+          threshold={thresholdRatio}
+        />
+      )}
+
+      {/* Zero-state explanation */}
+      {isZero && (
+        <p
+          role="status"
+          style={{
+            margin: 0,
+            fontSize: 13,
+            color: 'var(--text-muted)',
+            lineHeight: 1.5,
+          }}
+        >
+          No rotations detected. The wheel may not have spun during the sample window,
+          or the detection box and threshold may need adjustment. Use "Test detection"
+          above to confirm the tape is crossing the box cleanly.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RatioSparkline
+// ---------------------------------------------------------------------------
+
+export interface RatioSparklineProps {
+  /** Dark-pixel ratio per sampled frame, 0..1. */
+  trace: number[];
+  /** The cutoff 0..1 — drawn as a reference line across the chart. */
+  threshold: number;
+}
+
+const SPARKLINE_HEIGHT = 48;
+const SPARKLINE_BAR_WIDTH = 3;
+const SPARKLINE_BAR_GAP = 1;
+
+export function RatioSparkline({ trace, threshold }: RatioSparklineProps): JSX.Element {
+  // Cap rendering to keep the element compact even on long samples.
+  // Show at most ~120 bars; downsample by averaging buckets if needed.
+  const MAX_BARS = 120;
+  const samples = downsample(trace, MAX_BARS);
+
+  const svgWidth = samples.length * (SPARKLINE_BAR_WIDTH + SPARKLINE_BAR_GAP);
+  const thresholdY = SPARKLINE_HEIGHT * (1 - threshold);
+
+  return (
+    <div aria-label="Ratio trace — dark-pixel ratio per sampled frame">
+      <p style={{ margin: '0 0 4px', fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.03em', textTransform: 'uppercase' }}>
+        Dark-pixel ratio trace (threshold line = {Math.round(threshold * 100)}%)
+      </p>
+      <svg
+        data-testid="ratio-sparkline"
+        role="img"
+        aria-label={`Sparkline: ${samples.length} data points, threshold at ${Math.round(threshold * 100)}%`}
+        width={svgWidth}
+        height={SPARKLINE_HEIGHT}
+        style={{
+          display: 'block',
+          maxWidth: '100%',
+          borderRadius: 4,
+          background: 'var(--surface)',
+          border: '1px solid var(--border)',
+          overflow: 'visible',
+        }}
+      >
+        {/* Bars */}
+        {samples.map((ratio, i) => {
+          const barH = Math.max(1, Math.round(ratio * SPARKLINE_HEIGHT));
+          const x = i * (SPARKLINE_BAR_WIDTH + SPARKLINE_BAR_GAP);
+          const y = SPARKLINE_HEIGHT - barH;
+          const aboveThreshold = ratio >= threshold;
+          return (
+            <rect
+              key={i}
+              x={x}
+              y={y}
+              width={SPARKLINE_BAR_WIDTH}
+              height={barH}
+              fill={aboveThreshold ? 'var(--accent, #f59e0b)' : 'var(--text-muted, #888)'}
+              opacity={aboveThreshold ? 0.9 : 0.45}
+            />
+          );
+        })}
+
+        {/* Threshold reference line */}
+        <line
+          data-testid="sparkline-threshold-line"
+          x1={0}
+          y1={thresholdY}
+          x2={svgWidth}
+          y2={thresholdY}
+          stroke="var(--danger, #ef4444)"
+          strokeWidth={1.5}
+          strokeDasharray="4 2"
+        />
+      </svg>
+      <p style={{ margin: '4px 0 0', fontSize: 11, color: 'var(--text-muted)' }}>
+        Bars above the red dashed line = tape detected. Each dip/peak crossing the line
+        should correspond to one wheel rotation.
+      </p>
+    </div>
+  );
+}
+
+/** Average-downsample `arr` to at most `maxLen` buckets. */
+export function downsample(arr: number[], maxLen: number): number[] {
+  if (arr.length <= maxLen) return arr;
+  const bucketSize = arr.length / maxLen;
+  const result: number[] = [];
+  for (let i = 0; i < maxLen; i++) {
+    const start = Math.floor(i * bucketSize);
+    const end = Math.floor((i + 1) * bucketSize);
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += arr[j] ?? 0;
+    result.push(sum / (end - start));
+  }
+  return result;
 }
 
 // -----------------------------------------------------------------------
