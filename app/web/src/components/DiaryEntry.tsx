@@ -26,7 +26,7 @@ import { relativeTime, formatDuration } from '../lib/time';
 import { activityStyle } from '../lib/activity-style';
 import { ShareDialog } from './ShareDialog';
 import { ClipPlayerDialog } from './ClipPlayerDialog';
-import { isTTSAvailable, speak } from '../lib/tts';
+import { isTTSAvailable, speak, stripLeadingEmoji } from '../lib/tts';
 import { parseWheelMeters } from '../lib/trpc-extensions';
 import { formatMeters } from '../lib/distance';
 import { useAuth } from '../hooks/useAuth';
@@ -39,15 +39,6 @@ export interface DiaryEntryProps {
   ttsEnabled?: boolean;
   /** From settings.distance_unit — defaults to 'mi' until the backend ships. */
   distanceUnit?: 'mi' | 'km';
-}
-
-// Narrative templates start with an emoji (e.g. "🥕 {pet} had a snack!"); the
-// circle badge already shows that glyph, so strip it from the visible header
-// to avoid the double-icon. Handles VS16 (U+FE0F) / ZWJ (U+200D) joiners
-// used by composed emoji like 🕳️ and 🗺️.
-const LEADING_EMOJI = /^\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic})*\s*/u;
-function stripLeadingEmoji(text: string): string {
-  return text.replace(LEADING_EMOJI, '');
 }
 
 export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' }: DiaryEntryProps): JSX.Element {

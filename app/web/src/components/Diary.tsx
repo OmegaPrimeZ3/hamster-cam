@@ -12,6 +12,7 @@ import { trpc } from '../trpc';
 import type { RouterOutputs } from '../trpc';
 import { DiaryEntry } from './DiaryEntry';
 import { useTTSEnabled } from '../hooks/useTTSEnabled';
+import { speak } from '../lib/tts';
 import { getDistanceUnit } from '../lib/trpc-extensions';
 
 export interface DiaryProps {
@@ -70,14 +71,9 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
     for (const entry of today.data) {
       if (seenIdsRef.current.has(entry.id)) continue;
       seenIdsRef.current.add(entry.id);
-      try {
-        const u = new SpeechSynthesisUtterance(entry.narrative);
-        u.rate = 0.95;
-        u.pitch = 1.1;
-        window.speechSynthesis.speak(u);
-      } catch {
-        /* speech unavailable — silent fallback */
-      }
+      // Route through the shared helper: strips the badge emoji and picks the
+      // most natural installed voice (same path as the per-card speaker button).
+      speak(entry.narrative);
     }
   }, [today.data, readAloud]);
 

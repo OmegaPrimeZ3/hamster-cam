@@ -6,7 +6,12 @@
 // and window.SpeechSynthesisUtterance so these tests run in jsdom.
 
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { isTTSAvailable, speak } from '../src/lib/tts';
+import { isTTSAvailable, speak, stripLeadingEmoji } from '../src/lib/tts';
+
+// Minimal fake voice for ranking tests — only the fields scoreVoice reads.
+function voice(name: string, lang: string, def = false): SpeechSynthesisVoice {
+  return { name, lang, default: def, localService: true, voiceURI: name } as SpeechSynthesisVoice;
+}
 
 describe('isTTSAvailable', () => {
   it('returns true when both speechSynthesis and SpeechSynthesisUtterance are present', () => {
@@ -75,5 +80,51 @@ describe('speak', () => {
 
     expect(() => speak('Empty voices')).not.toThrow();
     expect(speakFn).toHaveBeenCalledOnce();
+  });
+
+  it('strips the leading badge emoji so it is not narrated', () => {
+    let capturedUtt: SpeechSynthesisUtterance | null = null;
+    vi.spyOn(window.speechSynthesis, 'speak').mockImplementation((utt) => {
+      capturedUtt = utt;
+    });
+
+    speak('🥕 Remy had a snack!');
+
+    expect((capturedUtt as unknown as SpeechSynthesisUtterance).text).toBe(
+      'Remy had a snack!',
+    );
+  });
+
+  it('prefers an installed high-quality (Enhanced) English voice', () => {
+    vi.spyOn(window.speechSynthesis, 'getVoices').mockReturnValue([
+      voice('Daniel', 'en-GB'),
+      voice('Google US English', 'en-US'),
+      voice('Samantha (Enhanced)', 'en-US'),
+      voice('Anna', 'de-DE'),
+    ]);
+    let capturedUtt: SpeechSynthesisUtterance | null = null;
+    vi.spyOn(window.speechSynthesis, 'speak').mockImplementation((utt) => {
+      capturedUtt = utt;
+    });
+
+    speak('Pick the best voice');
+
+    expect((capturedUtt as unknown as SpeechSynthesisUtterance).voice?.name).toBe(
+      'Samantha (Enhanced)',
+    );
+  });
+});
+
+describe('stripLeadingEmoji', () => {
+  it('removes a plain leading emoji and following whitespace', () => {
+    expect(stripLeadingEmoji('🥕 had a snack')).toBe('had a snack');
+  });
+
+  it('removes a composed emoji with VS16/ZWJ joiners', () => {
+    expect(stripLeadingEmoji('🕳️ went into the tunnel')).toBe('went into the tunnel');
+  });
+
+  it('leaves emoji-free text untouched', () => {
+    expect(stripLeadingEmoji('Remy is sleeping')).toBe('Remy is sleeping');
   });
 });
