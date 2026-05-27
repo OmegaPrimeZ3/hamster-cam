@@ -30,7 +30,7 @@ import {
   getVapidPublicKey,
   sendPushToUser,
 } from './push.js';
-import { testWheelDetection } from './wheel-odometer.js';
+import { testWheelDetection, liveWheelRotationTest } from './wheel-odometer.js';
 
 import * as db from './db.js';
 import { resolveSession } from './session.js';
@@ -784,6 +784,59 @@ const camerasRouter = router({
         return { croppedPngBase64: '', darkPixelRatio: 0, thresholdPct: 0, error: result.error };
       }
       return { ...result, error: null };
+    }),
+
+  /**
+   * Sample the live RTSP feed for up to 30 s and return rotation-count,
+   * distance, and a per-frame dark-pixel ratio trace. The operator runs this
+   * after placing the tape mark to verify the odometer picks up real rotations
+   * before enabling the persistent live session.
+   *
+   * Read-only — does not affect the persistent activeSessions map.
+   */
+  testWheelRotation: adminProcedure
+    .meta({ audit: false })
+    .input(z.object({
+      cameraId: z.number().int(),
+      durationS: z.number().int().min(5).max(30).optional(),
+    }))
+    .output(z.object({
+      rotations: z.number(),
+      sampledDurationS: z.number(),
+      sampleFps: z.number(),
+      framesSampled: z.number().int(),
+      ratioTrace: z.array(z.number()),
+      thresholdRatio: z.number(),
+      distanceMeters: z.number(),
+      diameterMm: z.number(),
+    }))
+    .mutation(async ({ input }) => {
+      const { cameraId, durationS } = input;
+
+      // Gate checks are inside liveWheelRotationTest; we translate its thrown
+      // Errors into typed TRPCErrors the UI can display, and surface ffmpeg
+      // stderr in the server log without leaking it to the client.
+      try {
+        return await liveWheelRotationTest(cameraId, durationS ?? 15);
+      } catch (err) {
+        if (err instanceof FfmpegError) {
+          const log = childLogger('trpc.cameras');
+          log.error(
+            { cameraId, ffmpegCode: err.code, stderr: err.stderr },
+            'testWheelRotation: ffmpeg failed',
+          );
+          throw new TRPCError({
+            code: 'INTERNAL_SERVER_ERROR',
+            message: `ffmpeg failed (exit ${err.code ?? 'signal'}): ${err.message}`,
+          });
+        }
+        if (err instanceof Error) {
+          // Eligibility / configuration errors — surface them as BAD_REQUEST so
+          // the UI can show a user-readable reason without a stack trace.
+          throw new TRPCError({ code: 'BAD_REQUEST', message: err.message });
+        }
+        throw err;
+      }
     }),
 });
 

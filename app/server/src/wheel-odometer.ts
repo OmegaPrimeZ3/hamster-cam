@@ -22,6 +22,7 @@ import type { Readable } from 'node:stream';
 
 import * as db from './db.js';
 import { getConfig } from './config.js';
+import { FfmpegError } from './frigate.js';
 import { childLogger } from './logger.js';
 
 const log = childLogger('wheel-odometer');
@@ -447,6 +448,157 @@ export async function replayWheelDistance(input: ReplayWheelDistanceInput): Prom
       const metres = rotations * Math.PI * input.diameterMm / 1000;
       log.info({ clipUrl: input.clipUrl, rotations, metres }, 'wheel-replay: complete');
       resolve(metres);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Live rotation test — bounded RTSP window
+// ---------------------------------------------------------------------------
+
+/** Hard lower/upper bound on the test window passed to `liveWheelRotationTest`. */
+const LIVE_TEST_MIN_S = 5;
+const LIVE_TEST_MAX_S = 30;
+/** Kill-timeout safety net: how long after the expected window we force-kill ffmpeg. */
+const LIVE_TEST_KILL_GRACE_MS = 5_000;
+
+export interface LiveWheelRotationTestResult {
+  rotations: number;
+  sampledDurationS: number;
+  sampleFps: number;
+  framesSampled: number;
+  /** Dark-pixel ratio (0–1) per sampled frame, in arrival order. */
+  ratioTrace: number[];
+  /** The dark-ratio cutoff (0–1): frame is 'dark' when ratio >= thresholdRatio. */
+  thresholdRatio: number;
+  distanceMeters: number;
+  diameterMm: number;
+}
+
+/**
+ * Sample the live go2rtc RTSP feed for a bounded window and return rotation /
+ * distance metrics.
+ *
+ * Reuses `PgmParser` and `RotationCounter` unchanged (DRY). Runs independently
+ * of the persistent `activeSessions` map; go2rtc fans the RTSP stream out so a
+ * second reader does not disturb an active odometer session.
+ *
+ * Throws `FfmpegError` when ffmpeg fails to spawn or exits non-zero.
+ * Throws `Error` when the camera is ineligible (not found / no live_src /
+ * odometer not enabled).
+ */
+export async function liveWheelRotationTest(
+  cameraId: number,
+  durationS: number = 15,
+): Promise<LiveWheelRotationTestResult> {
+  const clampedS = Math.min(LIVE_TEST_MAX_S, Math.max(LIVE_TEST_MIN_S, durationS));
+
+  const camera = db.getCameraById(cameraId);
+  if (!camera) {
+    throw new Error(`camera ${cameraId} not found`);
+  }
+  if (camera.wheel_mark_enabled !== 1) {
+    throw new Error('wheel odometer is not enabled for this camera');
+  }
+
+  const {
+    live_src,
+    wheel_diameter_mm: diameterMm,
+    wheel_band_x_pct: bandX,
+    wheel_band_width_pct: bandW,
+    wheel_band_y_pct: bandY,
+    wheel_band_height_pct: bandH,
+    wheel_threshold_pct: thresholdPct,
+  } = camera;
+
+  const rtspUrl = wheelRtspUrl(live_src);
+  if (!rtspUrl) {
+    throw new Error('camera has no go2rtc live_src / FRIGATE_URL is not configured');
+  }
+
+  // thresholdRatio is the dark-ratio cutoff (0..1) exposed to the UI.
+  // RotationCounter treats a frame as dark when ratio*100 >= thresholdPct,
+  // which is equivalent to ratio >= 1 - thresholdPct/100.
+  const thresholdRatio = 1 - thresholdPct / 100;
+
+  return new Promise((resolve, reject) => {
+    const counter = new RotationCounter(thresholdPct);
+    const ratioTrace: number[] = [];
+
+    // Collect each frame's ratio into the trace AND drive the FSM.
+    const parser = new PgmParser((ratio) => {
+      ratioTrace.push(ratio);
+      counter.feed(ratio);
+    }, thresholdPct);
+
+    const startMs = Date.now();
+
+    // `-t clampedS` tells ffmpeg to stop reading after the window.
+    // A kill-timeout fires LIVE_TEST_KILL_GRACE_MS later as a safety net.
+    const rawProc = spawn('ffmpeg', [
+      '-rtsp_transport', 'tcp',
+      '-i', rtspUrl,
+      '-t', String(clampedS),
+      '-vf', `crop=iw*${bandW}/100:ih*${bandH}/100:iw*${bandX}/100:ih*${bandY}/100,format=gray`,
+      '-vsync', 'vfr',
+      '-r', String(SAMPLE_FPS),
+      '-f', 'image2pipe',
+      '-vcodec', 'pgm',
+      '-',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const stderrChunks: string[] = [];
+
+    rawProc.stdout.on('data', (chunk: Buffer) => {
+      parser.feed(chunk);
+    });
+
+    rawProc.stderr.on('data', (chunk: Buffer) => {
+      // Collect stderr for error reporting; keep only the last ~2 KB.
+      stderrChunks.push(chunk.toString('utf8'));
+      if (stderrChunks.length > 40) stderrChunks.shift();
+    });
+
+    const killTimer = setTimeout(() => {
+      try { rawProc.kill('SIGKILL'); } catch { /* already dead */ }
+    }, clampedS * 1000 + LIVE_TEST_KILL_GRACE_MS);
+
+    rawProc.on('error', (err) => {
+      clearTimeout(killTimer);
+      reject(new FfmpegError(err.message, null, stderrChunks.join('')));
+    });
+
+    rawProc.on('close', (code) => {
+      clearTimeout(killTimer);
+
+      const sampledDurationS = (Date.now() - startMs) / 1000;
+
+      // ffmpeg exits 0 after -t expires. A signal kill (code=null) can also
+      // happen from our safety net; if we got frames it is still a valid result.
+      // Reject only on a non-zero integer exit code.
+      if (typeof code === 'number' && code !== 0) {
+        reject(new FfmpegError(`ffmpeg exited with code ${code}`, code, stderrChunks.join('')));
+        return;
+      }
+
+      const rotations = counter.getRotations();
+      const distanceMeters = rotations * Math.PI * diameterMm / 1000;
+
+      log.info(
+        { cameraId, clampedS, rotations, distanceMeters, frames: ratioTrace.length },
+        'live-wheel-test: complete',
+      );
+
+      resolve({
+        rotations,
+        sampledDurationS,
+        sampleFps: SAMPLE_FPS,
+        framesSampled: ratioTrace.length,
+        ratioTrace,
+        thresholdRatio,
+        distanceMeters,
+        diameterMm,
+      });
     });
   });
 }

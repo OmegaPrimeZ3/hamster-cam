@@ -512,3 +512,185 @@ describe('wheel_band_x_pct / wheel_band_width_pct DB round-trip', () => {
     expect(updated?.wheel_band_width_pct).toBe(55);
   });
 });
+
+// ---------------------------------------------------------------------------
+// liveWheelRotationTest — synthetic frame injection, no real ffmpeg.
+// ---------------------------------------------------------------------------
+//
+// Strategy: mock spawn so that `rawProc.stdout` is a fake EventEmitter we
+// control.  We emit synthetic PGM frames (same format as other tests) and
+// then fire the 'close' event with code 0.  This exercises the full
+// PgmParser → RotationCounter pipeline and the output-shape contract without
+// hitting a real RTSP stream.
+
+describe('liveWheelRotationTest', () => {
+  // Helper: build a 1×1 PGM frame buffer for a given pixel value.
+  function pgmFrame(pixelValue: number): Buffer {
+    const header = Buffer.from('P5\n1 1\n255\n', 'ascii');
+    return Buffer.concat([header, Buffer.from([pixelValue])]);
+  }
+
+  it('returns correct rotations, distanceMeters, thresholdRatio for a synthetic sequence', async () => {
+    // threshold=50 → thresholdRatio = 1 - 50/100 = 0.5
+    // dark pixel = value < 127.5 (PgmParser uses 255*(1-50/100)=127.5 as cutoff)
+    // RotationCounter treats frame as dark when ratio*100 >= 50, i.e. ratio >= 0.5
+    //
+    // We produce 2 full rotations:
+    //   [3 light, 3 dark, 3 light] × 2
+    const camId = await seedWheelCamera(); // diameterMm=152, thresholdPct=50
+
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+
+    // Override spawn for this module-scope block.
+    const fakeProc = makeFakeProc();
+    currentSpawnMock.mockReturnValueOnce(fakeProc);
+
+    // Kick off the promise (it will await the 'close' event).
+    const resultPromise = liveWheelRotationTest(camId, 15);
+
+    // Emit 2 rotation cycles: 3 light → 3 dark → 3 light, twice.
+    const lightFrame = pgmFrame(200); // 200 >= 127.5 → light (ratio = 0)
+    const darkFrame  = pgmFrame(50);  // 50  <  127.5 → dark  (ratio = 1)
+
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      for (let i = 0; i < 3; i += 1) fakeProc.stdout.emit('data', lightFrame);
+      for (let i = 0; i < 3; i += 1) fakeProc.stdout.emit('data', darkFrame);
+      for (let i = 0; i < 3; i += 1) fakeProc.stdout.emit('data', lightFrame);
+    }
+
+    // Signal ffmpeg done (exit 0).
+    fakeProc.emit('close', 0);
+
+    const result = await resultPromise;
+
+    expect(result.rotations).toBe(2);
+    expect(result.framesSampled).toBe(18); // 9 frames × 2 cycles
+    expect(result.sampleFps).toBe(10);
+    expect(result.thresholdRatio).toBeCloseTo(0.5, 5);
+    expect(result.diameterMm).toBe(152);
+    // distanceMeters = 2 × π × 152 / 1000
+    expect(result.distanceMeters).toBeCloseTo(2 * Math.PI * 152 / 1000, 5);
+    // ratioTrace should contain the per-frame ratios: 0 for light, 1 for dark.
+    expect(result.ratioTrace).toHaveLength(18);
+    // First three frames are light → ratio 0.
+    expect(result.ratioTrace[0]).toBeCloseTo(0, 5);
+    // Frames 3–5 are dark → ratio 1.
+    expect(result.ratioTrace[3]).toBeCloseTo(1, 5);
+  });
+
+  it('rejects with FfmpegError when ffmpeg exits non-zero', async () => {
+    const { FfmpegError: FErr } = await import('../src/frigate.js');
+    const camId = await seedWheelCamera();
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+
+    const fakeProc = makeFakeProc();
+    currentSpawnMock.mockReturnValueOnce(fakeProc);
+
+    const resultPromise = liveWheelRotationTest(camId, 5);
+
+    // Emit some stderr then a non-zero exit.
+    fakeProc.stderr.emit('data', Buffer.from('Connection refused'));
+    fakeProc.emit('close', 1);
+
+    await expect(resultPromise).rejects.toBeInstanceOf(FErr);
+  });
+
+  it('rejects with FfmpegError when spawn emits an error event', async () => {
+    const { FfmpegError: FErr } = await import('../src/frigate.js');
+    const camId = await seedWheelCamera();
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+
+    const fakeProc = makeFakeProc();
+    currentSpawnMock.mockReturnValueOnce(fakeProc);
+
+    const resultPromise = liveWheelRotationTest(camId, 5);
+
+    fakeProc.emit('error', new Error('ENOENT'));
+
+    await expect(resultPromise).rejects.toBeInstanceOf(FErr);
+  });
+
+  it('throws a plain Error when camera is not found', async () => {
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+    await expect(liveWheelRotationTest(99999, 5)).rejects.toThrow('not found');
+  });
+
+  it('throws a plain Error when wheel odometer is disabled', async () => {
+    const camId = await seedWheelCamera(false); // wheel_mark_enabled = false
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+    await expect(liveWheelRotationTest(camId, 5)).rejects.toThrow('not enabled');
+  });
+
+  it('clamps durationS to [5, 30] — passes -t 30 for oversized input', async () => {
+    const camId = await seedWheelCamera();
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+
+    const fakeProc = makeFakeProc();
+    currentSpawnMock.mockReturnValueOnce(fakeProc);
+
+    const resultPromise = liveWheelRotationTest(camId, 999);
+
+    // Immediately close with 0 (no frames is fine for this test — we only care
+    // about the ffmpeg args).
+    fakeProc.emit('close', 0);
+    await resultPromise;
+
+    const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
+    const tIdx = args.indexOf('-t');
+    expect(tIdx).toBeGreaterThanOrEqual(0);
+    expect(args[tIdx + 1]).toBe('30');
+  });
+
+  it('clamps durationS to minimum 5 for undersized input', async () => {
+    const camId = await seedWheelCamera();
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+
+    const fakeProc = makeFakeProc();
+    currentSpawnMock.mockReturnValueOnce(fakeProc);
+
+    const resultPromise = liveWheelRotationTest(camId, 1);
+    fakeProc.emit('close', 0);
+    await resultPromise;
+
+    const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
+    const tIdx = args.indexOf('-t');
+    expect(tIdx).toBeGreaterThanOrEqual(0);
+    expect(args[tIdx + 1]).toBe('5');
+  });
+
+  it('returns zero rotations and zero distanceMeters when no rotation occurs', async () => {
+    const camId = await seedWheelCamera();
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+
+    const fakeProc = makeFakeProc();
+    currentSpawnMock.mockReturnValueOnce(fakeProc);
+
+    const resultPromise = liveWheelRotationTest(camId, 5);
+
+    // Only light frames — FSM never transitions to dark.
+    const lightFrame = pgmFrame(200);
+    for (let i = 0; i < 10; i += 1) fakeProc.stdout.emit('data', lightFrame);
+    fakeProc.emit('close', 0);
+
+    const result = await resultPromise;
+
+    expect(result.rotations).toBe(0);
+    expect(result.distanceMeters).toBe(0);
+    expect(result.framesSampled).toBe(10);
+  });
+
+  it('succeeds with zero frames when ffmpeg exits 0 immediately', async () => {
+    const camId = await seedWheelCamera();
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+
+    const fakeProc = makeFakeProc();
+    currentSpawnMock.mockReturnValueOnce(fakeProc);
+
+    const resultPromise = liveWheelRotationTest(camId, 5);
+    fakeProc.emit('close', 0);
+
+    const result = await resultPromise;
+    expect(result.framesSampled).toBe(0);
+    expect(result.rotations).toBe(0);
+  });
+});
