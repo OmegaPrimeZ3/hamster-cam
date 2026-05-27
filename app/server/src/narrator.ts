@@ -625,17 +625,38 @@ function prepareCloseVisit(
 }
 
 /**
- * Commit a DeferredEntry to the diary (if dwell >= minDwellMs).
- * Returns the written row or null for fly-throughs.
+ * Commit a DeferredEntry to the diary (if dwell >= the applicable threshold).
+ *
+ * `interruptedByZone` — pass `true` when an exploring visit was closed
+ * mid-track because the pet ENTERED a defined Frigate zone on the same
+ * camera/track.  In this case we bypass the normal `exploringMinDwellMs`
+ * gate (which exists only to suppress long open-space wandering noise) and
+ * apply a minimal 2-second anti-flicker floor instead.  The zone entry that
+ * follows constitutes proof that the preceding exploring activity was genuine
+ * — dropping it would silently hide real behaviour.
+ *
+ * NOISE DECISION: 2 s floor (same as the general `minDwellMs` default).
+ * Rationale: Frigate can fire a spurious single-frame detection that
+ * immediately re-classifies into a zone within < 1 s, which would produce a
+ * 0 ms "exploring" entry that adds no information. 2 s is long enough to
+ * filter that artefact while still capturing the instant-turn-around that the
+ * operator asked for.  The operator can lower `minDwellMs` in settings if
+ * even shorter interrupted explorations are desired.
+ *
+ * Pure exploring visits that end WITHOUT entering a zone still obey the
+ * full `exploringMinDwellMs` threshold — normal noise suppression is intact.
  */
 async function commitDeferred(
   deferred: DeferredEntry,
   deps: ScheduledFlushDeps,
+  options: { interruptedByZone?: boolean } = {},
 ): Promise<db.DiaryEntryRow | null> {
   // Activity-specific dwell threshold: exploring requires a much longer dwell
   // than other activities so casual cage wandering is suppressed.
+  // Exception: when exploring was interrupted by a zone entry on the same
+  // track, use only the minimal anti-flicker floor (minDwellMs) instead.
   const dwellThreshold =
-    deferred.activity === 'exploring'
+    deferred.activity === 'exploring' && !options.interruptedByZone
       ? tuning.exploringMinDwellMs
       : tuning.minDwellMs;
   if (deferred.durationMs < dwellThreshold) return null;
@@ -866,13 +887,27 @@ export async function handleFrigateEvent(
       }
     }
 
+    // Determine whether the current event is opening at least one DEFINED zone
+    // (i.e. anything other than 'exploring'). This is used below to decide
+    // whether a closing 'exploring' visit qualifies for the reduced dwell gate.
+    const currentHasDefinedZone = [...currentZones].some((z) => z !== 'exploring');
+
     for (const activity of midTrackToClose) {
       const visit = petState.zoneVisits.get(activity);
       if (!visit) continue;
       petState.zoneVisits.delete(activity);
       // Mid-track close: emit immediately (no transition-window needed).
+      //
+      // When an 'exploring' visit is displaced by the pet entering a defined
+      // Frigate zone on the same camera/track, pass interruptedByZone=true so
+      // commitDeferred bypasses the exploringMinDwellMs gate and uses only the
+      // minimal anti-flicker floor.  This ensures the exploring entry is ALWAYS
+      // written when a zone entry follows it — the zone entry proves the activity
+      // was real.  Pure exploring visits that end without a following zone entry
+      // (i.e. via track-end) still obey the full exploringMinDwellMs threshold.
+      const interruptedByZone = activity === 'exploring' && currentHasDefinedZone;
       const deferred = prepareCloseVisit(visit, activity, cameraName, occurredAtMs);
-      const entry = await commitDeferred(deferred, deps);
+      const entry = await commitDeferred(deferred, deps, { interruptedByZone });
       if (entry) written.push(entry);
     }
   }

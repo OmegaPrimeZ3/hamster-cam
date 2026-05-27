@@ -1747,3 +1747,321 @@ describe('migration 0021 — backfill diary camera_ids from details JSON', () =>
   });
 
 });
+
+// ---------------------------------------------------------------------------
+// exploring → defined-zone transition (same track / same camera)
+// ---------------------------------------------------------------------------
+// Requirement: when the hamster is exploring (no defined zone) and then
+// ENTERS a defined Frigate zone mid-track, the in-progress exploring entry
+// must be finalised and written IMMEDIATELY, and the subsequent zone activity
+// must open a SEPARATE diary entry — not coalesced into the exploring entry.
+//
+// Noise decision documented in commitDeferred: a 2 s anti-flicker floor
+// replaces the normal exploringMinDwellMs gate when interruptedByZone=true.
+// ---------------------------------------------------------------------------
+
+describe('exploring → defined-zone transition (same track)', () => {
+  it('produces BOTH an exploring entry and a distinct zone entry in correct occurred_at order', async () => {
+    // Full happy path: explore for 10s, enter wheel zone for 5s.
+    // Both entries must be written and exploring.occurred_at < wheel.occurred_at.
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 2_000, exploringMinDwellMs: 60_000 });
+    resetNarratorState();
+
+    db.createCamera({ name: 'cam-wide', emoji: '📷', stream_url: 'rtsp://x/wide', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_710_000_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Hamster detected in open space — exploring visit opens.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'cam-wide', zones: [], startSec: 1_710_000_000 }),
+      deps,
+    );
+
+    // 10 seconds later the hamster enters the wheel zone mid-track.
+    // This must: close exploring (write it NOW, bypassing exploringMinDwellMs),
+    // then open a new wheel visit.
+    now = t0 + 10_000;
+    const writtenOnZoneEnter = await handleFrigateEvent(
+      newEvent({ type: 'update', camera: 'cam-wide', zones: ['wheel'] }),
+      deps,
+    );
+
+    // The exploring visit (10s, > 2s floor) is written IMMEDIATELY on zone entry.
+    expect(writtenOnZoneEnter.length).toBe(1);
+    expect(writtenOnZoneEnter[0]?.activity).toBe('exploring');
+    expect(writtenOnZoneEnter[0]?.duration_ms).toBe(10_000);
+
+    // Now the wheel visit is open.  Close it with an update that leaves the zone.
+    now = t0 + 15_000;
+    const writtenOnZoneLeave = await handleFrigateEvent(
+      newEvent({ type: 'update', camera: 'cam-wide', zones: [] }),
+      deps,
+    );
+    // Wheel visit (5s, > 2s floor) is written immediately on zone exit.
+    expect(writtenOnZoneLeave.length).toBe(1);
+    expect(writtenOnZoneLeave[0]?.activity).toBe('wheel');
+    expect(writtenOnZoneLeave[0]?.duration_ms).toBe(5_000);
+
+    // DB check: both entries, in occurred_at order.
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    // Sort ascending to check order.
+    const sorted = [...entries].sort((a, b) => a.occurred_at - b.occurred_at);
+    expect(sorted.length).toBe(2);
+    expect(sorted[0]?.activity).toBe('exploring');
+    expect(sorted[1]?.activity).toBe('wheel');
+    // exploring.occurred_at < wheel.occurred_at
+    expect(sorted[0]!.occurred_at).toBeLessThan(sorted[1]!.occurred_at);
+
+    vi.useRealTimers();
+  });
+
+  it('zone entry is NOT coalesced into the exploring entry', async () => {
+    // The wheel entry must be a distinct row, not an extension of the exploring row.
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 2_000, exploringMinDwellMs: 60_000 });
+    resetNarratorState();
+
+    db.createCamera({ name: 'cam-wide', emoji: '📷', stream_url: 'rtsp://x/wide', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_710_100_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Exploring for 10s.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'cam-wide', zones: [], startSec: 1_710_100_000 }),
+      deps,
+    );
+    now = t0 + 10_000;
+    await handleFrigateEvent(
+      newEvent({ type: 'update', camera: 'cam-wide', zones: ['food'] }),
+      deps,
+    );
+    // Food for 5s.
+    now = t0 + 15_000;
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'cam-wide', zones: ['food'], startSec: 1_710_100_000, endSec: 1_710_100_015 }),
+      deps,
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    // Must be exactly TWO entries: exploring and food.
+    expect(entries.length).toBe(2);
+    const activities = entries.map((e) => e.activity).sort();
+    expect(activities).toEqual(['exploring', 'food']);
+    // Each must have its own positive duration_ms.
+    const exploringEntry = entries.find((e) => e.activity === 'exploring');
+    const foodEntry = entries.find((e) => e.activity === 'food');
+    expect(exploringEntry?.duration_ms).toBeGreaterThan(0);
+    expect(foodEntry?.duration_ms).toBeGreaterThan(0);
+    // They must be SEPARATE rows with different occurred_at values.
+    expect(exploringEntry?.id).not.toBe(foodEntry?.id);
+    expect(exploringEntry?.occurred_at).not.toBe(foodEntry?.occurred_at);
+
+    vi.useRealTimers();
+  });
+
+  it('short exploring interrupted by a zone still writes the exploring entry (bypasses exploringMinDwellMs)', async () => {
+    // Operator specifically wants this: even a 3s exploring spell before the
+    // pet enters a wheel zone must produce a diary entry.
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    // exploringMinDwellMs = 60s, but the exploring visit is only 3s long.
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 2_000, exploringMinDwellMs: 60_000 });
+    resetNarratorState();
+
+    db.createCamera({ name: 'cam-wide', emoji: '📷', stream_url: 'rtsp://x/wide', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_710_200_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Exploring for only 3s (way below 60s threshold).
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'cam-wide', zones: [], startSec: 1_710_200_000 }),
+      deps,
+    );
+    now = t0 + 3_000;
+    // Pet immediately enters wheel zone — proof that the 3s of exploring was real.
+    const writtenOnZoneEnter = await handleFrigateEvent(
+      newEvent({ type: 'update', camera: 'cam-wide', zones: ['wheel'] }),
+      deps,
+    );
+
+    // The exploring entry MUST be written despite only 3s dwell (> 2s floor).
+    expect(writtenOnZoneEnter.length).toBe(1);
+    expect(writtenOnZoneEnter[0]?.activity).toBe('exploring');
+    expect(writtenOnZoneEnter[0]?.duration_ms).toBe(3_000);
+
+    vi.useRealTimers();
+  });
+
+  it('anti-flicker floor: exploring visit < 2s before zone entry is still suppressed', async () => {
+    // A 1s "exploring" blip that immediately classifies into a zone is too
+    // short to be meaningful — suppress it (Frigate artefact, not real dwell).
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 2_000, exploringMinDwellMs: 60_000 });
+    resetNarratorState();
+
+    db.createCamera({ name: 'cam-wide', emoji: '📷', stream_url: 'rtsp://x/wide', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_710_300_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Exploring for only 1s — below the 2s anti-flicker floor.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'cam-wide', zones: [], startSec: 1_710_300_000 }),
+      deps,
+    );
+    now = t0 + 1_000; // 1s < minDwellMs=2s → suppressed even with interruptedByZone
+    const writtenOnZoneEnter = await handleFrigateEvent(
+      newEvent({ type: 'update', camera: 'cam-wide', zones: ['wheel'] }),
+      deps,
+    );
+
+    // Below the 2s floor → suppressed.
+    expect(writtenOnZoneEnter.length).toBe(0);
+
+    // The wheel visit opened correctly regardless.
+    now = t0 + 8_000;
+    const writtenOnLeave = await handleFrigateEvent(
+      newEvent({ type: 'update', camera: 'cam-wide', zones: [] }),
+      deps,
+    );
+    expect(writtenOnLeave.length).toBe(1);
+    expect(writtenOnLeave[0]?.activity).toBe('wheel');
+
+    // DB: only the wheel entry (exploring suppressed).
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('wheel');
+
+    vi.useRealTimers();
+  });
+
+  it('pure exploring that ends WITHOUT entering a zone still obeys exploringMinDwellMs', async () => {
+    // Regression guard: the 60s threshold must NOT be bypassed for a plain
+    // exploring visit that ends normally (no zone entry follows).
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 2_000, exploringMinDwellMs: 60_000 });
+    resetNarratorState();
+
+    db.createCamera({ name: 'cam-wide', emoji: '📷', stream_url: 'rtsp://x/wide', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_710_400_000_000;
+    const deps = { now: () => t0, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // 40s exploring, no zone entry ever — below 60s threshold.
+    await handleFrigateEvent(
+      newEvent({
+        type: 'end',
+        camera: 'cam-wide',
+        zones: [],
+        startSec: 1_710_400_000,
+        endSec: 1_710_400_040, // 40s
+      }),
+      deps,
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    // Must be suppressed — pure exploring, no zone entry proof.
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+
+    vi.useRealTimers();
+  });
+
+  it('cross-camera transition window remains intact after exploring→zone on single camera', async () => {
+    // The 8s cross-camera transition window must not be disturbed.  After an
+    // exploring→zone sequence on camera A, a 'new' event on camera B within
+    // transitionWindowMs must still trigger a transition entry (when enabled).
+    //
+    // IMPORTANT: use a neutral camera name ('cam-wide') so that zones=[] truly
+    // classifies as 'exploring'. A camera named 'wheel' would fall back to the
+    // 'wheel' keyword even with an empty zones list, so no exploring visit
+    // would ever open on that camera.
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({
+      transitionWindowMs: 8_000,
+      minDwellMs: 2_000,
+      exploringMinDwellMs: 60_000,
+      transitionEntriesEnabled: true,
+    });
+    resetNarratorState();
+
+    // Neutral camera A — no keyword in name → zones=[] → 'exploring'.
+    db.createCamera({ name: 'cam-wide', emoji: '📷', stream_url: 'rtsp://x/wide', enabled: true });
+    // Camera B for the cross-camera follow-up.
+    db.createCamera({ name: 'cam-food', emoji: '🥕', stream_url: 'rtsp://x/food', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_710_500_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // 1. cam-wide: exploring for 5s, then enters wheel zone mid-track.
+    //    The exploring entry (5s > 2s floor) must be written immediately.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'cam-wide', zones: [], startSec: 1_710_500_000 }),
+      deps,
+    );
+    now = t0 + 5_000;
+    const writtenOnZoneEnter = await handleFrigateEvent(
+      newEvent({ type: 'update', camera: 'cam-wide', zones: ['wheel'] }),
+      deps,
+    );
+    expect(writtenOnZoneEnter.length).toBe(1);
+    expect(writtenOnZoneEnter[0]?.activity).toBe('exploring');
+
+    // 2. Wheel zone track ends — wheel visit deferred with transition window.
+    now = t0 + 10_000;
+    const endWritten = await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'cam-wide', zones: ['wheel'], startSec: 1_710_500_000, endSec: 1_710_500_010 }),
+      deps,
+    );
+    expect(endWritten).toEqual([]); // deferred, not yet committed
+
+    // 3. 1s later: new event on cam-food → cross-camera transition fires.
+    now = t0 + 11_000;
+    const transitionWritten = await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'cam-food', zones: ['food'] }),
+      deps,
+    );
+    expect(transitionWritten.length).toBe(1);
+    expect(transitionWritten[0]?.activity).toBe('transition');
+
+    // DB must have both: exploring entry (from mid-track close) + transition entry.
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    const activities = entries.map((e) => e.activity).sort();
+    expect(activities).toContain('exploring');
+    expect(activities).toContain('transition');
+  });
+});
