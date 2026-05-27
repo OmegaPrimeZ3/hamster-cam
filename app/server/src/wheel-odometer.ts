@@ -2,11 +2,24 @@
 // Optical-mark wheel odometry — Approach B.
 //
 // The operator sticks a piece of black tape on the wheel rim. We spawn an
-// ffmpeg child process that reads the camera RTSP stream at 10 fps, crops the
-// frame to a configurable horizontal band, and emits raw grayscale PGM frames
-// on stdout. A finite-state machine (LIGHT → DARK → LIGHT = one rotation)
-// counts rotations with an 80 ms debounce (3 frames at 10 fps). On session
-// end the rotation count is converted to metres:
+// ffmpeg child process that reads the camera RTSP stream at 30 fps (matching
+// the source camera's native frame rate — sampling faster would only duplicate
+// frames and waste CPU), crops the frame to a configurable 2-D ROI box, and
+// emits raw grayscale PGM frames on stdout. A finite-state machine counts
+// rotations using edge detection with a refractory period:
+//
+//   LIGHT → DARK  (falling edge, confirmed by ≥1 dark frame)
+//   DARK  → LIGHT (rising edge) = one rotation counted
+//   then lock out the counter for REFRACTORY_MS to reject flicker /
+//   contact-bounce / a marker parked in the box.
+//
+// At 30 fps a real tape pass lasts ~1–3 frames; the old 3-frame sustained-dark
+// requirement (80 ms at 10 fps, effectively 300 ms at 10 fps) was far too
+// coarse and ate almost every real pass. The refractory period replaces it:
+// hamster wheels realistically top ~4-5 rps, so 150 ms ≈ 4.5 frames at 30 fps
+// reliably rejects sub-100 ms noise while allowing genuinely fast spins.
+//
+// On session end the rotation count is converted to metres:
 //   metres = rotations × π × diameter_mm / 1000
 //
 // REUSABLE STATE MACHINE (DRY)
@@ -31,10 +44,21 @@ const log = childLogger('wheel-odometer');
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Sampling rate passed to ffmpeg (-r). */
-const SAMPLE_FPS = 10;
-/** Minimum consecutive frames a state must hold before it's counted (debounce). */
-const DEBOUNCE_FRAMES = 3;
+/**
+ * Sampling rate passed to ffmpeg (-r). Cameras are locked at 30 fps; matching
+ * that rate gives the tightest temporal resolution without duplicating frames.
+ */
+const SAMPLE_FPS = 30;
+
+/**
+ * Refractory period in milliseconds: minimum time between two counted
+ * rotations. Hamster wheels realistically top out around 4-5 rps, so a 150 ms
+ * lock-out window rejects sub-100 ms flicker / contact-bounce / a parked
+ * marker while allowing genuinely fast consecutive spins at up to ~6.7 rps.
+ * At 30 fps this equals ~4.5 frames.
+ */
+const REFRACTORY_MS = 150;
+
 /** Safety cut-off — auto-kill a session after 2 hours. */
 const MAX_SESSION_MS = 2 * 60 * 60 * 1000;
 
@@ -172,7 +196,7 @@ export class PgmParser {
 }
 
 // ---------------------------------------------------------------------------
-// Rotation counter — finite-state machine with debounce
+// Rotation counter — edge-detection FSM with refractory period
 // ---------------------------------------------------------------------------
 
 type MarkState = 'light' | 'dark';
@@ -181,23 +205,46 @@ type MarkState = 'light' | 'dark';
  * Stateful FSM that converts a stream of per-frame dark-pixel ratios into
  * a rotation count. "Dark" means the tape mark is in the ROI box.
  *
- * State transitions:
- *   LIGHT → DARK: falling edge — tape entered the box.
- *   DARK  → LIGHT: rising edge — tape left the box. One rotation counted.
+ * Algorithm (replaces the old 3-frame sustained-dark debounce):
  *
- * Debounce: a state change is only committed after DEBOUNCE_FRAMES consecutive
- * frames agree on the new state.
+ *   1. Classify each incoming frame as 'dark' or 'light' using the threshold.
+ *   2. On a LIGHT → DARK transition (falling edge, confirmed by ≥ 1 dark
+ *      frame), record that the marker has entered the box.
+ *   3. On the subsequent DARK → LIGHT transition (rising edge), count one
+ *      rotation — BUT only if at least REFRACTORY_MS has elapsed since the
+ *      last counted rotation.
+ *   4. The refractory period (150 ms, ~4.5 frames at 30 fps) suppresses:
+ *      - flicker: a lone dark frame that turns light again immediately
+ *      - contact-bounce: rapid on/off within a single pass
+ *      - a parked marker: the marker sitting in the box indefinitely counts
+ *        exactly once on the first DARK → LIGHT exit
+ *
+ * Time is derived from the frame index and the caller-supplied fps, keeping
+ * the class clock-free (no Date.now()) so it is deterministically testable.
  *
  * The "dark" threshold uses the same rule as the Settings test-tool:
  *   darkPixelRatio * 100 >= thresholdPct → state is 'dark'.
  */
 export class RotationCounter {
   private state: MarkState = 'light';
-  private candidateState: MarkState = 'light';
-  private candidateCount = 0;
   private rotations = 0;
+  private frameIndex = 0;
+  /** Frame index at which the last rotation was counted, or -Infinity initially. */
+  private lastCountedFrame = -Infinity;
+  private readonly msPerFrame: number;
 
-  constructor(private readonly thresholdPct: number) {}
+  /**
+   * @param thresholdPct  Dark-pixel threshold in percent (0–100).
+   * @param fps           Sampling rate; defaults to SAMPLE_FPS (30). Callers
+   *                      that run the counter at a different rate (e.g. tests
+   *                      driving frame-by-frame) can pass an explicit value.
+   */
+  constructor(
+    private readonly thresholdPct: number,
+    fps: number = SAMPLE_FPS,
+  ) {
+    this.msPerFrame = 1000 / fps;
+  }
 
   /**
    * Feed one frame's dark-pixel ratio (0–1). Returns the updated total
@@ -208,20 +255,17 @@ export class RotationCounter {
    */
   feed(darkPixelRatio: number): number {
     const newState: MarkState = darkPixelRatio * 100 >= this.thresholdPct ? 'dark' : 'light';
+    const prev = this.state;
+    this.state = newState;
+    this.frameIndex += 1;
 
-    if (newState === this.candidateState) {
-      this.candidateCount += 1;
-    } else {
-      this.candidateState = newState;
-      this.candidateCount = 1;
-    }
-
-    if (this.candidateCount >= DEBOUNCE_FRAMES && newState !== this.state) {
-      const prev = this.state;
-      this.state = newState;
-      // Count one rotation on the DARK → LIGHT transition (rising edge).
-      if (prev === 'dark' && newState === 'light') {
+    // Count one rotation on the DARK → LIGHT rising edge, subject to the
+    // refractory period.
+    if (prev === 'dark' && newState === 'light') {
+      const elapsedSinceLastMs = (this.frameIndex - this.lastCountedFrame) * this.msPerFrame;
+      if (elapsedSinceLastMs >= REFRACTORY_MS) {
         this.rotations += 1;
+        this.lastCountedFrame = this.frameIndex;
       }
     }
 

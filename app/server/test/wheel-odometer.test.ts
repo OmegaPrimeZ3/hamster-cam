@@ -1,6 +1,6 @@
 // Unit tests for wheel-odometer.ts:
 //   - PgmParser: stream parsing and dark-pixel-ratio computation
-//   - RotationCounter: debounced FSM edge detection + rotation-to-metres math
+//   - RotationCounter: edge-detection FSM with refractory period
 //   - Session lifecycle: start→end returns metres; double-start idempotent;
 //     end-without-start returns null; ffmpeg crash mid-session is logged and
 //     returns the partial count.
@@ -119,116 +119,181 @@ describe('PgmParser', () => {
 });
 
 // ---------------------------------------------------------------------------
-// RotationCounter — pure unit tests.
+// RotationCounter — edge-detection FSM with refractory period.
 // ---------------------------------------------------------------------------
+//
+// Constructor accepts an explicit fps so we can control the refractory timing
+// without running 30 real frames per transition. We pass fps=30 (the real
+// value) and space our pulses far enough apart to clear the 150 ms / 4.5-frame
+// refractory window. Each group of frames in the tests below is separated by
+// enough frames to guarantee clearance.
 
 describe('RotationCounter', () => {
   beforeEach(() => {
     vi.resetModules();
   });
 
-  // RotationCounter.feed() now takes a dark-pixel ratio (0–1).
   // threshold=50 → frame is 'dark' when ratio * 100 >= 50, i.e. ratio >= 0.5.
-  // LIGHT_RATIO=0.0 (no dark pixels), DARK_RATIO=1.0 (all pixels dark).
   const LIGHT_RATIO = 0.0;
   const DARK_RATIO = 1.0;
 
-  it('counts one rotation on a debounced DARK → LIGHT transition', async () => {
+  // At 30 fps, REFRACTORY_MS=150 → refractory = 4.5 frames.
+  // We use 6 light frames between rotations to guarantee clearance.
+  const CLEAR = 6; // frames of light to clear the refractory window
+
+  it('counts one rotation on a minimal DARK → LIGHT transition (1 dark frame)', async () => {
+    // This is THE regression test: a single dark frame followed by light MUST
+    // count, because real fast passes at 30fps are 1-3 frames wide.
     const { RotationCounter } = await import('../src/wheel-odometer.js');
-    const counter = new RotationCounter(50);
+    const counter = new RotationCounter(50, 30);
 
-    // 3 light frames first (initial state committed).
-    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
+    // Start in light.
+    counter.feed(LIGHT_RATIO);
     expect(counter.getRotations()).toBe(0);
 
-    // 3 dark frames — falling edge committed.
-    for (let i = 0; i < 3; i += 1) counter.feed(DARK_RATIO);
-    expect(counter.getRotations()).toBe(0);
+    // One dark frame (falling edge confirmed).
+    counter.feed(DARK_RATIO);
+    expect(counter.getRotations()).toBe(0); // not yet — need the rising edge
 
-    // 3 light frames — rising edge committed = 1 rotation.
-    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
+    // Back to light — rising edge: 1 rotation counted.
+    counter.feed(LIGHT_RATIO);
     expect(counter.getRotations()).toBe(1);
+  });
+
+  it('counts one rotation on a 2-frame dark pulse', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const counter = new RotationCounter(50, 30);
+
+    counter.feed(LIGHT_RATIO);
+    counter.feed(DARK_RATIO);
+    counter.feed(DARK_RATIO);
+    counter.feed(LIGHT_RATIO);
+
+    expect(counter.getRotations()).toBe(1);
+  });
+
+  it('counts one rotation on a longer sustained dark pulse', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const counter = new RotationCounter(50, 30);
+
+    counter.feed(LIGHT_RATIO);
+    for (let i = 0; i < 10; i += 1) counter.feed(DARK_RATIO);
+    counter.feed(LIGHT_RATIO);
+
+    expect(counter.getRotations()).toBe(1);
+  });
+
+  it('marker parked in the box for many frames counts exactly once', async () => {
+    // If the wheel stops with the marker inside the box, only one rotation
+    // should count — on the first exit from dark to light.
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const counter = new RotationCounter(50, 30);
+
+    counter.feed(LIGHT_RATIO);
+    // Marker parked: 30 dark frames (1 second at 30 fps).
+    for (let i = 0; i < 30; i += 1) counter.feed(DARK_RATIO);
+    // Wheel starts moving — marker exits.
+    counter.feed(LIGHT_RATIO);
+
+    expect(counter.getRotations()).toBe(1);
+  });
+
+  it('refractory period: flicker inside refractory window does NOT add a spurious count', async () => {
+    // After one rotation is counted, a lone dark frame within REFRACTORY_MS
+    // must not increment the counter.
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const counter = new RotationCounter(50, 30);
+
+    // First rotation.
+    counter.feed(LIGHT_RATIO);
+    counter.feed(DARK_RATIO);
+    counter.feed(LIGHT_RATIO);
+    expect(counter.getRotations()).toBe(1);
+
+    // Immediately after (still within ~150ms / 4.5 frames): a lone dark flicker.
+    // Feed 2 more light frames then 1 dark + 1 light — total elapsed < 4.5 frames.
+    counter.feed(LIGHT_RATIO);
+    counter.feed(DARK_RATIO); // frame index 4 — only 1 frame since last count at frame 2
+    counter.feed(LIGHT_RATIO);
+
+    // Must still be 1 — refractory block.
+    expect(counter.getRotations()).toBe(1);
+  });
+
+  it('counts a second rotation after the refractory window has cleared', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const counter = new RotationCounter(50, 30);
+
+    // First rotation.
+    counter.feed(LIGHT_RATIO);
+    counter.feed(DARK_RATIO);
+    counter.feed(LIGHT_RATIO);
+    expect(counter.getRotations()).toBe(1);
+
+    // Clear the refractory window with CLEAR (6) light frames.
+    for (let i = 0; i < CLEAR; i += 1) counter.feed(LIGHT_RATIO);
+
+    // Second rotation.
+    counter.feed(DARK_RATIO);
+    counter.feed(LIGHT_RATIO);
+    expect(counter.getRotations()).toBe(2);
+  });
+
+  it('counts multiple rapid rotations with refractory clearance between each', async () => {
+    // THE FAST-SPIN regression: a sequence of brief 1-2-frame dark pulses that
+    // simulate 20-30 real passes per 30-second window must all be counted.
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const counter = new RotationCounter(50, 30);
+
+    const TARGET_ROTATIONS = 10;
+    // Each rotation: 1 light (start) + 1 dark + CLEAR light frames.
+    // Total inter-rotation gap = 1 + CLEAR = 7 frames = 233 ms >> 150 ms refractory.
+    for (let r = 0; r < TARGET_ROTATIONS; r += 1) {
+      counter.feed(LIGHT_RATIO); // ensure we are in light state
+      counter.feed(DARK_RATIO);  // 1-frame dark pulse
+      counter.feed(LIGHT_RATIO); // rising edge — rotation counted
+      for (let g = 0; g < CLEAR - 1; g += 1) counter.feed(LIGHT_RATIO); // clear refractory
+    }
+
+    expect(counter.getRotations()).toBe(TARGET_ROTATIONS);
   });
 
   it('threshold boundary: ratio exactly at thresholdPct/100 is dark', async () => {
     const { RotationCounter } = await import('../src/wheel-odometer.js');
     // threshold=50 → ratio >= 0.5 is dark.
-    const counter = new RotationCounter(50);
+    const counter = new RotationCounter(50, 30);
 
-    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
-
+    counter.feed(LIGHT_RATIO);
     // ratio=0.5 → 0.5*100=50 >= 50 → dark.
-    for (let i = 0; i < 3; i += 1) counter.feed(0.5);
-    expect(counter.getRotations()).toBe(0); // still in dark state, no rising edge yet.
+    counter.feed(0.5);
+    counter.feed(LIGHT_RATIO);
 
-    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
     expect(counter.getRotations()).toBe(1);
   });
 
   it('threshold boundary: ratio just below thresholdPct/100 is light', async () => {
     const { RotationCounter } = await import('../src/wheel-odometer.js');
-    // threshold=50 → ratio < 0.5 is light.
-    const counter = new RotationCounter(50);
+    // threshold=50 → ratio < 0.5 is light — FSM never enters dark state.
+    const counter = new RotationCounter(50, 30);
 
-    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
-
-    // ratio=0.49 → 0.49*100=49 < 50 → light (never goes dark).
-    for (let i = 0; i < 6; i += 1) counter.feed(0.49);
+    for (let i = 0; i < 10; i += 1) counter.feed(0.49);
     expect(counter.getRotations()).toBe(0);
-  });
-
-  it('debounces noise — fewer than 3 consecutive frames does not change state', async () => {
-    const { RotationCounter } = await import('../src/wheel-odometer.js');
-    const counter = new RotationCounter(50);
-
-    // Establish light state.
-    for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
-
-    // Two dark (below debounce threshold) then back to light.
-    counter.feed(DARK_RATIO);
-    counter.feed(DARK_RATIO);
-    counter.feed(LIGHT_RATIO);
-
-    // Two more dark, two more light — never 3 consecutive.
-    counter.feed(DARK_RATIO);
-    counter.feed(DARK_RATIO);
-    counter.feed(LIGHT_RATIO);
-    counter.feed(LIGHT_RATIO);
-
-    expect(counter.getRotations()).toBe(0);
-  });
-
-  it('counts multiple rotations over a sequence of transitions', async () => {
-    const { RotationCounter } = await import('../src/wheel-odometer.js');
-    const counter = new RotationCounter(50);
-
-    for (let r = 0; r < 3; r += 1) {
-      for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
-      for (let i = 0; i < 3; i += 1) counter.feed(DARK_RATIO);
-      for (let i = 0; i < 3; i += 1) counter.feed(LIGHT_RATIO);
-    }
-
-    expect(counter.getRotations()).toBe(3);
   });
 
   it('test-tool and live-counter agree: partial dark-pixel frame above threshold is dark', async () => {
     const { RotationCounter } = await import('../src/wheel-odometer.js');
-    // Simulate the real bug scenario: tape occupies ~50% of the ROI box.
+    // Simulate the real scenario: tape occupies ~50% of the ROI box.
     // threshold=40 → ratio >= 0.4 is dark.
-    const counter = new RotationCounter(40);
+    const counter = new RotationCounter(40, 30);
 
-    for (let i = 0; i < 3; i += 1) counter.feed(0.0); // light
-
-    // ratio=0.5 → 0.5*100=50 >= 40 → dark (this is what the test-tool would show as "visible")
-    for (let i = 0; i < 3; i += 1) counter.feed(0.5);
-
-    for (let i = 0; i < 3; i += 1) counter.feed(0.0); // light again
+    counter.feed(0.0); // light
+    counter.feed(0.5); // dark (0.5*100=50 >= 40)
+    counter.feed(0.0); // light again → 1 rotation
 
     expect(counter.getRotations()).toBe(1);
   });
 
-  it('converts rotations to correct metres (maths check)', () => {
-    // metres = rotations × π × diameter_mm / 1000
+  it('distanceMeters = rotations × π × diameter_mm / 1000 (maths check)', () => {
     const rotations = 10;
     const diameterMm = 152.0;
     const metres = rotations * Math.PI * diameterMm / 1000;
@@ -347,7 +412,9 @@ describe('wheel session lifecycle', () => {
     expect(_activeSessions.size).toBe(0);
   });
 
-  it('start→end returns computed metres from rotation count', async () => {
+  it('start→end returns computed metres from rotation count (1 rotation via 1-frame dark pulse)', async () => {
+    // At 30fps with refractory detection, a single dark frame followed by light
+    // is enough for one counted rotation (the regression scenario).
     const camId = await seedWheelCamera();
     const { startWheelSession, endWheelSession, _activeSessions } = await import('../src/wheel-odometer.js');
 
@@ -357,21 +424,16 @@ describe('wheel session lifecycle', () => {
     const session = _activeSessions.get(camId);
     expect(session).toBeDefined();
 
-    // Feed the parser 9 frames simulating one full rotation:
-    // 3 light, 3 dark, 3 light.
+    // Feed the parser a minimal rotation: 1 light + 1 dark + 1 light.
+    // At 30fps the refractory is ~4.5 frames; this is the first rotation so
+    // lastCountedFrame starts at -Infinity — no refractory block.
     const header = Buffer.from('P5\n4 4\n255\n', 'ascii');
-    const lightPixels = Buffer.alloc(16, 200);
-    const darkPixels = Buffer.alloc(16, 50);
+    const lightPixels = Buffer.alloc(16, 200); // 200 >= 127.5 → light
+    const darkPixels  = Buffer.alloc(16, 50);  // 50  <  127.5 → dark
 
-    for (let i = 0; i < 3; i += 1) {
-      session?.proc.stdout.emit('data', Buffer.concat([header, lightPixels]));
-    }
-    for (let i = 0; i < 3; i += 1) {
-      session?.proc.stdout.emit('data', Buffer.concat([header, darkPixels]));
-    }
-    for (let i = 0; i < 3; i += 1) {
-      session?.proc.stdout.emit('data', Buffer.concat([header, lightPixels]));
-    }
+    session?.proc.stdout.emit('data', Buffer.concat([header, lightPixels]));
+    session?.proc.stdout.emit('data', Buffer.concat([header, darkPixels]));
+    session?.proc.stdout.emit('data', Buffer.concat([header, lightPixels]));
 
     const metres = endWheelSession(camId);
     // 1 rotation × π × 152 / 1000
@@ -433,6 +495,18 @@ describe('wheel session lifecycle', () => {
     const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
     const vfIdx = args.indexOf('-vf');
     expect(args[vfIdx + 1]).toBe('crop=iw*100/100:ih*10/100:iw*0/100:ih*50/100,format=gray');
+  });
+
+  it('ffmpeg -r arg is 30 (native camera fps)', async () => {
+    const camId = await seedWheelCamera();
+    const { startWheelSession } = await import('../src/wheel-odometer.js');
+
+    startWheelSession(camId, Date.now());
+
+    const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
+    const rIdx = args.indexOf('-r');
+    expect(rIdx).toBeGreaterThanOrEqual(0);
+    expect(args[rIdx + 1]).toBe('30');
   });
 });
 
@@ -522,6 +596,10 @@ describe('wheel_band_x_pct / wheel_band_width_pct DB round-trip', () => {
 // then fire the 'close' event with code 0.  This exercises the full
 // PgmParser → RotationCounter pipeline and the output-shape contract without
 // hitting a real RTSP stream.
+//
+// NOTE: The RotationCounter inside liveWheelRotationTest uses SAMPLE_FPS=30.
+// Each rotation cycle must include enough light frames to clear the refractory
+// window (REFRACTORY_MS=150ms at 30fps ≈ 4.5 frames → use 6 light frames).
 
 describe('liveWheelRotationTest', () => {
   // Helper: build a 1×1 PGM frame buffer for a given pixel value.
@@ -530,13 +608,17 @@ describe('liveWheelRotationTest', () => {
     return Buffer.concat([header, Buffer.from([pixelValue])]);
   }
 
+  // CLEAR = 6 light frames between rotations to guarantee refractory clearance
+  // at 30fps (6 frames = 200ms > 150ms refractory).
+  const CLEAR_FRAMES = 6;
+
   it('returns correct rotations, distanceMeters, thresholdRatio for a synthetic sequence', async () => {
     // threshold=50 → thresholdRatio = 1 - 50/100 = 0.5
     // dark pixel = value < 127.5 (PgmParser uses 255*(1-50/100)=127.5 as cutoff)
     // RotationCounter treats frame as dark when ratio*100 >= 50, i.e. ratio >= 0.5
     //
-    // We produce 2 full rotations:
-    //   [3 light, 3 dark, 3 light] × 2
+    // We produce 2 full rotations. Each rotation = 1 light + 1 dark + CLEAR_FRAMES light.
+    // First rotation: no refractory concern (lastCountedFrame = -Infinity).
     const camId = await seedWheelCamera(); // diameterMm=152, thresholdPct=50
 
     const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
@@ -548,14 +630,15 @@ describe('liveWheelRotationTest', () => {
     // Kick off the promise (it will await the 'close' event).
     const resultPromise = liveWheelRotationTest(camId, 15);
 
-    // Emit 2 rotation cycles: 3 light → 3 dark → 3 light, twice.
     const lightFrame = pgmFrame(200); // 200 >= 127.5 → light (ratio = 0)
     const darkFrame  = pgmFrame(50);  // 50  <  127.5 → dark  (ratio = 1)
 
+    // 2 rotation cycles with refractory clearance between them.
+    const framesPerCycle = 1 + 1 + CLEAR_FRAMES; // 1 light + 1 dark + 6 light = 8
     for (let cycle = 0; cycle < 2; cycle += 1) {
-      for (let i = 0; i < 3; i += 1) fakeProc.stdout.emit('data', lightFrame);
-      for (let i = 0; i < 3; i += 1) fakeProc.stdout.emit('data', darkFrame);
-      for (let i = 0; i < 3; i += 1) fakeProc.stdout.emit('data', lightFrame);
+      fakeProc.stdout.emit('data', lightFrame);
+      fakeProc.stdout.emit('data', darkFrame);
+      for (let i = 0; i < CLEAR_FRAMES; i += 1) fakeProc.stdout.emit('data', lightFrame);
     }
 
     // Signal ffmpeg done (exit 0).
@@ -564,18 +647,18 @@ describe('liveWheelRotationTest', () => {
     const result = await resultPromise;
 
     expect(result.rotations).toBe(2);
-    expect(result.framesSampled).toBe(18); // 9 frames × 2 cycles
-    expect(result.sampleFps).toBe(10);
+    expect(result.framesSampled).toBe(framesPerCycle * 2); // 16 frames
+    expect(result.sampleFps).toBe(30);
     expect(result.thresholdRatio).toBeCloseTo(0.5, 5);
     expect(result.diameterMm).toBe(152);
     // distanceMeters = 2 × π × 152 / 1000
     expect(result.distanceMeters).toBeCloseTo(2 * Math.PI * 152 / 1000, 5);
-    // ratioTrace should contain the per-frame ratios: 0 for light, 1 for dark.
-    expect(result.ratioTrace).toHaveLength(18);
-    // First three frames are light → ratio 0.
+    // ratioTrace should contain the per-frame ratios.
+    expect(result.ratioTrace).toHaveLength(framesPerCycle * 2);
+    // First frame is light → ratio 0.
     expect(result.ratioTrace[0]).toBeCloseTo(0, 5);
-    // Frames 3–5 are dark → ratio 1.
-    expect(result.ratioTrace[3]).toBeCloseTo(1, 5);
+    // Second frame is dark → ratio 1.
+    expect(result.ratioTrace[1]).toBeCloseTo(1, 5);
   });
 
   it('rejects with FfmpegError when ffmpeg exits non-zero', async () => {
@@ -692,5 +775,19 @@ describe('liveWheelRotationTest', () => {
     const result = await resultPromise;
     expect(result.framesSampled).toBe(0);
     expect(result.rotations).toBe(0);
+  });
+
+  it('sampleFps in result equals 30 (native camera fps)', async () => {
+    const camId = await seedWheelCamera();
+    const { liveWheelRotationTest } = await import('../src/wheel-odometer.js');
+
+    const fakeProc = makeFakeProc();
+    currentSpawnMock.mockReturnValueOnce(fakeProc);
+
+    const resultPromise = liveWheelRotationTest(camId, 5);
+    fakeProc.emit('close', 0);
+
+    const result = await resultPromise;
+    expect(result.sampleFps).toBe(30);
   });
 });

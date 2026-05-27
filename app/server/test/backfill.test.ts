@@ -640,17 +640,21 @@ describe('wheel distance backfill — RotationCounter state machine', () => {
     expect(metres).toBe(0);
   });
 
-  it('debounce prevents counting a 2-frame blip as a rotation', async () => {
+  it('a 2-frame dark pulse at 30fps IS counted as one rotation (real fast pass)', async () => {
+    // At 30fps a 2-frame dark pulse = ~66ms — this is exactly the kind of brief
+    // marker pass that was being dropped by the old 3-frame sustained-dark
+    // debounce. Under the new refractory-period scheme it must count.
+    // No refractory concern on the first rotation (lastCountedFrame = -Infinity).
     const { RotationCounter } = await import('../src/wheel-odometer.js');
     const counter = new RotationCounter(50);
     // Establish light.
     for (let i = 0; i < 3; i += 1) counter.feed(0.0);
-    // 2-frame dark blip (below DEBOUNCE_FRAMES=3).
+    // 2-frame dark pulse — real fast pass at 30fps.
     counter.feed(1.0);
     counter.feed(1.0);
-    // Back to light — no rotation should be counted.
+    // Back to light — rising edge triggers count.
     for (let i = 0; i < 3; i += 1) counter.feed(0.0);
-    expect(counter.getRotations()).toBe(0);
+    expect(counter.getRotations()).toBe(1);
   });
 
   it('distance backfill writes wheel_meters onto an existing wheel entry', async () => {
