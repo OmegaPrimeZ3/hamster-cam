@@ -3,7 +3,8 @@
 // "Torn storybook page" card. Three variants per PLAN §5.4:
 //   - narrative:  emoji + sentence + relative time (+ optional snapshot thumb)
 //   - snapshot:   same as narrative but tap expands to fullscreen snapshot
-//   - timelapse:  large 16:9 card with inline <video playsinline preload="metadata">
+//   - timelapse:  compact thumbnail button; tapping opens ClipPlayerDialog at
+//                 ~2× size (Item 7). Shows a "Nightly Recap" badge + duration.
 //
 // Additional variant: activity === 'recap' — text-only, larger type (18px),
 // distinct warm-gold accent. Sorted to top of the day in Diary.tsx.
@@ -118,13 +119,10 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
         // Snapshots sit beside the text while collapsed, but an expanded
         // snapshot stacks on top (like timelapse) so the enlarged image gets
         // the full card width instead of fighting the text for the row.
-        flexDirection:
-          entry.kind === 'timelapse' || (entry.kind === 'snapshot' && expanded)
-            ? 'column'
-            : 'row',
+        flexDirection: entry.kind === 'snapshot' && expanded ? 'column' : 'row',
         gap: 12,
         alignItems:
-          entry.kind === 'timelapse' || (entry.kind === 'snapshot' && expanded)
+          entry.kind === 'snapshot' && expanded
             ? 'stretch'
             : entry.kind === 'snapshot'
               ? 'center'
@@ -163,7 +161,7 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
       </div>
 
       {entry.kind === 'timelapse' ? (
-        <TimelapseBody entry={entry} />
+        <TimelapseBody entry={entry} onOpen={() => setClipOpen(true)} />
       ) : entry.kind === 'snapshot' ? (
         <SnapshotBody entry={entry} expanded={expanded} onToggle={() => setExpanded((v) => !v)} />
       ) : (
@@ -222,10 +220,9 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
                 type="button"
                 className="hc-btn"
                 onClick={() => setClipOpen(true)}
-                aria-label="View clip"
               >
                 <Play aria-hidden size={16} />
-                View clip
+                {entry.kind === 'timelapse' ? 'Watch recap' : 'View clip'}
               </button>
             )}
             <button
@@ -296,7 +293,12 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
       </div>
 
       <ShareDialog entry={entry} open={shareOpen} onOpenChange={setShareOpen} />
-      <ClipPlayerDialog entry={entry} open={clipOpen} onOpenChange={setClipOpen} />
+      <ClipPlayerDialog
+        entry={entry}
+        open={clipOpen}
+        onOpenChange={setClipOpen}
+        title={entry.kind === 'timelapse' ? 'Nightly Recap' : 'Watch clip'}
+      />
     </motion.article>
   );
 }
@@ -412,32 +414,84 @@ function SnapshotBody({
   );
 }
 
-function TimelapseBody({ entry }: { entry: Entry }): JSX.Element {
+// Compact 120×80 thumbnail button for a timelapse (nightly recap video) entry.
+// Tapping it fires onOpen which opens the shared ClipPlayerDialog at full size.
+// The "Nightly Recap" badge and duration are rendered by the parent's meta row.
+function TimelapseBody({
+  entry,
+  onOpen,
+}: {
+  entry: Entry;
+  onOpen: () => void;
+}): JSX.Element {
+  const hasPoster = Boolean(entry.thumbnail_url);
   return (
-    <div style={{ position: 'relative', aspectRatio: '16 / 9', background: '#000', borderRadius: 12, overflow: 'hidden' }}>
-      {entry.media_path ? (
-        <video
-          controls
-          playsInline
-          preload="metadata"
-          src={entry.media_path}
-          poster={entry.thumbnail_url ?? undefined}
-          style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label="Watch nightly recap video"
+      style={{
+        position: 'relative',
+        width: 120,
+        height: 80,
+        flexShrink: 0,
+        padding: 0,
+        border: 'none',
+        background: '#000',
+        borderRadius: 10,
+        overflow: 'hidden',
+        cursor: 'pointer',
+        display: 'block',
+      }}
+    >
+      {hasPoster && (
+        <img
+          src={entry.thumbnail_url ?? undefined}
+          alt=""
+          aria-hidden
+          loading="lazy"
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
         />
-      ) : (
-        <div
-          style={{
-            position: 'absolute',
-            inset: 0,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: '#fff',
-          }}
-        >
-          <Play aria-hidden size={32} />
-        </div>
       )}
-    </div>
+      {/* Semi-transparent scrim so the play icon is readable over any poster. */}
+      <div
+        aria-hidden
+        style={{
+          position: 'absolute',
+          inset: 0,
+          background: 'rgba(0, 0, 0, 0.38)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        <Play
+          aria-hidden
+          size={24}
+          style={{ color: '#fff', filter: 'drop-shadow(0 1px 3px rgba(0,0,0,0.6))' }}
+        />
+      </div>
+      {/* "Recap" badge pinned to bottom-left of the thumbnail. */}
+      <span
+        aria-hidden
+        style={{
+          position: 'absolute',
+          bottom: 4,
+          left: 4,
+          background: 'rgba(0,0,0,0.65)',
+          color: '#fff',
+          fontSize: 9,
+          fontWeight: 700,
+          letterSpacing: '0.06em',
+          textTransform: 'uppercase',
+          padding: '2px 5px',
+          borderRadius: 4,
+          lineHeight: 1.4,
+          fontFamily: 'Inter, system-ui, sans-serif',
+        }}
+      >
+        Recap
+      </span>
+    </button>
   );
 }

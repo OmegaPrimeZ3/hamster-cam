@@ -31,9 +31,11 @@ export interface ClipPlayerDialogProps {
   entry: Entry;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Dialog title. Defaults to "Watch clip". */
+  title?: string;
 }
 
-export function ClipPlayerDialog({ entry, open, onOpenChange }: ClipPlayerDialogProps): JSX.Element {
+export function ClipPlayerDialog({ entry, open, onOpenChange, title = 'Watch clip' }: ClipPlayerDialogProps): JSX.Element {
   const clip = trpc.clip.get.useQuery(
     { diary_entry_id: entry.id },
     {
@@ -67,7 +69,7 @@ export function ClipPlayerDialog({ entry, open, onOpenChange }: ClipPlayerDialog
         <Dialog.Overlay style={overlayStyle} />
         <Dialog.Content style={contentStyle} aria-describedby="clip-help">
           <Dialog.Title className="display" style={{ marginTop: 0 }}>
-            Watch clip
+            {title}
           </Dialog.Title>
           <p id="clip-help" style={{ color: 'var(--text-muted)', marginTop: 0, marginBottom: 12 }}>
             {petName} on camera
@@ -245,7 +247,12 @@ const contentStyle: React.CSSProperties = {
   top: '50%',
   left: '50%',
   transform: 'translate(-50%, -50%)',
-  width: 'min(540px, calc(100vw - 24px))',
+  // ~2× the old 540px cap; never wider than the viewport minus 32px gutters.
+  width: 'min(960px, calc(100vw - 32px))',
+  // Never taller than the viewport minus safe-area insets and 32px breathing room.
+  maxHeight:
+    'calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))',
+  overflowY: 'auto',
   padding: 22,
   background: 'var(--surface)',
   border: '1px solid var(--border)',

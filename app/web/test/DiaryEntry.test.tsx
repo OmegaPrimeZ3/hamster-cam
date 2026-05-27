@@ -84,18 +84,26 @@ describe('DiaryEntry', () => {
     expect(img.tagName).toBe('IMG');
   });
 
-  it('timelapse variant renders an inline <video> with playsinline', () => {
+  it('timelapse variant renders a compact thumbnail button (no inline video)', () => {
     const entry = makeEntry({
       kind: 'timelapse',
       activity: 'timelapse',
       narrative: "📽️ Peanut's Day 2026-05-19",
       media_path: '/timelapse/2026-05-19.mp4',
+      thumbnail_url: '/thumbnails/2026-05-19.jpg',
+      clip_available: true,
     });
     const { container } = renderWithProviders(<DiaryEntry entry={entry} now={entry.occurred_at + 60_000} />);
-    const video = container.querySelector('video');
-    expect(video).not.toBeNull();
-    expect(video?.getAttribute('playsinline') ?? video?.getAttribute('playsInline')).not.toBeNull();
-    expect(video?.getAttribute('preload')).toBe('metadata');
+    // No inline video — it's now a thumbnail that opens the modal.
+    expect(container.querySelector('video')).toBeNull();
+    // Accessible thumbnail button (aria-label on the poster button).
+    expect(
+      screen.getByRole('button', { name: /watch nightly recap video/i }),
+    ).toBeInTheDocument();
+    // "Watch recap" CTA button in the action row (visible text, clip_available=true).
+    expect(
+      screen.getByRole('button', { name: /watch recap/i }),
+    ).toBeInTheDocument();
   });
 
   it('shows the Read aloud button when ttsEnabled is true and TTS is available', () => {
