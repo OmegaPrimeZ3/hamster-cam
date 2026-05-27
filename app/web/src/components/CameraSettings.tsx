@@ -44,6 +44,11 @@ export function CameraSettings(): JSX.Element {
       await utils.cameras.list.invalidate();
     },
   });
+  const setEnabled = trpc.cameras.setEnabled.useMutation({
+    onSuccess: async () => {
+      await utils.cameras.list.invalidate();
+    },
+  });
   const [editing, setEditing] = useState<CameraDTO | null>(null);
   const [adding, setAdding] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<number | null>(null);
@@ -87,7 +92,15 @@ export function CameraSettings(): JSX.Element {
             {editing?.id === cam.id ? (
               <AddCameraForm existing={cam} onDone={() => setEditing(null)} />
             ) : (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  opacity: cam.enabled ? 1 : 0.45,
+                  transition: 'opacity 0.2s',
+                }}
+              >
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                   <button
                     type="button"
@@ -112,7 +125,28 @@ export function CameraSettings(): JSX.Element {
                 </div>
                 <span aria-hidden style={{ fontSize: 20 }}>{cam.emoji}</span>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontWeight: 600 }}>{cam.name}</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ fontWeight: 600 }}>{cam.name}</span>
+                    {!cam.enabled && (
+                      <span
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          padding: '2px 8px',
+                          borderRadius: 999,
+                          background: 'var(--surface-raised)',
+                          border: '1px solid var(--border)',
+                          color: 'var(--text-muted)',
+                          fontSize: 11,
+                          fontWeight: 500,
+                          letterSpacing: '0.03em',
+                          textTransform: 'uppercase',
+                        }}
+                      >
+                        Hidden
+                      </span>
+                    )}
+                  </div>
                   <small style={{ color: 'var(--text-muted)', wordBreak: 'break-all' }}>
                     {cam.live_src
                       ? <><span aria-label="go2rtc stream">📡</span> {cam.live_src}</>
@@ -173,6 +207,26 @@ export function CameraSettings(): JSX.Element {
                   }`}
                   aria-label="Status"
                 />
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    cursor: setEnabled.isLoading && setEnabled.variables?.id === cam.id ? 'wait' : 'pointer',
+                    flexShrink: 0,
+                  }}
+                  title={cam.enabled ? 'Hide from camera grid' : 'Show in camera grid'}
+                >
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={cam.enabled}
+                    aria-label={`Show ${cam.name} in the camera grid`}
+                    disabled={setEnabled.isLoading && setEnabled.variables?.id === cam.id}
+                    onChange={() => setEnabled.mutate({ id: cam.id, enabled: !cam.enabled })}
+                    style={{ width: 20, height: 20, flexShrink: 0 }}
+                  />
+                </label>
                 <button
                   type="button"
                   className="hc-btn"
