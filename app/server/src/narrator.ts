@@ -5,7 +5,7 @@
 // PLAN §5.4 (cross-camera tracking).
 //
 // ============================================================================
-// ZONE-ENTRY / ZONE-EXIT MODEL (updated 2026-05-25)
+// ZONE-ENTRY / ZONE-EXIT MODEL (updated 2026-05-27)
 // ============================================================================
 //
 // State is in-memory; this module owns:
@@ -64,6 +64,32 @@
 // reporting the same current_zones. The diff in step 1 means we open a visit
 // exactly once per zone-entry and emit exactly once per zone-exit. Re-entering
 // a zone after leaving it opens a fresh visit.
+//
+// COMMIT GATE (false-positive / uncommitted-track filter):
+//   Frigate publishes MQTT events for every tracked object, including objects
+//   it later discards as false positives that never appear in the Explore UI
+//   (no snapshot saved, no clip saved). A sustained false-positive track (e.g.
+//   lighting flicker, wheel motion artifact) that outlives exploringMinDwellMs
+//   would previously be written to the diary as 'exploring' — a phantom entry.
+//
+//   The gate invariant: a zone-visit diary entry may only be written if the
+//   Frigate object was actually committed, defined as:
+//     • false_positive is NOT true (Frigate has not flagged it as a bad detect)
+//     • AND at least one of has_snapshot or has_clip is true (it appears in UI)
+//
+//   Values are carried on the ZoneVisit and updated on every incoming event so
+//   we always hold the freshest assessment. The 'end' event is the authoritative
+//   source — by end-time Frigate has made its final save decision.
+//
+//   The gate applies to ALL Frigate-event-driven emission paths:
+//     - mid-track zone-exit (commitDeferred from the mid-track close loop)
+//     - track-end other-cameras-alive (commitDeferred from sub-case A)
+//     - track-end last-camera deferred flush (commitDeferred from flushPending)
+//   It does NOT apply to: snapshot, timelapse, recap, disk-watch — those are
+//   not driven by Frigate object tracks.
+//
+//   When a visit fails the gate the wheel odometer session is still ended
+//   cleanly (prepareCloseVisit calls endWheelSession before the gate check).
 //
 // The narrator is fully testable: `handleFrigateEvent` does all I/O via the
 // `db` module, time can be controlled by passing `now`, and template choice
@@ -166,6 +192,21 @@ export interface FrigateEventPayloadSide {
   start_time?: number; // seconds since epoch
   end_time?: number | null;
   has_snapshot?: boolean;
+  has_clip?: boolean;
+  /**
+   * Whether Frigate has classified this track as a false positive. When true
+   * the object was detected but discarded — it will NOT appear in the Explore
+   * UI and must not produce a diary entry.
+   */
+  false_positive?: boolean;
+  /**
+   * Best confidence score achieved across the track's lifetime. Set on update/
+   * end events by Frigate. `score` is the current-frame confidence; `top_score`
+   * is the peak achieved so far. We record both for diagnostic details but the
+   * commit gate only uses `false_positive` and the saved-media flags.
+   */
+  top_score?: number;
+  score?: number;
   snapshot?: { frame_time?: number } | null;
 }
 
@@ -258,6 +299,18 @@ interface ZoneVisit {
   cameras: Set<string>;
   /** Camera id whose wheel odometer session is running (null if none). */
   odomCameraId: number | null;
+  /**
+   * Commit-gate fields — carried from the most recent Frigate event for this
+   * track. `undefined` means the field has not yet been reported (treat as
+   * "not false positive" / "not saved" conservatively). On track 'end' events
+   * Frigate has made its final save decision, so these values are authoritative.
+   *
+   * false_positive: true → discard entry (Frigate flagged as bad detect).
+   * hasSnapshot / hasClip: at least one must be true to allow emission.
+   */
+  falsePositive: boolean | undefined;
+  hasSnapshot: boolean | undefined;
+  hasClip: boolean | undefined;
 }
 
 /**
@@ -271,6 +324,19 @@ interface DeferredEntry {
   occurredAt: number;
   cameraId: number | null;
   details: Record<string, unknown>;
+  /**
+   * Commit-gate values snapshotted from the ZoneVisit at close time. The
+   * authoritative values come from the 'end' event; for mid-track closes the
+   * values are whatever Frigate last reported (could be undefined for a very
+   * short track). See the COMMIT GATE comment block at the top of this file.
+   *
+   * `undefined` is treated conservatively at emission time:
+   *   falsePositive=undefined → treat as NOT false positive (allow emission).
+   *   hasSnapshot/hasClip=undefined → treat as NOT saved (block emission).
+   */
+  falsePositive: boolean | undefined;
+  hasSnapshot: boolean | undefined;
+  hasClip: boolean | undefined;
 }
 
 /**
@@ -543,12 +609,17 @@ interface ScheduledFlushDeps {
 /**
  * Open a new zone visit. Starts a wheel odometer session if applicable.
  * Must only be called when the zone is NOT already in petState.zoneVisits.
+ *
+ * `side` is the `after` payload from the opening event — used to seed the
+ * commit-gate fields (false_positive, has_snapshot, has_clip). These will be
+ * updated on every subsequent event via `updateZoneVisitGateFields`.
  */
 function openZoneVisit(
   petState: PetState,
   activity: Activity,
   cameraName: string,
   startedAt: number,
+  side: FrigateEventPayloadSide,
 ): void {
   let odomCameraId: number | null = null;
   if (activity === 'wheel') {
@@ -579,12 +650,38 @@ function openZoneVisit(
     startedAt,
     cameras: new Set([cameraName]),
     odomCameraId,
+    falsePositive: side.false_positive,
+    hasSnapshot: side.has_snapshot,
+    hasClip: side.has_clip,
   });
+}
+
+/**
+ * Update commit-gate fields on an open zone visit from the latest event
+ * payload. Called on every 'new', 'update', and 'end' event so the visit
+ * always holds the freshest Frigate assessment. When a field is undefined on
+ * the incoming side we leave the existing value in place — Frigate only
+ * populates these fields once they become relevant (e.g. has_clip only goes
+ * true when a clip is actually saved, not on the initial 'new').
+ */
+function updateZoneVisitGateFields(
+  visit: ZoneVisit,
+  side: FrigateEventPayloadSide,
+): void {
+  if (side.false_positive !== undefined) visit.falsePositive = side.false_positive;
+  if (side.has_snapshot !== undefined) visit.hasSnapshot = side.has_snapshot;
+  if (side.has_clip !== undefined) visit.hasClip = side.has_clip;
 }
 
 /**
  * Close a zone visit and prepare a DeferredEntry. Always ends the wheel
  * odometer session — never leaves an ffmpeg session open regardless of dwell.
+ *
+ * The commit-gate fields (falsePositive, hasSnapshot, hasClip) are snapshotted
+ * from the visit at close time. The gate itself is applied later in
+ * commitDeferred — after dwell-threshold checks but before any DB write.
+ * Separating the two concerns keeps this function clean and ensures the
+ * odometer is always ended even when the entry is ultimately gated out.
  */
 function prepareCloseVisit(
   visit: ZoneVisit,
@@ -597,6 +694,7 @@ function prepareCloseVisit(
   };
 
   // Always end the odometer session — never leave ffmpeg running.
+  // This MUST happen before any gate check so sessions are always cleaned up.
   if (activity === 'wheel' && visit.odomCameraId !== null) {
     try {
       const metres = endWheelSession(visit.odomCameraId);
@@ -621,6 +719,9 @@ function prepareCloseVisit(
     occurredAt: closedAt,
     cameraId: cameraIdByName([...visit.cameras][0] ?? cameraName),
     details,
+    falsePositive: visit.falsePositive,
+    hasSnapshot: visit.hasSnapshot,
+    hasClip: visit.hasClip,
   };
 }
 
@@ -660,6 +761,45 @@ async function commitDeferred(
       ? tuning.exploringMinDwellMs
       : tuning.minDwellMs;
   if (deferred.durationMs < dwellThreshold) return null;
+
+  // -------------------------------------------------------------------------
+  // COMMIT GATE: drop Frigate-event-driven entries that were not committed.
+  //
+  // Drop entries for tracks that Frigate marked as a false positive, or for
+  // tracks that were never saved (no snapshot AND no clip). These tracks never
+  // appear in Frigate's Explore UI, so they must not appear in the diary.
+  //
+  // All DeferredEntry instances come from Frigate zone visits (the Activity
+  // type only covers zone-based activities — 'snapshot', 'timelapse', 'recap'
+  // are written via separate code paths that never create DeferredEntries).
+  // The gate therefore applies unconditionally here.
+  //
+  // Conservatism rules:
+  //   • falsePositive=true  → ALWAYS drop (Frigate explicitly flagged it).
+  //   • falsePositive=undefined → allow (absence of flag = not flagged yet).
+  //   • hasSnapshot=undefined AND hasClip=undefined → DROP (no save evidence).
+  //   • hasSnapshot=true OR hasClip=true → allow.
+  // -------------------------------------------------------------------------
+  if (deferred.falsePositive === true) {
+    log.debug(
+      { activity: deferred.activity, camera: deferred.details['camera'] },
+      'commit-gate: dropping false_positive track — not in Frigate UI',
+    );
+    return null;
+  }
+  const saved = deferred.hasSnapshot === true || deferred.hasClip === true;
+  if (!saved) {
+    log.debug(
+      {
+        activity: deferred.activity,
+        camera: deferred.details['camera'],
+        hasSnapshot: deferred.hasSnapshot,
+        hasClip: deferred.hasClip,
+      },
+      'commit-gate: dropping unsaved track (no snapshot, no clip) — not in Frigate UI',
+    );
+    return null;
+  }
 
   // Back-to-back same-activity coalescing: if the most recent diary entry is
   // the SAME non-wheel activity and the pet returned to it within
@@ -846,10 +986,12 @@ export async function handleFrigateEvent(
   for (const activity of currentZones) {
     const existing = petState.zoneVisits.get(activity);
     if (!existing) {
-      openZoneVisit(petState, activity, cameraName, zoneOpenStartedAt);
+      openZoneVisit(petState, activity, cameraName, zoneOpenStartedAt, event.after);
     } else if (!existing.cameras.has(cameraName)) {
       // Additional camera joins the existing visit (dedup invariant 2).
       existing.cameras.add(cameraName);
+      // Refresh gate fields from this camera's perspective.
+      updateZoneVisitGateFields(existing, event.after);
 
       // Edge case: existing visit has no odometer but this camera can provide one.
       if (activity === 'wheel' && existing.odomCameraId === null) {
@@ -865,8 +1007,13 @@ export async function handleFrigateEvent(
           }
         }
       }
+    } else {
+      // Camera already in this visit: update gate fields from the latest event.
+      // This is the critical path for 'update' and 'end' events — Frigate may
+      // flip has_snapshot, has_clip, or false_positive at any point in the
+      // track's lifetime. The 'end' event carries the authoritative final values.
+      updateZoneVisitGateFields(existing, event.after);
     }
-    // else: camera already in this visit — debounce, nothing to do.
   }
 
   // -------------------------------------------------------------------------
@@ -880,6 +1027,10 @@ export async function handleFrigateEvent(
     const midTrackToClose: Activity[] = [];
     for (const [activity, visit] of petState.zoneVisits) {
       if (!currentZones.has(activity) && visit.cameras.has(cameraName)) {
+        // Update gate fields before closing so prepareCloseVisit snapshots the
+        // latest Frigate assessment. Mid-track closes use the current 'update'
+        // or 'new' event's after-side — the same track is still live.
+        updateZoneVisitGateFields(visit, event.after);
         visit.cameras.delete(cameraName);
         if (visit.cameras.size === 0) {
           midTrackToClose.push(activity);
@@ -932,9 +1083,14 @@ export async function handleFrigateEvent(
   // -------------------------------------------------------------------------
   if (event.type === 'end') {
     // Collect (activity, visit) pairs before mutating the map.
+    // Also update commit-gate fields from this 'end' event — the 'end' payload
+    // carries Frigate's final authoritative values for false_positive,
+    // has_snapshot, and has_clip. We update BEFORE removing the camera from
+    // the visit so that prepareCloseVisit snapshots the authoritative values.
     const toClose: Array<{ activity: Activity; visit: ZoneVisit }> = [];
     for (const [activity, visit] of petState.zoneVisits) {
       if (visit.cameras.has(cameraName)) {
+        updateZoneVisitGateFields(visit, event.after);
         visit.cameras.delete(cameraName);
         if (visit.cameras.size === 0) {
           toClose.push({ activity, visit });
@@ -983,6 +1139,11 @@ export async function handleFrigateEvent(
                 occurredAt: occurredAtMs,
                 cameraId: cameraIdByName(cameraName),
                 details: { camera: cameraName },
+                // Synthesised entry: take gate fields directly from the 'end'
+                // event — no ZoneVisit to snapshot them from.
+                falsePositive: event.after.false_positive,
+                hasSnapshot: event.after.has_snapshot,
+                hasClip: event.after.has_clip,
               },
             ];
 
