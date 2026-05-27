@@ -82,7 +82,7 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
       details: null,
     });
 
-    const cutoff = now - 3 * 24 * 60 * 60 * 1000; // 3-day window
+    const cutoff = now - 10 * 24 * 60 * 60 * 1000; // 10-day window
     const results = db.listDiaryEntriesMissingThumbnail(cutoff, 50);
 
     expect(results.some((r) => r.id === recent.id)).toBe(true);
@@ -113,7 +113,7 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
       details: null,
     });
 
-    const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - 10 * 24 * 60 * 60 * 1000;
     const results = db.listDiaryEntriesMissingThumbnail(cutoff, 50);
 
     expect(results.some((r) => r.id === old.id)).toBe(false);
@@ -147,7 +147,7 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
     db.updateDiaryEntryThumbnailPath(entry.id, join('thumbnails', `entry-${entry.id}-thumb.jpg`));
     writeFileSync(join(workdir, 'thumbnails', `entry-${entry.id}-thumb.jpg`), Buffer.alloc(8));
 
-    const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - 10 * 24 * 60 * 60 * 1000;
     const results = db.listDiaryEntriesMissingThumbnail(cutoff, 50);
 
     expect(results.some((r) => r.id === entry.id)).toBe(false);
@@ -178,7 +178,7 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
       details: null,
     });
 
-    const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - 10 * 24 * 60 * 60 * 1000;
     const results = db.listDiaryEntriesMissingThumbnail(cutoff, 50);
 
     expect(results.some((r) => r.id === recap.id)).toBe(false);
@@ -202,7 +202,7 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
       details: null,
     });
 
-    const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - 10 * 24 * 60 * 60 * 1000;
     const results = db.listDiaryEntriesMissingThumbnail(cutoff, 50);
 
     expect(results.some((r) => r.id === no_cam.id)).toBe(false);
@@ -236,7 +236,7 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
       });
     }
 
-    const cutoff = now - 3 * 24 * 60 * 60 * 1000;
+    const cutoff = now - 10 * 24 * 60 * 60 * 1000;
     const results = db.listDiaryEntriesMissingThumbnail(cutoff, 3);
 
     expect(results.length).toBeLessThanOrEqual(3);
@@ -274,7 +274,7 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
       details: null,
     });
 
-    const cutoff = now - 3 * 24 * 60 * 60 * 1000;
+    const cutoff = now - 10 * 24 * 60 * 60 * 1000;
     const results = db.listDiaryEntriesMissingThumbnail(cutoff, 50);
 
     expect(results.some((r) => r.id === transition.id)).toBe(true);
@@ -376,9 +376,9 @@ describe('runThumbnailBackfillJob', () => {
       enabled: true,
     });
 
-    // Occurred 4 days ago — outside the 3-day retention window.
+    // Occurred 11 days ago — outside the 10-day retention window.
     db.createDiaryEntry({
-      occurred_at: Date.now() - 4 * 24 * 60 * 60 * 1000,
+      occurred_at: Date.now() - 11 * 24 * 60 * 60 * 1000,
       kind: 'narrative',
       activity: 'resting',
       narrative: 'nap',

@@ -361,11 +361,11 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
   };
 }
 
-// Mirrors record.retain.days=3 in mac-mini/frigate-config.yml.
+// Mirrors record.retain.days=10 in mac-mini/frigate-config.yml.
 // Entries older than this window cannot have live footage pulled from Frigate;
 // only already-extracted clip_path files or timelapse mp4s remain accessible.
 // Update this constant if you change record.retain.days in Frigate's config.
-const FRIGATE_RECORDING_RETENTION_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+const FRIGATE_RECORDING_RETENTION_MS = 10 * 24 * 60 * 60 * 1000; // 10 days
 
 function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
   // clip_available resolution order (mirrors ensureClip):

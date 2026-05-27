@@ -30,10 +30,10 @@ import { generateThumbnailForEntry } from '../thumbnails.js';
 const logger = childLogger('thumbnail-backfill-job');
 
 // Mirrors FRIGATE_RECORDING_RETENTION_MS in trpc.ts. Both constants track
-// record.retain.days=3 in the Frigate config. They are intentionally kept as
+// record.retain.days=10 in the Frigate config. They are intentionally kept as
 // module-level constants in their respective files to avoid a cross-module
 // coupling; if the retention window changes, update both.
-const FRIGATE_RECORDING_RETENTION_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+const FRIGATE_RECORDING_RETENTION_MS = 10 * 24 * 60 * 60 * 1000; // 10 days
 
 // Maximum entries processed per run. Keeps individual job runs short and
 // avoids overloading Frigate with a burst of clip fetches after a restart that

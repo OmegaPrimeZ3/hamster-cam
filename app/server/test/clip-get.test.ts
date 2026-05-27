@@ -183,9 +183,9 @@ describe('clip.get — FfmpegError handling', () => {
 // ---------------------------------------------------------------------------
 
 describe('clip_available — retention window in activity.list', () => {
-  const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+  const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
 
-  it('is false for a camera_id entry older than the 3-day retention window', async () => {
+  it('is false for a camera_id entry older than the 10-day retention window', async () => {
     const db = await import('../src/db.js');
     const { appRouter } = await import('../src/trpc.js');
 
@@ -197,10 +197,10 @@ describe('clip_available — retention window in activity.list', () => {
       enabled: true,
     });
 
-    // occurred_at = 4 days ago → outside the 3-day retention window.
-    const fourDaysAgo = Date.now() - (THREE_DAYS_MS + 24 * 60 * 60 * 1000);
+    // occurred_at = 11 days ago → outside the 10-day retention window.
+    const elevenDaysAgo = Date.now() - (TEN_DAYS_MS + 24 * 60 * 60 * 1000);
     db.createDiaryEntry({
-      occurred_at: fourDaysAgo,
+      occurred_at: elevenDaysAgo,
       kind: 'narrative',
       activity: 'wheel',
       narrative: 'old run',
@@ -216,7 +216,7 @@ describe('clip_available — retention window in activity.list', () => {
 
     const ctx = await makeAdminCtx();
     const caller = appRouter.createCaller(ctx);
-    const result = await caller.activity.range({ from: fourDaysAgo - 1000, to: fourDaysAgo + 1000 });
+    const result = await caller.activity.range({ from: elevenDaysAgo - 1000, to: elevenDaysAgo + 1000 });
 
     const entry = result[0];
     expect(entry).toBeDefined();
@@ -224,7 +224,7 @@ describe('clip_available — retention window in activity.list', () => {
     expect(entry?.clip_available).toBe(false);
   });
 
-  it('is true for a camera_id entry within the 3-day retention window', async () => {
+  it('is true for a camera_id entry within the 10-day retention window', async () => {
     const db = await import('../src/db.js');
     const { appRouter } = await import('../src/trpc.js');
 
@@ -236,7 +236,7 @@ describe('clip_available — retention window in activity.list', () => {
       enabled: true,
     });
 
-    // occurred_at = 1 hour ago → well inside the 3-day retention window.
+    // occurred_at = 1 hour ago → well inside the 10-day retention window.
     const oneHourAgo = Date.now() - 60 * 60 * 1000;
     db.createDiaryEntry({
       occurred_at: oneHourAgo,
@@ -270,9 +270,9 @@ describe('clip_available — retention window in activity.list', () => {
     const cachedAbs = join(workdir, cachedRel);
     writeFileSync(cachedAbs, Buffer.alloc(16));
 
-    const fourDaysAgo = Date.now() - (THREE_DAYS_MS + 24 * 60 * 60 * 1000);
+    const elevenDaysAgo = Date.now() - (TEN_DAYS_MS + 24 * 60 * 60 * 1000);
     const entry = db.createDiaryEntry({
-      occurred_at: fourDaysAgo,
+      occurred_at: elevenDaysAgo,
       kind: 'narrative',
       activity: 'wheel',
       narrative: 'cached old run',
@@ -289,7 +289,7 @@ describe('clip_available — retention window in activity.list', () => {
 
     const ctx = await makeAdminCtx();
     const caller = appRouter.createCaller(ctx);
-    const result = await caller.activity.range({ from: fourDaysAgo - 1000, to: fourDaysAgo + 1000 });
+    const result = await caller.activity.range({ from: elevenDaysAgo - 1000, to: elevenDaysAgo + 1000 });
 
     const dto = result[0];
     expect(dto?.clip_available).toBe(true);

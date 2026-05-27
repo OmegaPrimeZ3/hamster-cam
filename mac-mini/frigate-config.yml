@@ -64,11 +64,11 @@ detect:
   enabled: true
 
 # Defaults applied to every camera unless overridden. Per-PLAN §8 retention
-# math: continuous = 3 days, event clips = 30 days.
+# math: continuous = 10 days, event clips = 30 days.
 record:
   enabled: true
   retain:
-    days: 3
+    days: 10
     mode: motion
   events:
     pre_capture: 5
