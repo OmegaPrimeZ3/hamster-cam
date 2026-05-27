@@ -287,6 +287,106 @@ describe('narrator', () => {
     expect(entries.every((e) => e.activity === 'wheel')).toBe(true);
     vi.useRealTimers();
   });
+
+  // -------------------------------------------------------------------------
+  // Regression: clock skew between server and Pi/Frigate must not suppress
+  // diary entries.
+  //
+  // Root cause: zone-visit startedAt was previously set to `nowMs` (server
+  // wall-clock) while closedAt was sourced from Frigate's `end_time` (Pi
+  // clock). When the server clock ran ahead of the Pi clock, the computed
+  // durationMs = closedAt − startedAt was negative, silently failing the
+  // durationMs < dwellThreshold guard and producing zero diary entries even
+  // for a multi-minute wheel session.
+  //
+  // Fix: zone-visit startedAt is now set to `startMs` (Frigate's
+  // before.start_time converted to ms) so both endpoints of the duration
+  // calculation come from the same clock source.
+  // -------------------------------------------------------------------------
+
+  it('writes a wheel entry even when the server clock is 30s ahead of the Frigate Pi clock', async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 2_000 });
+    resetNarratorState();
+    await seedCameras();
+
+    // Frigate/Pi timestamps (seconds): run from 1_700_000_000 to 1_700_000_300 (5 min run).
+    const frigateStart = 1_700_000_000;
+    const frigateEnd   = 1_700_000_300; // 300 s = 5 minutes
+
+    // Server clock is 30 s ahead of the Pi clock: server sees the 'new' event
+    // at frigateStart * 1000 + 30_000, and the 'end' event at frigateEnd * 1000 + 30_000.
+    const skewMs = 30_000;
+    const serverNew = frigateStart * 1000 + skewMs; // 1_700_000_030_000
+    const serverEnd = frigateEnd   * 1000 + skewMs; // 1_700_000_330_000
+
+    // 'new' event: server clock is serverNew, but Frigate's start_time = frigateStart.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'wheel', zones: ['wheel'], startSec: frigateStart }),
+      { now: () => serverNew, rng: () => 0 },
+    );
+
+    // 'end' event: server clock is serverEnd, Frigate's end_time = frigateEnd.
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: frigateStart, endSec: frigateEnd }),
+      { now: () => serverEnd, rng: () => 0 },
+    );
+
+    // Advance past transition window so the deferred timer fires.
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, serverEnd + 1_000_000);
+    // Entry MUST be present — clock skew must not cause a silent drop.
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('wheel');
+    // Duration should be the Frigate-clocked run time, not the skewed difference.
+    expect(entries[0]?.duration_ms).toBe((frigateEnd - frigateStart) * 1000); // 300_000 ms
+    vi.useRealTimers();
+  });
+
+  it('duration_ms reflects Frigate-clocked run time regardless of server clock offset', async () => {
+    // Variant: Pi clock is 15s AHEAD of server (opposite skew direction).
+    // Pre-fix: this direction produces a duration LARGER than reality. Post-fix:
+    // duration is always Frigate-clocked and correct regardless of skew direction.
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 2_000 });
+    resetNarratorState();
+    await seedCameras();
+
+    const frigateStart = 1_700_005_000;
+    const frigateEnd   = 1_700_005_060; // 60s run
+
+    // Server clock is 15s BEHIND the Pi (Pi is ahead by 15s).
+    const skewMs = -15_000;
+    const serverNew = frigateStart * 1000 + skewMs;
+    const serverEnd = frigateEnd   * 1000 + skewMs;
+
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'wheel', zones: ['wheel'], startSec: frigateStart }),
+      { now: () => serverNew, rng: () => 0 },
+    );
+
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: frigateStart, endSec: frigateEnd }),
+      { now: () => serverEnd, rng: () => 0 },
+    );
+
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, serverEnd + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries[0]?.duration_ms).toBe((frigateEnd - frigateStart) * 1000); // 60_000 ms
+    vi.useRealTimers();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1177,139 @@ describe('cameraIdByName — live_src resolution', () => {
     // With the fix, the camera resolves → odometer session starts.
     expect(_activeSessions.size).toBe(1);
     expect(_activeSessions.has(cam.id)).toBe(true);
+
+    void cam;
+    vi.useRealTimers();
+    vi.doUnmock('node:child_process');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug 1 regression: odomCameraId must only be set when startWheelSession
+// returns true (i.e. an ffmpeg session is actually live). Previously
+// isCameraWheelEnabled was checked instead of the return value of
+// startWheelSession, which meant that a camera with wheel_mark_enabled=1 but
+// no live_src would set odomCameraId even though no session was started,
+// causing prepareCloseVisit to call endWheelSession on a non-existent session
+// and silently produce no distance data.
+// ---------------------------------------------------------------------------
+
+describe('wheel odometer — odomCameraId is only set when a session actually started', () => {
+  it('wheel_mark_enabled=1 with no live_src: no session started, no spurious endWheelSession call', async () => {
+    vi.useFakeTimers();
+
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const db = await import('../src/db.js');
+
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    // Camera has wheel mark enabled but live_src is not set — startWheelSession
+    // will return false (no RTSP URL to connect to).
+    const cam = db.createCamera({
+      name: 'wheel-no-src',
+      emoji: '🎡',
+      stream_url: 'rtsp://x/wheel',
+      // live_src deliberately omitted
+      enabled: true,
+      wheel_mark_enabled: true,
+      wheel_diameter_mm: 152.0,
+      wheel_band_y_pct: 50.0,
+      wheel_band_height_pct: 10.0,
+      wheel_threshold_pct: 50.0,
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_700_010_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Zone opens — session should NOT start (no live_src).
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'wheel-no-src', zones: ['wheel'], startSec: 1_700_010_000 }),
+      deps,
+    );
+    expect(_activeSessions.size).toBe(0); // no session started
+
+    // Zone closes after a meaningful dwell.
+    now = t0 + 30_000;
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'wheel-no-src', zones: ['wheel'], startSec: 1_700_010_000, endSec: 1_700_010_030 }),
+      deps,
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    // Entry IS written (wheel run happened even without odometry).
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('wheel');
+
+    // But no wheel_meters in details (session was never started, so no distance).
+    const details = entries[0]?.details
+      ? (JSON.parse(entries[0].details) as Record<string, unknown>)
+      : {};
+    expect(details['wheel_meters']).toBeUndefined();
+
+    void cam;
+    vi.useRealTimers();
+  });
+
+  it('wheel_mark_enabled=1 with live_src set: session starts → odomCameraId set → distance recorded', async () => {
+    const spawnMock = vi.fn(() => makeFakeProc());
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    vi.useFakeTimers();
+
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const db = await import('../src/db.js');
+
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    const cam = db.createCamera({
+      name: 'wheel-with-src',
+      emoji: '🎡',
+      stream_url: 'rtsp://x/wheel',
+      live_src: 'wheel_cam',
+      enabled: true,
+      wheel_mark_enabled: true,
+      wheel_diameter_mm: 152.0,
+      wheel_band_y_pct: 50.0,
+      wheel_band_height_pct: 10.0,
+      wheel_threshold_pct: 50.0,
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_700_011_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // Zone opens — session SHOULD start.
+    await handleFrigateEvent(
+      newEvent({ type: 'new', camera: 'wheel_cam', zones: ['wheel'], startSec: 1_700_011_000 }),
+      deps,
+    );
+    expect(_activeSessions.size).toBe(1); // session started
+    expect(_activeSessions.has(cam.id)).toBe(true);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    // Zone closes.
+    now = t0 + 30_000;
+    await handleFrigateEvent(
+      newEvent({ type: 'end', camera: 'wheel_cam', zones: ['wheel'], startSec: 1_700_011_000, endSec: 1_700_011_030 }),
+      deps,
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    // Session ended after zone closed.
+    expect(_activeSessions.size).toBe(0);
 
     void cam;
     vi.useRealTimers();

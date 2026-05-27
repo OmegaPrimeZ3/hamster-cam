@@ -313,6 +313,7 @@ interface Statements {
   // diary activity counts (badge evaluation)
   diaryCountActivityAllTime: Database.Statement;
   diaryCountDistinctActiveDaysAllTime: Database.Statement;
+  diaryCountKindAllTime: Database.Statement;
 }
 
 let statementsCache: { db: Database.Database; s: Statements } | null = null;
@@ -730,6 +731,13 @@ function statements(): Statements {
     diaryCountDistinctActiveDaysAllTime: db.prepare(`
       SELECT COUNT(DISTINCT date(occurred_at / 1000, 'unixepoch', 'localtime')) AS n
         FROM diary_entries
+    `),
+    // Count all diary entries of a given kind across all time. Used by
+    // memory_keeper / paparazzi badge rules: only diary entries with
+    // kind='snapshot' represent genuine manual snapshots — the raw `snapshots`
+    // table also holds auto-captured nightly frames which must NOT count.
+    diaryCountKindAllTime: db.prepare(`
+      SELECT COUNT(*) AS n FROM diary_entries WHERE kind = ?
     `),
   };
 
@@ -1499,6 +1507,20 @@ export function countDiaryActivityAllTime(activity: DiaryActivity): number {
  */
 export function countDistinctActiveDaysAllTime(): number {
   const row = statements().diaryCountDistinctActiveDaysAllTime.get() as { n: number };
+  return row.n;
+}
+
+/**
+ * Count all diary entries of a given kind across all time.
+ *
+ * Use this (not the raw `snapshots` table) when evaluating snapshot-based
+ * badge rules. Diary entries with kind='snapshot' are written exclusively by
+ * `saveManualSnapshot` — so this count reflects only genuine operator-triggered
+ * snapshots. The `snapshots` table also holds auto-captured nightly frames
+ * (written by the snapshot-capture job) which must NOT count toward badges.
+ */
+export function countDiaryKindAllTime(kind: DiaryKind): number {
+  const row = statements().diaryCountKindAllTime.get(kind) as { n: number };
   return row.n;
 }
 

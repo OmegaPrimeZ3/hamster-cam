@@ -71,9 +71,12 @@
 
 import * as db from './db.js';
 import { evaluateBadges, type BadgeId } from './badges.js';
+import { childLogger } from './logger.js';
 import { pickTemplate, render } from './narratives.js';
 import { evaluatePushForEntry } from './push.js';
 import { startWheelSession, endWheelSession } from './wheel-odometer.js';
+
+const log = childLogger('narrator');
 
 // ---------------------------------------------------------------------------
 // Tunables — read once at startup, refresh on demand (e.g. after a settings
@@ -446,10 +449,6 @@ function cameraIdByName(name: string): number | null {
   return byName?.id ?? null;
 }
 
-function isCameraWheelEnabled(cameraId: number): boolean {
-  const cam = db.getCameraById(cameraId);
-  return cam?.wheel_mark_enabled === 1;
-}
 
 function formatDuration(durationMs: number): string {
   const totalSec = Math.max(0, Math.round(durationMs / 1000));
@@ -555,8 +554,13 @@ function openZoneVisit(
       const camId = cameraIdByName(cameraName);
       if (camId !== null) {
         try {
-          startWheelSession(camId, startedAt);
-          if (isCameraWheelEnabled(camId)) {
+          // startWheelSession returns true only when an ffmpeg session is
+          // actually running (wheel enabled, live_src configured, not a
+          // duplicate). Only set odomCameraId when there is a live session to
+          // end — otherwise prepareCloseVisit would call endWheelSession on a
+          // camera that never had one (returning null and losing any distance).
+          const sessionStarted = startWheelSession(camId, startedAt);
+          if (sessionStarted) {
             odomCameraId = camId;
           }
         } catch (err) {
@@ -788,11 +792,28 @@ export async function handleFrigateEvent(
   // -------------------------------------------------------------------------
   // Open visits for newly-entered zones (debounce: camera already in visit →
   // no-op).
+  //
+  // startedAt anchor strategy — keeps both endpoints of `durationMs` on the
+  // same clock so that server↔Pi clock skew cannot produce a negative duration:
+  //
+  //   'new' event: the zone was present from object birth. Use `startMs`
+  //   (Frigate's before.start_time in ms) as the anchor. The close timestamp
+  //   for a track-end close is `endMs` (also Frigate-clocked), so both
+  //   endpoints share the same clock and skew cancels out.
+  //
+  //   'update' event: the zone was entered mid-track. `startMs` points to the
+  //   OBJECT birth, not the zone-entry moment. For mid-track closes the close
+  //   timestamp is `nowMs` (server clock, the update event's receive time).
+  //   Using `nowMs` here means both endpoints are server-clocked. Clock skew
+  //   cannot affect a duration where both sides come from `Date.now()`.
+  //
+  // In both cases the resulting `durationMs` is correct and robust to skew.
   // -------------------------------------------------------------------------
+  const zoneOpenStartedAt = event.type === 'new' ? startMs : nowMs;
   for (const activity of currentZones) {
     const existing = petState.zoneVisits.get(activity);
     if (!existing) {
-      openZoneVisit(petState, activity, cameraName, nowMs);
+      openZoneVisit(petState, activity, cameraName, zoneOpenStartedAt);
     } else if (!existing.cameras.has(cameraName)) {
       // Additional camera joins the existing visit (dedup invariant 2).
       existing.cameras.add(cameraName);
@@ -800,10 +821,12 @@ export async function handleFrigateEvent(
       // Edge case: existing visit has no odometer but this camera can provide one.
       if (activity === 'wheel' && existing.odomCameraId === null) {
         const camId = cameraIdByName(cameraName);
-        if (camId !== null && isCameraWheelEnabled(camId)) {
+        if (camId !== null) {
           try {
-            startWheelSession(camId, existing.startedAt);
-            existing.odomCameraId = camId;
+            const sessionStarted = startWheelSession(camId, existing.startedAt);
+            if (sessionStarted) {
+              existing.odomCameraId = camId;
+            }
           } catch (err) {
             void err;
           }
@@ -927,7 +950,9 @@ export async function handleFrigateEvent(
       pending.timer = setTimeout(() => {
         // commitDeferred inside flushPending calls deps.onEntryWritten for each
         // written entry — no further wiring needed here.
-        void flushPending(petKey, pending, deps);
+        flushPending(petKey, pending, deps).catch((err: unknown) => {
+          log.error({ err }, 'flushPending timer failed — diary entry may be lost');
+        });
       }, tuning.transitionWindowMs);
       pending.timer.unref?.();
       petState.pending = pending;

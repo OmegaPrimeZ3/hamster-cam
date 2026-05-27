@@ -249,16 +249,21 @@ const activeSessions = new Map<number, SessionHandle>();
  * session is already running for that camera id, this is a no-op. Auto-stops
  * after 2 hours as a safety net. If wheel_mark_enabled = 0 for the camera,
  * this is a no-op.
+ *
+ * Returns true if a session is active after this call (either newly started or
+ * already running), false if the camera is ineligible (disabled, missing
+ * live_src, not found). The narrator uses this return value to decide whether
+ * to set odomCameraId — it must only be set when a real ffmpeg session is live.
  */
-export function startWheelSession(cameraId: number, startedAt: number): void {
-  if (activeSessions.has(cameraId)) return;
+export function startWheelSession(cameraId: number, startedAt: number): boolean {
+  if (activeSessions.has(cameraId)) return true;
 
   const camera = db.getCameraById(cameraId);
   if (!camera) {
     log.warn({ cameraId }, 'wheel-odometer: camera not found, skipping session start');
-    return;
+    return false;
   }
-  if (camera.wheel_mark_enabled !== 1) return;
+  if (camera.wheel_mark_enabled !== 1) return false;
 
   const {
     live_src,
@@ -273,7 +278,7 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
   const rtspUrl = wheelRtspUrl(live_src);
   if (!rtspUrl) {
     log.warn({ cameraId, live_src }, 'wheel-odometer: no live_src / FRIGATE_URL — cannot start session');
-    return;
+    return false;
   }
 
   const counter = new RotationCounter(thresholdPct);
@@ -340,6 +345,7 @@ export function startWheelSession(cameraId: number, startedAt: number): void {
   });
 
   log.info({ cameraId, rtspUrl, bandX, bandW, bandY, bandH, thresholdPct }, 'wheel session started');
+  return true;
 }
 
 /**

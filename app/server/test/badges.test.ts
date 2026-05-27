@@ -127,15 +127,45 @@ describe('badges', () => {
     expect(earned).toContain('first_day');
   });
 
-  it('memory_keeper — earns at 5+ snapshots', async () => {
+  it('memory_keeper — earns at 5+ manual snapshot diary entries', async () => {
     const db = await import('../src/db.js');
     const { evaluateBadges } = await import('../src/badges.js');
-    const cam = db.createCamera({ name: 'wheel', emoji: '🎡', stream_url: 'rtsp://x', enabled: true });
+    const cam = db.createCamera({ name: 'cam', emoji: '📷', stream_url: 'rtsp://x', enabled: true });
+    const now = Date.now();
     for (let i = 0; i < 5; i += 1) {
-      db.createSnapshot({ camera_id: cam.id, taken_at: Date.now() - i, path: `s${i}.jpg` });
+      db.createDiaryEntry({
+        occurred_at: now - i,
+        kind: 'snapshot',
+        activity: 'snapshot',
+        narrative: 'snapshot',
+        pet_name: null,
+        camera_id: cam.id,
+        from_camera_id: null,
+        to_camera_id: null,
+        duration_ms: null,
+        snapshot_id: null,
+        media_path: null,
+        details: null,
+      });
     }
     const earned = await evaluateBadges();
     expect(earned).toContain('memory_keeper');
+  });
+
+  it('memory_keeper — auto-captured snapshots (snapshots table only) do NOT award the badge', async () => {
+    // Bug fix regression test: the nightly snapshot-capture job inserts into
+    // the `snapshots` table but does NOT create diary entries. Those rows must
+    // not count toward Memory Keeper — only operator-triggered snapshots
+    // (which create a diary entry with kind='snapshot') should.
+    const db = await import('../src/db.js');
+    const { evaluateBadges } = await import('../src/badges.js');
+    const cam = db.createCamera({ name: 'auto-cam', emoji: '📷', stream_url: 'rtsp://x', enabled: true });
+    for (let i = 0; i < 100; i += 1) {
+      db.createSnapshot({ camera_id: cam.id, taken_at: Date.now() - i, path: `auto${i}.jpg` });
+    }
+    // No diary entries with kind='snapshot' created.
+    const earned = await evaluateBadges();
+    expect(earned).not.toContain('memory_keeper');
   });
 
   it('hat_trick — earns at 3 distinct activities within 1h', async () => {
@@ -576,23 +606,51 @@ describe('badges', () => {
     expect(row?.count).toBe(1);
   });
 
-  it('paparazzi — earns at 50+ all-time snapshots', async () => {
+  it('paparazzi — earns at 50+ all-time manual snapshot diary entries', async () => {
     const db = await import('../src/db.js');
     const { evaluateBadges } = await import('../src/badges.js');
     const cam = db.createCamera({ name: 'Snap', emoji: '📸', stream_url: 'rtsp://snap', enabled: true });
+    const now = Date.now();
     for (let i = 0; i < 50; i += 1) {
-      db.createSnapshot({ camera_id: cam.id, taken_at: Date.now() - i, path: `snap${i}.jpg` });
+      db.createDiaryEntry({
+        occurred_at: now - i,
+        kind: 'snapshot',
+        activity: 'snapshot',
+        narrative: 'snapshot',
+        pet_name: null,
+        camera_id: cam.id,
+        from_camera_id: null,
+        to_camera_id: null,
+        duration_ms: null,
+        snapshot_id: null,
+        media_path: null,
+        details: null,
+      });
     }
     const earned = await evaluateBadges();
     expect(earned).toContain('paparazzi');
   });
 
-  it('paparazzi — does NOT earn below 50 snapshots', async () => {
+  it('paparazzi — does NOT earn below 50 manual snapshot diary entries', async () => {
     const db = await import('../src/db.js');
     const { evaluateBadges } = await import('../src/badges.js');
     const cam = db.createCamera({ name: 'Snap', emoji: '📸', stream_url: 'rtsp://snap', enabled: true });
+    const now = Date.now();
     for (let i = 0; i < 49; i += 1) {
-      db.createSnapshot({ camera_id: cam.id, taken_at: Date.now() - i, path: `snap${i}.jpg` });
+      db.createDiaryEntry({
+        occurred_at: now - i,
+        kind: 'snapshot',
+        activity: 'snapshot',
+        narrative: 'snapshot',
+        pet_name: null,
+        camera_id: cam.id,
+        from_camera_id: null,
+        to_camera_id: null,
+        duration_ms: null,
+        snapshot_id: null,
+        media_path: null,
+        details: null,
+      });
     }
     const earned = await evaluateBadges();
     expect(earned).not.toContain('paparazzi');
@@ -602,14 +660,41 @@ describe('badges', () => {
     const db = await import('../src/db.js');
     const { evaluateBadges } = await import('../src/badges.js');
     const cam = db.createCamera({ name: 'Snap', emoji: '📸', stream_url: 'rtsp://snap', enabled: true });
+    const now = Date.now();
     for (let i = 0; i < 50; i += 1) {
-      db.createSnapshot({ camera_id: cam.id, taken_at: Date.now() - i, path: `snap${i}.jpg` });
+      db.createDiaryEntry({
+        occurred_at: now - i,
+        kind: 'snapshot',
+        activity: 'snapshot',
+        narrative: 'snapshot',
+        pet_name: null,
+        camera_id: cam.id,
+        from_camera_id: null,
+        to_camera_id: null,
+        duration_ms: null,
+        snapshot_id: null,
+        media_path: null,
+        details: null,
+      });
     }
     await evaluateBadges();
     await evaluateBadges();
     const summary = db.summarizeBadges();
     const row = summary.find((s) => s.badge_id === 'paparazzi');
     expect(row?.count).toBe(1);
+  });
+
+  it('paparazzi — auto-captured snapshots (snapshots table only) do NOT award the badge', async () => {
+    // Same regression guard as memory_keeper: nightly auto-captures must not
+    // count toward paparazzi either.
+    const db = await import('../src/db.js');
+    const { evaluateBadges } = await import('../src/badges.js');
+    const cam = db.createCamera({ name: 'Auto', emoji: '📷', stream_url: 'rtsp://auto', enabled: true });
+    for (let i = 0; i < 100; i += 1) {
+      db.createSnapshot({ camera_id: cam.id, taken_at: Date.now() - i, path: `auto${i}.jpg` });
+    }
+    const earned = await evaluateBadges();
+    expect(earned).not.toContain('paparazzi');
   });
 
   it('globe_runner — earns when cumulative wheel_meters >= 1,000,000 (1,000 km)', async () => {

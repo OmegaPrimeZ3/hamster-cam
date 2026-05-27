@@ -160,9 +160,11 @@ export async function evaluateBadges(
     if (hour < EARLY_BIRD_HOUR) tryEarn('early_bird', e.occurred_at);
   }
 
-  // memory_keeper — at least 5 snapshot rows ever.
-  const snapshotCount = entries.filter((e) => e.kind === 'snapshot').length
-    + countAllSnapshotEntriesIfHistoric();
+  // memory_keeper — at least 5 manual snapshot diary entries ever.
+  // We count kind='snapshot' diary entries all-time (NOT the raw `snapshots`
+  // table, which also holds auto-captured nightly frames from the
+  // snapshot-capture job — those must not award this badge).
+  const snapshotCount = db.countDiaryKindAllTime('snapshot');
   if (snapshotCount >= MEMORY_KEEPER_SNAPSHOTS) tryEarn('memory_keeper', now);
 
   // hat_trick — 3 distinct activities within any 1-hour window today.
@@ -205,9 +207,10 @@ export async function evaluateBadges(
   const allTimeWheelCount = db.countDiaryActivityAllTime('wheel');
   if (allTimeWheelCount >= WHEEL_VETERAN_COUNT) tryEarn('wheel_veteran', now);
 
-  // paparazzi — 50 all-time snapshots saved (reuse same signal as memory_keeper).
-  const allTimeSnapshots = entries.filter((e) => e.kind === 'snapshot').length
-    + countAllSnapshotEntriesIfHistoric();
+  // paparazzi — 50 all-time manual snapshots. Same source of truth as
+  // memory_keeper: count kind='snapshot' diary entries, not the raw snapshots
+  // table (which includes auto-captured nightly frames).
+  const allTimeSnapshots = db.countDiaryKindAllTime('snapshot');
   if (allTimeSnapshots >= PAPARAZZI_SNAPSHOTS) tryEarn('paparazzi', now);
 
   // wheelie — 5+ wheel runs today.
@@ -254,15 +257,6 @@ export async function evaluateBadges(
 const MILE_HIGH_METRES = 1609.34;     // 1 mile
 const MARATHON_CLUB_METRES = 42195;   // 42.195 km (marathon)
 const ULTRA_METRES = 160934;          // 100 miles
-
-function countAllSnapshotEntriesIfHistoric(): number {
-  // Snapshots earned on previous days also count toward "5 ever saved". We
-  // ask the DB rather than scanning everything: a single COUNT(*) over the
-  // snapshots table is the simplest signal.
-  return db
-    .listSnapshotsBetween(0, Number.MAX_SAFE_INTEGER)
-    .length;
-}
 
 function hasHatTrick(entries: readonly db.DiaryEntryRow[]): boolean {
   // Sort by time and sweep a 1-hour window of distinct activities.
