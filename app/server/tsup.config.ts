@@ -6,6 +6,7 @@ export default defineConfig({
     migrate: 'src/migrate.ts',
     bootstrap: 'src/bootstrap.ts',
     'diary-cleanup': 'src/diary-cleanup.ts',
+    backfill: 'src/backfill.ts',
     // Exposed to the frontend workspace for end-to-end-typed tRPC client.
     // `import type { AppRouter } from '@hamster-cam/server/trpc'`.
     trpc: 'src/trpc.ts',

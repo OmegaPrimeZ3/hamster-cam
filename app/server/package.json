@@ -30,7 +30,8 @@
     "test:watch": "vitest",
     "migrate": "tsx src/migrate.ts",
     "bootstrap-admin": "tsx src/bootstrap.ts",
-    "diary-cleanup": "tsx src/diary-cleanup.ts"
+    "diary-cleanup": "tsx src/diary-cleanup.ts",
+    "backfill": "tsx src/backfill.ts"
   },
   "dependencies": {
     "@fastify/cookie": "10.0.1",
