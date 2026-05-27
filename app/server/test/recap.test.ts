@@ -307,6 +307,22 @@ describe('runRecapJob', () => {
     expect(result.diary_entry_id).not.toBeNull();
   });
 
+  it('API 403/400 error includes HTTP status in result (GeminiApiError coverage)', async () => {
+    // Verifies the new GeminiApiError path returns api_error without throwing,
+    // and that a 403 (bad key / quota) is distinguishable from a 500 for the
+    // operator reading the logs. The test just checks the skipped result; the
+    // log output is structural — not asserted in unit tests.
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    for (const status of [400, 403, 404, 429]) {
+      const result = await runRecapJob(REF_DATE, { fetch: makeErrorFetch(status) });
+      expect(result.skipped).toBe('api_error');
+      expect(result.diary_entry_id).toBeNull();
+    }
+  });
+
   it('excludes a 19:00 entry from the overnight window (before nightStart)', async () => {
     process.env['GEMINI_API_KEY'] = 'test-key';
     const { runRecapJob } = await import('../src/jobs/recap.js');

@@ -21,6 +21,22 @@ import { childLogger } from '../logger.js';
 
 const logger = childLogger('recap-job');
 
+/**
+ * Thrown by callGemini when the Gemini API returns a non-2xx status.
+ * Carries the HTTP status and the raw response body so callers can log
+ * actionable diagnostics (e.g. 400 = bad model name, 403 = quota/key).
+ */
+class GeminiApiError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: number,
+    readonly responseBody: string,
+  ) {
+    super(message);
+    this.name = 'GeminiApiError';
+  }
+}
+
 const SKIP_KINDS: ReadonlySet<db.DiaryKind> = new Set(['timelapse', 'recap']);
 const SKIP_ACTIVITIES: ReadonlySet<db.DiaryActivity> = new Set(['snapshot', 'timelapse', 'recap']);
 const MIN_SOURCE_ENTRIES = 3;
@@ -83,6 +99,23 @@ export async function runRecapJob(
     (e) => !SKIP_KINDS.has(e.kind) && (e.activity == null || !SKIP_ACTIVITIES.has(e.activity)),
   );
 
+  // Log diagnostic info at every run so operators can see exactly what the
+  // job found — critical for debugging "recap not appearing" without needing
+  // to manually query the DB.
+  logger.info(
+    {
+      job: 'recap',
+      night: isoDate,
+      window_start_iso: new Date(nightStart).toISOString(),
+      window_end_iso: new Date(nightEnd).toISOString(),
+      all_entries_in_window: allEntries.length,
+      source_entries: sourceEntries.length,
+      min_required: MIN_SOURCE_ENTRIES,
+      model: cfg.GEMINI_MODEL ?? 'gemini-2.0-flash',
+    },
+    'overnight recap: job running',
+  );
+
   if (sourceEntries.length < MIN_SOURCE_ENTRIES) {
     logger.info(
       { job: 'recap', night: isoDate, entries: sourceEntries.length, skipped: 'too_few_entries' },
@@ -95,11 +128,31 @@ export async function runRecapJob(
   const bulletList = buildBulletList(sourceEntries);
   const prompt = buildPrompt(petName, bulletList);
 
+  const geminiModel = cfg.GEMINI_MODEL ?? 'gemini-2.0-flash';
   let recapText: string;
   try {
-    recapText = await callGemini(cfg.GEMINI_API_KEY, cfg.GEMINI_MODEL ?? 'gemini-2.0-flash', prompt, fetchFn);
+    recapText = await callGemini(cfg.GEMINI_API_KEY, geminiModel, prompt, fetchFn);
   } catch (err) {
-    logger.warn({ job: 'recap', night: isoDate, err: (err as Error).message }, 'overnight recap API call failed');
+    // Log at ERROR level (not warn) so this surfaces clearly in production.
+    // GeminiApiError carries HTTP status + body — critical for diagnosing
+    // 400 (bad model name), 403 (quota/invalid key), 429 (rate limit), etc.
+    if (err instanceof GeminiApiError) {
+      logger.error(
+        {
+          job: 'recap',
+          night: isoDate,
+          model: geminiModel,
+          http_status: err.httpStatus,
+          response_body: err.responseBody.slice(0, 500),
+        },
+        'overnight recap: Gemini API call failed — check GEMINI_API_KEY and GEMINI_MODEL',
+      );
+    } else {
+      logger.error(
+        { job: 'recap', night: isoDate, model: geminiModel, err: (err as Error).message },
+        'overnight recap: Gemini API call failed (network/timeout)',
+      );
+    }
     return { date: isoDate, skipped: 'api_error', diary_entry_id: null };
   }
 
@@ -156,7 +209,15 @@ async function callGemini(
   }
 
   if (!res.ok) {
-    throw new Error(`Gemini returned HTTP ${res.status}`);
+    // Capture the response body so the caller can log actionable detail
+    // (e.g. 400 INVALID_ARGUMENT = bad model name, 403 = quota/key issue).
+    let body = '';
+    try {
+      body = await res.text();
+    } catch {
+      // ignore
+    }
+    throw new GeminiApiError(`Gemini returned HTTP ${res.status}`, res.status, body);
   }
 
   const json = await res.json() as GeminiResponse;
