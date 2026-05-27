@@ -25,7 +25,7 @@
 //  18.  filterHamsterSnapshots: snapshot outside the match window is dropped.
 //  19.  Recap test: SECONDS_PER_FRAME changed to 1.5 (details.seconds_per_frame).
 
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -590,5 +590,236 @@ describe('runTimelapseJob hamster-filter integration', () => {
     // depending on how many of the 30 snapshots land in the first half window.
     // Just verify it didn't throw.
     expect(result.date).toBe('2026-05-24');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concat-list uniformity tests (white-box: stageAndWriteConcatForTest)
+//
+// Root cause of exit-69 bug: stageAndWriteConcat was writing raw .jpg paths
+// into the concat script. The fix normalises every still to a .mp4 segment
+// first so every concat entry is a uniform H.264 MP4.
+// ---------------------------------------------------------------------------
+
+describe('stageAndWriteConcat — concat list contains only normalised .mp4 entries', () => {
+  it('every entry in the concat script is a .mp4, no raw .jpg entries', async () => {
+    const db = await import('../src/db.js');
+    const { runFfmpeg } = await import('../src/frigate.js');
+    const { stageAndWriteConcatForTest } = await import('../src/jobs/timelapse.js');
+
+    const cam = db.createCamera({
+      name: 'concat-test-cam',
+      emoji: '📷',
+      stream_url: 'rtsp://host/concat',
+      enabled: true,
+    });
+
+    // Seed 5 on-disk JPEG snapshots.
+    const windowStart = new Date('2026-05-24T22:00:00').getTime();
+    const snapPaths: string[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      const rel = join('snapshots', `concat-${i}.jpg`);
+      const abs = join(workdir, rel);
+      writeFileSync(abs, Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+      db.createSnapshot({ camera_id: cam.id, taken_at: windowStart + i * 60_000, path: rel });
+      snapPaths.push(abs);
+    }
+
+    // Fake clip already normalised to .mp4.
+    const clipMp4 = join(workdir, 'clip-norm-test.mp4');
+    writeFileSync(clipMp4, Buffer.alloc(16));
+
+    // Build a synthetic Timeline (3 stills + 1 clip).
+    const timeline = {
+      segments: [
+        { type: 'still' as const, absPath: snapPaths[0]!, durationS: 1.5, midMs: windowStart },
+        { type: 'still' as const, absPath: snapPaths[1]!, durationS: 1.5, midMs: windowStart + 60_000 },
+        { type: 'clip' as const, absPath: clipMp4, durationS: 3, midMs: windowStart + 90_000 },
+        { type: 'still' as const, absPath: snapPaths[2]!, durationS: 1.5, midMs: windowStart + 120_000 },
+        { type: 'still' as const, absPath: snapPaths[3]!, durationS: 1.5, midMs: windowStart + 180_000 },
+        { type: 'still' as const, absPath: snapPaths[4]!, durationS: 1.5, midMs: windowStart + 240_000 },
+        { type: 'still' as const, absPath: snapPaths[0]!, durationS: 1.5, midMs: windowStart + 300_000 },
+        { type: 'still' as const, absPath: snapPaths[1]!, durationS: 1.5, midMs: windowStart + 360_000 },
+      ],
+      stillCount: 7,
+      clipCount: 1,
+    };
+
+    const stagingDir = mkdtempSync(join(tmpdir(), 'hamster-concat-test-'));
+    try {
+      const result = await stageAndWriteConcatForTest(timeline, stagingDir, workdir);
+
+      // The mock runFfmpeg writes a 16-byte MP4 for each still normalisation call.
+      // The result must be non-null (enough segments).
+      expect(result).not.toBeNull();
+
+      // Read the concat script and verify every `file` line references a .mp4.
+      const { readFileSync } = await import('node:fs');
+      const script = readFileSync(result!.concatPath, 'utf8');
+      const fileLines = script.split('\n').filter((l) => l.startsWith('file '));
+      expect(fileLines.length).toBeGreaterThan(0);
+
+      for (const line of fileLines) {
+        // Each line: file '/path/to/something.mp4'
+        expect(line).toMatch(/\.mp4'/);
+        // None should be a raw .jpg.
+        expect(line).not.toMatch(/\.jpg'/);
+      }
+
+      // runFfmpeg should have been called once per still (7 stills).
+      const calls = vi.mocked(runFfmpeg).mock.calls;
+      const stillNormCalls = calls.filter((args) =>
+        args[0].includes('-loop') && args[0].includes('1'),
+      );
+      expect(stillNormCalls).toHaveLength(7);
+    } finally {
+      rmSync(stagingDir, { recursive: true, force: true });
+    }
+  });
+
+  it('still-normalisation failure for one frame is non-fatal — remaining frames proceed', async () => {
+    const db = await import('../src/db.js');
+    const { runFfmpeg } = await import('../src/frigate.js');
+    const { stageAndWriteConcatForTest } = await import('../src/jobs/timelapse.js');
+
+    const cam = db.createCamera({
+      name: 'concat-fail-cam',
+      emoji: '📷',
+      stream_url: 'rtsp://host/fail',
+      enabled: true,
+    });
+
+    const windowStart = new Date('2026-05-24T22:00:00').getTime();
+    const snapPaths: string[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      const rel = join('snapshots', `fail-${i}.jpg`);
+      const abs = join(workdir, rel);
+      writeFileSync(abs, Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+      db.createSnapshot({ camera_id: cam.id, taken_at: windowStart + i * 60_000, path: rel });
+      snapPaths.push(abs);
+    }
+
+    // Make the mock fail on the 3rd still-normalisation call (index 2).
+    let callCount = 0;
+    vi.mocked(runFfmpeg).mockImplementation(async (args: readonly string[]) => {
+      const outPath = args[args.length - 1] as string;
+      if (args.includes('-loop')) {
+        callCount += 1;
+        if (callCount === 3) {
+          const { FfmpegError: FE } = await import('../src/frigate.js');
+          throw new FE('ffmpeg exited with code 1', 1, 'Error: could not read jpeg\nConversion failed!');
+        }
+        // Success: write the mock MP4.
+        if (outPath.endsWith('.mp4')) writeFileSync(outPath, Buffer.alloc(16));
+        return;
+      }
+      // Non-still call (concat or music pass).
+      if (outPath.endsWith('.mp4')) writeFileSync(outPath, Buffer.alloc(16));
+    });
+
+    const timeline = {
+      segments: snapPaths.map((p, i) => ({
+        type: 'still' as const,
+        absPath: p,
+        durationS: 1.5,
+        midMs: windowStart + i * 60_000,
+      })),
+      stillCount: snapPaths.length,
+      clipCount: 0,
+    };
+
+    const stagingDir = mkdtempSync(join(tmpdir(), 'hamster-fail-test-'));
+    try {
+      // Should not throw — the failure is skipped.
+      const result = await stageAndWriteConcatForTest(timeline, stagingDir, workdir);
+      // 9 out of 10 stills succeeded (1 failed) — still above MIN_FRAMES.
+      expect(result).not.toBeNull();
+
+      const { readFileSync } = await import('node:fs');
+      const script = readFileSync(result!.concatPath, 'utf8');
+      const fileLines = script.split('\n').filter((l) => l.startsWith('file '));
+      // Should have 9 entries (the failed one was skipped).
+      expect(fileLines).toHaveLength(9);
+      // All entries must be .mp4.
+      for (const line of fileLines) {
+        expect(line).toMatch(/\.mp4'/);
+      }
+    } finally {
+      rmSync(stagingDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FfmpegError stderr surfacing
+// ---------------------------------------------------------------------------
+
+describe('FfmpegError stderr surfacing', () => {
+  it('FfmpegError carries the stderr payload and code', async () => {
+    const { FfmpegError } = await import('../src/frigate.js');
+    const err = new FfmpegError('ffmpeg exited with code 69', 69, 'Conversion failed!\nsome detail\n');
+    expect(err.code).toBe(69);
+    expect(err.stderr).toContain('Conversion failed!');
+    expect(err.message).toContain('69');
+    expect(err.name).toBe('FfmpegError');
+  });
+
+  it('stderrSummaryForTest returns the last N lines of stderr', async () => {
+    const { stderrSummaryForTest } = await import('../src/jobs/timelapse.js');
+    const longStderr = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
+    const summary = stderrSummaryForTest(longStderr, 20);
+    const summaryLines = summary.split('\n');
+    expect(summaryLines).toHaveLength(20);
+    expect(summaryLines[0]).toBe('line 30');
+    expect(summaryLines[19]).toBe('line 49');
+  });
+
+  it('stderrSummaryForTest returns all lines when stderr is shorter than N', async () => {
+    const { stderrSummaryForTest } = await import('../src/jobs/timelapse.js');
+    const shortStderr = 'line A\nline B\nline C\n';
+    const summary = stderrSummaryForTest(shortStderr, 20);
+    // 3 non-empty lines after trim + split.
+    expect(summary.split('\n').filter((l) => l.length > 0)).toHaveLength(3);
+  });
+
+  it('clip-normalisation failure logs ffmpeg_stderr when FfmpegError is thrown', async () => {
+    // Verify the job run does NOT throw when a clip normalisation fails with
+    // a FfmpegError carrying stderr — and that the job still produces output.
+    const { runFfmpeg } = await import('../src/frigate.js');
+
+    // Make the mock throw a FfmpegError on any clip-normalisation call.
+    vi.mocked(runFfmpeg).mockImplementation(async (args: readonly string[]) => {
+      const outPath = args[args.length - 1] as string;
+      // Clip normalisation: no -loop flag, has -c:v libx264, output is clip-norm-*.mp4.
+      if (!args.includes('-loop') && outPath.includes('clip-norm-')) {
+        const { FfmpegError: FE } = await import('../src/frigate.js');
+        throw new FE('ffmpeg exited with code 69', 69, 'Conversion failed!\nBroken H.264 segment\n');
+      }
+      // All other calls succeed.
+      if (typeof outPath === 'string' && outPath.endsWith('.mp4')) {
+        writeFileSync(outPath, Buffer.alloc(16));
+      }
+    });
+
+    const runTime = new Date('2026-05-25T06:05:00');
+    const windowStart = new Date('2026-05-24T22:00:00').getTime();
+    await seedNSnapshots(30, windowStart, 'stderr-cam');
+
+    // Point to a fake Frigate URL so clip fetching is attempted.
+    process.env['FRIGATE_URL'] = 'http://localhost:15999';
+
+    const { fetchHamsterEvents } = await import('../src/frigate.js');
+    vi.mocked(fetchHamsterEvents).mockResolvedValueOnce([
+      {
+        id: 'ev-stderr', camera: 'stderr-cam', label: 'hamster',
+        start_time: (windowStart / 1000) + 100,
+        end_time: (windowStart / 1000) + 110,
+        has_clip: true, has_snapshot: false, zones: [],
+      },
+    ]);
+
+    const { runTimelapseJob } = await import('../src/jobs/timelapse.js');
+    // Must not throw — clip failure is non-fatal.
+    await expect(runTimelapseJob(runTime)).resolves.not.toThrow();
   });
 });

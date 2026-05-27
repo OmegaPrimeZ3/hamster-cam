@@ -47,7 +47,7 @@
 //   node dist/timelapse-regen.js --date YYYY-MM-DD
 //   (also exported as runTimelapseForDate for programmatic use)
 
-import { mkdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -56,12 +56,24 @@ import { join } from 'node:path';
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
 import type { DiaryActivity, DiaryEntryRow, SnapshotRow } from '../db.js';
-import { fetchHamsterEvents, type FrigateDetectionEvent, runFfmpeg } from '../frigate.js';
+import { FfmpegError, fetchHamsterEvents, type FrigateDetectionEvent, runFfmpeg } from '../frigate.js';
 import { childLogger } from '../logger.js';
 import { pickTemplate, render } from '../narratives.js';
 import { generateThumbnailForEntry } from '../thumbnails.js';
 
 const logger = childLogger('timelapse-job');
+
+/**
+ * Return the last N lines of ffmpeg stderr so error log entries are readable
+ * without being enormous. Trims leading/trailing whitespace.
+ */
+function stderrSummary(stderr: string, lines = 20): string {
+  return stderr
+    .trim()
+    .split('\n')
+    .slice(-lines)
+    .join('\n');
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -516,7 +528,11 @@ async function fetchAndNormaliseClips(
         'timelapse: clip normalised',
       );
     } catch (err) {
-      logger.warn({ event: event.id, err: (err as Error).message }, 'timelapse: clip fetch/normalise failed — skipping');
+      const stderrTail = err instanceof FfmpegError ? stderrSummary(err.stderr) : undefined;
+      logger.warn(
+        { event: event.id, err: (err as Error).message, ffmpeg_stderr: stderrTail },
+        'timelapse: clip fetch/normalise failed — skipping',
+      );
     }
   }
 
@@ -641,44 +657,86 @@ interface StagingResult {
 }
 
 /**
- * Symlink still-frame snapshots into the staging dir and write the ffmpeg
- * concat demuxer script covering both stills and clips.
+ * Normalise every still-frame JPEG into a short H.264 MP4 segment, then write
+ * a concat demuxer script that references only uniform H.264 MP4 files (both
+ * still segments and pre-normalised clip segments).
  *
- * Returns null when fewer than MIN_FRAMES on-disk segments are available.
+ * WHY: ffmpeg's -f concat demuxer requires stream-uniform inputs. A concat
+ * list that mixes mjpeg-stills with h264-clips produces "Conversion failed!"
+ * (exit 69) as soon as the demuxer crosses a stream boundary. Normalising
+ * every still to H.264 first makes the whole list homogeneous, so the final
+ * concat can use -c:v copy (no re-encode) and succeeds cleanly.
+ *
+ * Each still gets its own ffmpeg call:
+ *   -loop 1 -t <SECONDS_PER_FRAME> -i <jpeg>
+ *   -vf scale/pad/fps  (same normalisation as clips)
+ *   -c:v libx264 -pix_fmt yuv420p
+ *
+ * Still-normalisation failures are silently skipped (non-fatal, same policy
+ * as clip-normalisation failures).
+ *
+ * Returns null when fewer than MIN_FRAMES on-disk segments are available
+ * after normalisation.
  */
 async function stageAndWriteConcat(
   timeline: Timeline,
   stagingDir: string,
   storagePath: string,
 ): Promise<StagingResult | null> {
-  let concatScript = 'ffconcat version 1.0\n';
+  // vf applied to every still segment — keeps res/fps/SAR identical to clips.
+  const stillVf = [
+    `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease`,
+    `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2`,
+    `fps=${OUTPUT_FPS}`,
+  ].join(',');
+
+  const concatEntries: string[] = [];
   let totalDurationS = 0;
   let validCount = 0;
   let stillIndex = 0;
 
   for (const seg of timeline.segments) {
     if (seg.type === 'still') {
-      // Symlink the snapshot into the staging dir.
       const srcAbs = seg.absPath.startsWith('/')
         ? seg.absPath
         : join(storagePath, seg.absPath);
       if (!existsSync(srcAbs)) continue;
-      const dest = join(stagingDir, `frame-${String(stillIndex).padStart(4, '0')}.jpg`);
-      try {
-        await symlink(srcAbs, dest);
-      } catch {
-        // symlink may fail if dest already exists (unlikely given unique indices)
-        if (!existsSync(dest)) continue;
-      }
-      concatScript += `file '${dest}'\nduration ${SECONDS_PER_FRAME}\n`;
-      totalDurationS += SECONDS_PER_FRAME;
+
+      const normMp4 = join(stagingDir, `still-${String(stillIndex).padStart(4, '0')}.mp4`);
       stillIndex += 1;
+
+      try {
+        await runFfmpeg([
+          '-y',
+          '-loop', '1',
+          '-t', String(SECONDS_PER_FRAME),
+          '-i', srcAbs,
+          '-vf', stillVf,
+          '-c:v', 'libx264',
+          '-preset', 'fast',
+          '-pix_fmt', 'yuv420p',
+          '-an',
+          '-movflags', '+faststart',
+          normMp4,
+        ]);
+      } catch (err) {
+        const stderrTail = err instanceof FfmpegError ? stderrSummary(err.stderr) : undefined;
+        logger.warn(
+          { path: srcAbs, err: (err as Error).message, ffmpeg_stderr: stderrTail },
+          'timelapse: still normalisation failed — skipping frame',
+        );
+        continue;
+      }
+
+      if (!existsSync(normMp4)) continue;
+
+      concatEntries.push(`file '${normMp4}'`);
+      totalDurationS += SECONDS_PER_FRAME;
       validCount += 1;
     } else {
-      // Clip segment: file exists in stagingDir already (normalised by fetchAndNormaliseClips).
+      // Clip segment — already a normalised H.264 MP4.
       if (!existsSync(seg.absPath)) continue;
-      // No `duration` line for clips — the concat demuxer reads their natural duration.
-      concatScript += `file '${seg.absPath}'\n`;
+      concatEntries.push(`file '${seg.absPath}'`);
       totalDurationS += seg.durationS;
       validCount += 1;
     }
@@ -686,17 +744,7 @@ async function stageAndWriteConcat(
 
   if (validCount < MIN_FRAMES) return null;
 
-  // Duplicate the last segment with duration 0 so the concat demuxer correctly
-  // displays the final segment's duration (required by the concat demuxer spec).
-  // For clips, this is a no-op (clips end naturally at their stream end).
-  const lastSeg = timeline.segments[timeline.segments.length - 1];
-  if (lastSeg?.type === 'still') {
-    const lastStillDest = join(stagingDir, `frame-${String(stillIndex - 1).padStart(4, '0')}.jpg`);
-    if (existsSync(lastStillDest)) {
-      concatScript += `file '${lastStillDest}'\nduration 0\n`;
-    }
-  }
-
+  const concatScript = `ffconcat version 1.0\n${concatEntries.join('\n')}\n`;
   const concatPath = join(stagingDir, 'concat.txt');
   await writeFile(concatPath, concatScript, 'utf8');
 
@@ -718,59 +766,57 @@ interface RenderVideoInput {
 /**
  * Render the final output video from the concat script.
  *
- * Without music: single-pass encode with concat demuxer → vf chain → H.264.
- * With music:
- *   1. Render a silent video to a temp file.
- *   2. Mix the music track in a second pass: loop the audio, trim to video
- *      duration, apply -18 dB volume, fade out last 3s.
+ * All inputs in the concat list are uniform H.264 MP4 segments (stills were
+ * pre-normalised in stageAndWriteConcat), so pass 1 can use -c:v copy —
+ * fast, lossless, and no stream-uniformity issues.
  *
- * Two-pass approach avoids the complexity of combining the concat demuxer
- * (which doesn't support audio) with amix in a single graph.
+ * The watermark vf chain is applied ONCE in the final output step:
+ *   - No music → single pass: concat stream-copy → watermark re-encode.
+ *   - With music → two passes:
+ *       1. concat → stream-copy → intermediate silent MP4 (no watermark yet).
+ *       2. silent MP4 + music → watermark encode + audio mix → final output.
+ *     The watermark encode and the music mix happen together in pass 2 so we
+ *     only re-encode the video pixels once.
  */
 async function renderVideo(input: RenderVideoInput): Promise<void> {
-  const vfChain = [
-    `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease`,
-    `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2`,
-    `fps=${OUTPUT_FPS}`,
-    `drawtext=text='${input.watermark}':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.4:boxborderw=8:x=w-tw-20:y=h-th-20`,
-  ].join(',');
+  // Watermark filter applied on the final encode (exactly once, regardless of
+  // whether music is present). NOT applied per-segment.
+  const watermarkVf = `drawtext=text='${input.watermark}':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.4:boxborderw=8:x=w-tw-20:y=h-th-20`;
 
   if (input.musicPath === null) {
-    // No music: direct concat → encode.
+    // No music: single pass — concat (stream-copy) → watermark re-encode.
     await runFfmpeg([
       '-y',
       '-f', 'concat',
       '-safe', '0',
       '-i', input.concatPath,
-      '-vf', vfChain,
+      '-vf', watermarkVf,
       '-c:v', 'libx264',
       '-pix_fmt', 'yuv420p',
       '-crf', '23',
       '-movflags', '+faststart',
-      '-vsync', 'vfr',
       input.outAbs,
     ]);
     return;
   }
 
-  // With music: two-pass.
-  // Pass 1: produce silent video.
+  // With music: two passes.
+  //
+  // Pass 1: concat all uniform H.264 segments via stream-copy into a silent
+  // intermediate. No re-encode here — keep it fast and avoid quality loss.
   const silentPath = input.outAbs.replace(/\.mp4$/, '-silent.mp4');
   await runFfmpeg([
     '-y',
     '-f', 'concat',
     '-safe', '0',
     '-i', input.concatPath,
-    '-vf', vfChain,
-    '-c:v', 'libx264',
-    '-pix_fmt', 'yuv420p',
-    '-crf', '23',
+    '-c:v', 'copy',
+    '-an',
     '-movflags', '+faststart',
-    '-vsync', 'vfr',
     silentPath,
   ]);
 
-  // Pass 2: mix music.
+  // Pass 2: watermark encode + music mix in one step.
   // afade=t=out fades the music out over the last 3 seconds.
   // aloop=-1 loops the audio track infinitely; atrim cuts it to video length.
   const fadeStart = Math.max(0, input.totalDurationS - 3);
@@ -790,7 +836,10 @@ async function renderVideo(input: RenderVideoInput): Promise<void> {
       '-filter_complex', `[1:a]${audioFilter}[music]`,
       '-map', '0:v',
       '-map', '[music]',
-      '-c:v', 'copy',
+      '-vf', watermarkVf,
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      '-crf', '23',
       '-c:a', 'aac',
       '-b:a', '128k',
       '-shortest',
@@ -799,11 +848,12 @@ async function renderVideo(input: RenderVideoInput): Promise<void> {
     ]);
   } catch (err) {
     // If the music pass fails, fall back to the silent video rather than killing the job.
+    // The silent video has no watermark in this path but is better than nothing.
+    const stderrTail = err instanceof FfmpegError ? stderrSummary(err.stderr) : undefined;
     logger.warn(
-      { err: (err as Error).message },
+      { err: (err as Error).message, ffmpeg_stderr: stderrTail },
       'timelapse: music mixing failed — falling back to silent video',
     );
-    // Rename the silent file to the output path.
     const { rename } = await import('node:fs/promises');
     await rename(silentPath, input.outAbs);
     return;
@@ -1051,3 +1101,9 @@ export const filterHamsterSnapshotsForTest = filterHamsterSnapshots;
 
 /** Exported purely for unit tests. */
 export const thinEvenlyForTest = thinEvenly;
+
+/** Exported purely for unit tests. */
+export const stageAndWriteConcatForTest = stageAndWriteConcat;
+
+/** Exported purely for unit tests. */
+export const stderrSummaryForTest = stderrSummary;

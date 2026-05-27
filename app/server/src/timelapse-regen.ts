@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 import { getDb } from './db.js';
+import { FfmpegError } from './frigate.js';
 import { logger } from './logger.js';
 import { runTimelapseForDate } from './jobs/timelapse.js';
 
@@ -107,8 +108,14 @@ if (invokedDirectly) {
     (code) => process.exit(code),
     (err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
-      logger.error({ err: msg }, 'timelapse-regen: fatal error');
+      const stderrTail = err instanceof FfmpegError
+        ? err.stderr.trim().split('\n').slice(-20).join('\n')
+        : undefined;
+      logger.error({ err: msg, ffmpeg_stderr: stderrTail }, 'timelapse-regen: fatal error');
       process.stderr.write(`fatal: ${msg}\n`);
+      if (stderrTail) {
+        process.stderr.write(`ffmpeg stderr (last 20 lines):\n${stderrTail}\n`);
+      }
       process.exit(1);
     },
   );
