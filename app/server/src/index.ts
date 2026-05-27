@@ -6,7 +6,8 @@
 //   2. Run migrations on the configured DATABASE_PATH
 //   3. Build Fastify, mount tRPC + /auth/* + /health
 //   4. Start MQTT subscriber (best-effort; degrades to "no events" if broker absent)
-//   5. Schedule cron jobs: timelapse 06:05, retention 02:00, disk-watch 03:00
+//   5. Schedule cron jobs: snapshot-capture (*/2 22:00–06:00), timelapse 06:05,
+//      recap 06:10, retention 02:00, disk-watch 03:00, thumbnail-backfill (*/3)
 //   6. Listen on PORT, host 0.0.0.0
 //
 // Shutdown order on SIGTERM/SIGINT:
