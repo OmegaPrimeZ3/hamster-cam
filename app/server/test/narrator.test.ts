@@ -60,6 +60,16 @@ function newEvent(args: {
   zones?: string[];
   startSec?: number;
   endSec?: number | null;
+  /**
+   * Simulates Frigate's commit-gate fields on the `after` side.
+   * Defaults to `has_snapshot: true` so existing tests (which test behaviours
+   * unrelated to the gate) continue to produce diary entries.
+   * Set `has_snapshot: false, has_clip: false` to simulate an unsaved track,
+   * or `false_positive: true` to simulate a false-positive track.
+   */
+  has_snapshot?: boolean;
+  has_clip?: boolean;
+  false_positive?: boolean;
 }) {
   const before = {
     camera: args.camera,
@@ -70,6 +80,11 @@ function newEvent(args: {
   const after = {
     ...before,
     end_time: args.endSec ?? null,
+    // Default has_snapshot=true so existing tests that don't care about the
+    // commit gate continue to produce diary entries as expected.
+    has_snapshot: args.has_snapshot ?? true,
+    has_clip: args.has_clip ?? false,
+    false_positive: args.false_positive ?? false,
   };
   return { type: args.type, before, after };
 }
@@ -2063,5 +2078,401 @@ describe('exploring → defined-zone transition (same track)', () => {
     const activities = entries.map((e) => e.activity).sort();
     expect(activities).toContain('exploring');
     expect(activities).toContain('transition');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Commit-gate tests: false_positive and unsaved-track filtering
+// ---------------------------------------------------------------------------
+//
+// The invariant: if a Frigate object track is NOT visible in Frigate's Explore
+// UI — i.e. false_positive=true OR (has_snapshot=false AND has_clip=false) —
+// it MUST NOT produce a diary entry.
+//
+// Tests cover:
+//  1. false_positive=true track → dropped on all emission paths (deferred flush,
+//     mid-track close, sub-case-A immediate emit).
+//  2. No snapshot / no clip track → dropped.
+//  3. Normal committed track (has_snapshot=true) → written.
+//  4. Clip-only track (has_clip=true, no snapshot) → written.
+//  5. Gate values can be set on update events and carry through to emission.
+//  6. Wheel odometer session is ended cleanly even when the gate drops the entry.
+// ---------------------------------------------------------------------------
+
+describe('commit-gate: false_positive and unsaved-track filtering', () => {
+  it('drops a false_positive=true track via deferred-flush path', async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const t0 = 1_720_000_000_000;
+    // Track with false_positive=true and has_snapshot=true (snapshot doesn't
+    // override false_positive — the explicit bad-detect flag always wins).
+    await handleFrigateEvent(
+      newEvent({
+        type: 'end',
+        camera: 'wheel',
+        zones: ['wheel'],
+        startSec: 1_720_000_000,
+        endSec: 1_720_000_030,
+        false_positive: true,
+        has_snapshot: true,
+      }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('drops a track with no snapshot and no clip (unsaved track)', async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const t0 = 1_720_001_000_000;
+    // Simulates a track Frigate tracked but never saved (no snapshot, no clip).
+    // These are the 'ghost' tracks that cause phantom diary entries.
+    await handleFrigateEvent(
+      newEvent({
+        type: 'end',
+        camera: 'wheel',
+        zones: ['wheel'],
+        startSec: 1_720_001_000,
+        endSec: 1_720_001_030,
+        has_snapshot: false,
+        has_clip: false,
+        false_positive: false,
+      }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('writes an entry for a normal committed track (has_snapshot=true)', async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const t0 = 1_720_002_000_000;
+    await handleFrigateEvent(
+      newEvent({
+        type: 'end',
+        camera: 'wheel',
+        zones: ['wheel'],
+        startSec: 1_720_002_000,
+        endSec: 1_720_002_030,
+        has_snapshot: true,
+        has_clip: false,
+        false_positive: false,
+      }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('wheel');
+    vi.useRealTimers();
+  });
+
+  it('writes an entry for a clip-only track (has_clip=true, no snapshot)', async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const t0 = 1_720_003_000_000;
+    await handleFrigateEvent(
+      newEvent({
+        type: 'end',
+        camera: 'food',
+        zones: ['food'],
+        startSec: 1_720_003_000,
+        endSec: 1_720_003_030,
+        has_snapshot: false,
+        has_clip: true,
+        false_positive: false,
+      }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('food');
+    vi.useRealTimers();
+  });
+
+  it('gate values set on an update event carry through to deferred emission', async () => {
+    // Simulates the realistic sequence: 'new' has no snapshot yet, 'update'
+    // sets has_snapshot=true as Frigate saves it, 'end' carries it through.
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const t0 = 1_720_004_000_000;
+    let now = t0;
+
+    // 'new' — no snapshot yet (track just started).
+    await handleFrigateEvent(
+      newEvent({
+        type: 'new',
+        camera: 'wheel',
+        zones: ['wheel'],
+        startSec: 1_720_004_000,
+        has_snapshot: false,
+        has_clip: false,
+        false_positive: false,
+      }),
+      { now: () => now, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    // 'update' — Frigate saves a snapshot partway through.
+    now = t0 + 10_000;
+    await handleFrigateEvent(
+      newEvent({
+        type: 'update',
+        camera: 'wheel',
+        zones: ['wheel'],
+        startSec: 1_720_004_000,
+        has_snapshot: true,
+        has_clip: false,
+        false_positive: false,
+      }),
+      { now: () => now, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    // 'end' — track ends, snapshot still true.
+    now = t0 + 30_000;
+    await handleFrigateEvent(
+      newEvent({
+        type: 'end',
+        camera: 'wheel',
+        zones: ['wheel'],
+        startSec: 1_720_004_000,
+        endSec: 1_720_004_030,
+        has_snapshot: true,
+        has_clip: false,
+        false_positive: false,
+      }),
+      { now: () => now, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    // Entry must be written — snapshot was confirmed on the 'update'.
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('wheel');
+    vi.useRealTimers();
+  });
+
+  it('gate blocks a track that starts with snapshot=true but ends with false_positive=true', async () => {
+    // Edge case: Frigate initially saves a snapshot but later reclassifies as
+    // false positive. The 'end' event's false_positive=true must override.
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const t0 = 1_720_005_000_000;
+    let now = t0;
+
+    // 'new' — looks legit at birth.
+    await handleFrigateEvent(
+      newEvent({
+        type: 'new',
+        camera: 'food',
+        zones: ['food'],
+        startSec: 1_720_005_000,
+        has_snapshot: true,
+        false_positive: false,
+      }),
+      { now: () => now, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    // 'end' — Frigate reclassifies as false positive.
+    now = t0 + 30_000;
+    await handleFrigateEvent(
+      newEvent({
+        type: 'end',
+        camera: 'food',
+        zones: ['food'],
+        startSec: 1_720_005_000,
+        endSec: 1_720_005_030,
+        has_snapshot: true,  // snapshot exists but…
+        false_positive: true, // …Frigate says it's a bad detect
+      }),
+      { now: () => now, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    // Must be dropped — false_positive=true on 'end' is authoritative.
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('drops unsaved track via mid-track close path (not just deferred flush)', async () => {
+    // Ensures the gate is applied on the immediate mid-track emission path,
+    // not just on the deferred flush. Use an update that causes a zone exit
+    // while the track is still live.
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    db.createCamera({ name: 'cam-wide', emoji: '📷', stream_url: 'rtsp://x/wide', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_720_006_000_000;
+    let now = t0;
+
+    // Track starts in food zone. No snapshot yet.
+    await handleFrigateEvent(
+      newEvent({
+        type: 'new',
+        camera: 'cam-wide',
+        zones: ['food'],
+        startSec: 1_720_006_000,
+        has_snapshot: false,
+        has_clip: false,
+        false_positive: false,
+      }),
+      { now: () => now, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    // Mid-track: leaves food zone. Still no snapshot/clip → gate must block.
+    now = t0 + 5_000;
+    const written = await handleFrigateEvent(
+      newEvent({
+        type: 'update',
+        camera: 'cam-wide',
+        zones: [],
+        has_snapshot: false,
+        has_clip: false,
+        false_positive: false,
+      }),
+      { now: () => now, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    expect(written.length).toBe(0); // gate must block mid-track emission too
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('wheel odometer session is ended cleanly even when the gate drops the entry', async () => {
+    // If a wheel track is gated out (false positive), the odometer session must
+    // still be ended — no dangling ffmpeg process left behind.
+    const spawnMock = vi.fn(() => makeFakeProc());
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import('../src/narrator.js');
+    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const db = await import('../src/db.js');
+
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+
+    const cam = db.createCamera({
+      name: 'wheel-cam',
+      emoji: '🎡',
+      stream_url: 'rtsp://x/wheel',
+      live_src: 'wheel_src',
+      enabled: true,
+      wheel_mark_enabled: true,
+      wheel_diameter_mm: 152.0,
+      wheel_band_y_pct: 50.0,
+      wheel_band_height_pct: 10.0,
+      wheel_threshold_pct: 50.0,
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_720_007_000_000;
+    let now = t0;
+    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // 'new' — odometer session starts (looks like a real track at birth).
+    await handleFrigateEvent(
+      newEvent({
+        type: 'new',
+        camera: 'wheel_src',
+        zones: ['wheel'],
+        startSec: 1_720_007_000,
+        has_snapshot: true,
+        false_positive: false,
+      }),
+      deps,
+    );
+    expect(_activeSessions.size).toBe(1);
+    expect(_activeSessions.has(cam.id)).toBe(true);
+
+    // 'end' — Frigate reclassifies as false positive.
+    now = t0 + 30_000;
+    await handleFrigateEvent(
+      newEvent({
+        type: 'end',
+        camera: 'wheel_src',
+        zones: ['wheel'],
+        startSec: 1_720_007_000,
+        endSec: 1_720_007_030,
+        has_snapshot: true,
+        false_positive: true,
+      }),
+      deps,
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    // Odometer session MUST be ended — no dangling process.
+    expect(_activeSessions.size).toBe(0);
+    // But NO diary entry — false_positive gate drops it.
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+
+    void cam;
+    vi.useRealTimers();
+    vi.doUnmock('node:child_process');
   });
 });
