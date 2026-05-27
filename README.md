@@ -242,7 +242,7 @@ listed there it's listed here and vice versa.
 | `CLOUDFLARE_ZONE` | Your apex domain | e.g. `remy-hamster.com`. |
 | `CLOUDFLARE_SUBDOMAIN` | The subdomain the cam runs at | e.g. `cam` → `cam.remy-hamster.com`. |
 | `GEMINI_API_KEY` | Enables the nightly AI storybook recap | **Optional.** If unset the recap job logs `skipped: no_api_key` and exits cleanly. Free at [aistudio.google.com](https://aistudio.google.com/app/apikey). |
-| `GEMINI_MODEL` | Which Gemini model writes the recap | *Optional.* Defaults to `gemini-2.0-flash`. |
+| `GEMINI_MODEL` | Which Gemini model writes the recap | *Optional.* Defaults to `gemini-2.5-flash`. |
 | `RTSP_USERNAME` / `RTSP_PASSWORD` | Locks the go2rtc RTSP listener on each Pi | Generate password with `openssl rand -base64 24`. |
 | `FRIGATE_RTSP_PASSWORD` | What Frigate sends to the Pi Zeros | Must equal `RTSP_PASSWORD`. |
 | `MQTT_URL` | Mosquitto connection string for the backend | `mqtt://mosquitto:1883` (Docker DNS, compose network). |
@@ -314,12 +314,13 @@ up to overnight.
 2. Add to your `.env`:
    ```sh
    GEMINI_API_KEY=AIzaSyA...your-key-here
-   GEMINI_MODEL=gemini-2.0-flash
+   GEMINI_MODEL=gemini-2.5-flash
    ```
 3. Restart the backend (`docker compose restart hamster-app`).
 
-**Cost.** Gemini 2.0 Flash's free tier gives 1,500 requests/day. This
-app uses one request per night. You will never approach the limit.
+**Cost.** Gemini 2.5 Flash's free tier gives generous daily request
+limits. This app uses one request per night. You will never approach
+the limit.
 
 **If the key is missing or revoked,** the recap job logs and exits
 cleanly. Every other feature keeps working.
@@ -450,10 +451,12 @@ Pi Zero 2 W ──────────────────────�
                                       │  │  SQLite (./db bind-mount)││
                                       │  │  MQTT subscriber         ││
                                       │  │  /live/ws WS proxy       ││ ← auth-gated
+                                      │  │  Cron: snapshots */2 22-6││
                                       │  │  Cron: timelapse 06:05   ││
-                                      │  │  Cron: recap*  06:10     ││
+                                      │  │  Cron: recap* 06:10      ││
                                       │  │  Cron: retention 02:00   ││
                                       │  │  Cron: disk-watch 03:00  ││
+                                      │  │  Cron: thumb-backfill */3││
                                       │  │  React SPA served here   ││
                                       │  └──────────────────────────┘│
                                       │  ┌──────────────┐            │
@@ -549,7 +552,8 @@ an opaque HttpOnly session cookie.
 
 - **`admin`** — full access. Manages cameras, pet settings, every
   account (create, trigger password reset, delete), and notification
-  preferences from a five-tab Settings drawer. Account creation calls
+  preferences from a six-tab Settings drawer (Pet, Cameras, Users,
+  Audit, Sharing, Notifications). Account creation calls
   Zyphr's `/auth/register`; password reset triggers `/auth/password/forgot`.
 - **`child`** — view-only. Sees cameras, the diary, badges, and
   snapshots. **No Settings, no gear icon.** Password changes are
@@ -574,8 +578,10 @@ before every protected tRPC procedure.
 ## Customization
 
 Not a hamster person? Change the pet emoji and palette in the
-onboarding wizard. Add or remove cameras at any time from Settings →
-Cameras. Tweak the narrative templates in
+onboarding wizard. Add, remove, or temporarily hide cameras at any
+time from Settings → Cameras — a one-tap per-camera toggle drops a
+camera from the live grid while keeping its diary history intact.
+Tweak the narrative templates in
 `app/server/src/narratives.ts` to match your pet's vibe — we've shipped
 defaults for hamsters, rabbits, cats, dogs, parrots, lizards, fish,
 and turtles.
