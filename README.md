@@ -21,6 +21,7 @@ If you build one, please send a photo.
 
 ## Table of contents
 
+- [A look around](#a-look-around) — screenshots
 - [What it does](#what-it-does) — feature tour
 - [Who is this for?](#who-is-this-for)
 - [Hardware shopping list](#hardware-shopping-list)
@@ -35,6 +36,28 @@ If you build one, please send a photo.
 - [Authentication](#authentication--accounts)
 - [Acknowledgments](#acknowledgments)
 - [License](#license)
+
+## A look around
+
+The kid-friendly Login form — rendered by the app, no third-party redirect:
+
+![Login screen](docs/read-me-images/1-Login.png)
+
+The camera grid dashboard with live multi-camera streaming:
+
+![Dashboard with live camera grid](docs/read-me-images/2-Dashboard.png)
+
+Playful badges, earned automatically and tap-to-explain:
+
+![Badges](docs/read-me-images/3-Badges.png)
+
+The storybook activity diary — each moment a torn-page card:
+
+![Storybook diary](docs/read-me-images/4-Diary.png)
+
+Recent diary cards carry a tap-to-play video clip pulled from Frigate:
+
+![Diary card with video clip](docs/read-me-images/5-Diary-Video.png)
 
 ## What it does
 
