@@ -42,6 +42,7 @@ import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRecapJob } from './jobs/recap.js';
 import { runRetentionJob } from './jobs/retention.js';
 import { runSnapshotCaptureJob } from './jobs/snapshot-capture.js';
+import { runThumbnailBackfillJob } from './jobs/thumbnail-backfill.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
 import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
@@ -442,11 +443,15 @@ export async function startRuntime(): Promise<RuntimeHandles> {
 
 function scheduleCronJobs(app: AppServer): ScheduledTask[] {
   const jobs: Array<{ name: string; spec: string; run: () => Promise<unknown> }> = [
-    { name: 'snapshot-capture', spec: '*/2 22,23,0-5 * * *', run: () => runSnapshotCaptureJob() },
-    { name: 'timelapse',        spec: '5 6 * * *',             run: () => runTimelapseJob() },
-    { name: 'recap',            spec: '10 6 * * *',            run: () => runRecapJob() }, // 06:10 — after the 06:05 timelapse; window closes at 06:00
-    { name: 'retention',        spec: '0 2 * * *',            run: () => runRetentionJob() },
-    { name: 'disk-watch',       spec: '0 3 * * *',            run: () => runDiskWatchJob() },
+    { name: 'snapshot-capture',     spec: '*/2 22,23,0-5 * * *', run: () => runSnapshotCaptureJob() },
+    { name: 'timelapse',            spec: '5 6 * * *',             run: () => runTimelapseJob() },
+    { name: 'recap',                spec: '10 6 * * *',            run: () => runRecapJob() }, // 06:10 — after the 06:05 timelapse; window closes at 06:00
+    { name: 'retention',            spec: '0 2 * * *',            run: () => runRetentionJob() },
+    { name: 'disk-watch',           spec: '0 3 * * *',            run: () => runDiskWatchJob() },
+    // Every 3 minutes: heal thumbnail-generation race failures (Frigate not yet
+    // flushed when the narrator closed an entry). Exits in microseconds when
+    // there are no candidates. Gated on FRIGATE_URL inside the job.
+    { name: 'thumbnail-backfill',   spec: '*/3 * * * *',          run: () => runThumbnailBackfillJob() },
   ];
 
   const tasks: ScheduledTask[] = [];

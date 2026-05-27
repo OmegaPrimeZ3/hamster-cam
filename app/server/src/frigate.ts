@@ -556,9 +556,14 @@ export interface ExtractFrameResult {
 }
 
 /**
- * Pulls a 1-second clip from Frigate's recordings API centered on `atMs` and
- * extracts the first video frame as a downscaled JPEG. Writes the result under
- * `STORAGE_PATH/thumbnails/<cameraName>-<atMs>.jpg`.
+ * Pulls a 4-second clip from Frigate's recordings API centered on `atMs` and
+ * extracts a frame near the midpoint as a downscaled JPEG. Writes the result
+ * under `STORAGE_PATH/thumbnails/<cameraName>-<atMs>.jpg`.
+ *
+ * The 4-second window (atMs±2s) is wide enough to survive a single-segment
+ * boundary gap that would starve a 1-second window. An input seek (`-ss`) is
+ * applied so ffmpeg doesn't always grab frame 0 of the wider window — it
+ * seeks ~2 seconds in so the extracted frame lands near `atMs`.
  *
  * Returns `captured: false` and still writes a zero-byte placeholder when
  * Frigate is unreachable, ffmpeg fails, or the output is empty — never throws
@@ -581,18 +586,28 @@ export async function extractFrame(input: {
   }
 
   const width = input.widthPx ?? 480;
-  const sec = Math.floor(input.atMs / 1000);
-  const endSec = sec + 1;
+  const centerSec = Math.floor(input.atMs / 1000);
+  // 4-second window: start 2s before the target moment; clamp to 0 so we
+  // never request a negative timestamp from Frigate.
+  const startSec = Math.max(0, centerSec - 2);
+  const endSec = centerSec + 2;
   // Frigate 0.17.x recording-clip endpoint (same route as extractClip):
   //   /api/<camera_name>/start/<sec>/end/<endSec>/clip.mp4
   const sourceUrl = new URL(
-    `/api/${encodeURIComponent(input.cameraName)}/start/${sec}/end/${endSec}/clip.mp4`,
+    `/api/${encodeURIComponent(input.cameraName)}/start/${startSec}/end/${endSec}/clip.mp4`,
     cfg.FRIGATE_URL,
   ).toString();
+
+  // Seek offset within the 4-second window so the extracted frame lands near
+  // `atMs` rather than at the very start of the window. When startSec was
+  // clamped to 0 the effective offset is smaller; clamp to [0, 3] to stay
+  // inside the window.
+  const seekOffset = Math.min(centerSec - startSec, 3);
 
   try {
     await runFfmpeg([
       '-y',
+      '-ss', String(seekOffset),
       '-i', sourceUrl,
       '-frames:v', '1',
       '-vf', `scale=${width}:-1`,

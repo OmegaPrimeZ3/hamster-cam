@@ -272,6 +272,7 @@ interface Statements {
   diaryClearMediaOlderThan: Database.Statement;
   diaryUpdateThumbnailPath: Database.Statement;
   diaryUpdateClipPath: Database.Statement;
+  diaryMissingThumbnail: Database.Statement;
   // badges
   badgeInsertDaily: Database.Statement;
   badgeInsertOnce: Database.Statement;
@@ -528,6 +529,22 @@ function statements(): Statements {
     diaryUpdateClipPath: db.prepare(
       'UPDATE diary_entries SET clip_path = @clip_path WHERE id = @id',
     ),
+    // Backfill query: entries that lack a thumbnail, have a resolvable camera,
+    // and fall within the Frigate recording retention window (passed as a
+    // cutoff epoch-ms via the positional parameter). Excludes 'recap' entries
+    // which never get thumbnails. Newest first so recent races are fixed first.
+    // Uses idx_diary_occurred_at to walk newest-to-oldest efficiently.
+    diaryMissingThumbnail: db.prepare(`
+      SELECT * FROM diary_entries
+       WHERE thumbnail_path IS NULL
+         AND kind != 'recap'
+         AND occurred_at >= ?
+         AND (camera_id IS NOT NULL
+              OR to_camera_id IS NOT NULL
+              OR from_camera_id IS NOT NULL)
+       ORDER BY occurred_at DESC
+       LIMIT ?
+    `),
 
     // badges -----------------------------------------------------------
     // Daily policy: INSERT OR IGNORE on the UNIQUE(badge_id, earned_day) key.
@@ -1280,6 +1297,23 @@ export function updateDiaryEntryThumbnailPath(id: number, relPath: string): void
 /** Persist a cached clip path onto an existing diary entry row. */
 export function updateDiaryEntryClipPath(id: number, relPath: string): void {
   statements().diaryUpdateClipPath.run({ id, clip_path: relPath });
+}
+
+/**
+ * Return diary entries that are missing a thumbnail and are candidates for
+ * backfill: they have a resolvable camera AND fall within the given retention
+ * window (i.e. occurred_at >= retentionCutoffMs). Results are ordered
+ * newest-first so the most-recently-written race failures are healed first.
+ * `limit` caps the batch size per job run to avoid hammering Frigate.
+ */
+export function listDiaryEntriesMissingThumbnail(
+  retentionCutoffMs: number,
+  limit: number,
+): DiaryEntryRow[] {
+  return statements().diaryMissingThumbnail.all(
+    retentionCutoffMs,
+    limit,
+  ) as DiaryEntryRow[];
 }
 
 /** Shared helper: sum wheel_meters from a set of detail rows. */

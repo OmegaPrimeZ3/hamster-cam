@@ -114,24 +114,45 @@ describe('extractClip — Frigate 0.17.x URL', () => {
 // ---------------------------------------------------------------------------
 
 describe('extractFrame — Frigate 0.17.x URL', () => {
-  it('passes /api/<cam>/start/<s>/end/<s+1>/clip.mp4 to ffmpeg', async () => {
+  it('passes a 4-second window centered on atMs to ffmpeg (start=center-2, end=center+2)', async () => {
     const { extractFrame } = await import('../src/frigate.js');
 
-    // atMs = 5_000_500 → sec = floor(5_000_500 / 1000) = 5000; endSec = 5001
+    // atMs = 5_000_500 → centerSec = floor(5_000_500 / 1000) = 5000
+    // startSec = max(0, 5000 - 2) = 4998; endSec = 5000 + 2 = 5002
     const result = await extractFrame({ cameraName: 'remy-cam', atMs: 5_000_500 });
 
     const iIdx = capturedFfmpegArgs.indexOf('-i');
     expect(iIdx).toBeGreaterThan(-1);
     const inputUrl = capturedFfmpegArgs[iIdx + 1];
 
-    expect(inputUrl).toBe('http://frigate.local:5000/api/remy-cam/start/5000/end/5001/clip.mp4');
+    expect(inputUrl).toBe('http://frigate.local:5000/api/remy-cam/start/4998/end/5002/clip.mp4');
     expect(inputUrl).not.toContain('/recordings/');
+    expect(inputUrl).not.toContain('/start/5000/end/5001/'); // old 1-second form must be gone
 
-    // extractFrame should report captured:true because mock emits close(0)
-    // and the output file was written (zero bytes by default → captured:false
-    // is the real outcome; what matters is the URL was correct).
     // Either outcome is acceptable here — we only care about the URL.
     expect(result.path).toContain('thumbnails');
+  });
+
+  it('clamps startSec to 0 when atMs is within the first 2 seconds', async () => {
+    const { extractFrame } = await import('../src/frigate.js');
+
+    // atMs = 1500 → centerSec = 1; startSec = max(0, 1-2) = 0; endSec = 3
+    await extractFrame({ cameraName: 'remy-cam', atMs: 1_500 });
+
+    const iIdx = capturedFfmpegArgs.indexOf('-i');
+    const inputUrl = capturedFfmpegArgs[iIdx + 1];
+    expect(inputUrl).toBe('http://frigate.local:5000/api/remy-cam/start/0/end/3/clip.mp4');
+  });
+
+  it('includes a -ss seek offset so the extracted frame lands near atMs', async () => {
+    const { extractFrame } = await import('../src/frigate.js');
+
+    // atMs = 5_000_500 → centerSec=5000, startSec=4998, seekOffset = min(5000-4998, 3) = 2
+    await extractFrame({ cameraName: 'remy-cam', atMs: 5_000_500 });
+
+    const ssIdx = capturedFfmpegArgs.indexOf('-ss');
+    expect(ssIdx).toBeGreaterThan(-1);
+    expect(capturedFfmpegArgs[ssIdx + 1]).toBe('2');
   });
 
   it('does not throw when FRIGATE_URL is absent — returns captured:false', async () => {
