@@ -358,7 +358,11 @@ export async function runTimelapseForDate(
       'timelapse produced',
     );
 
-    void generateThumbnailForEntry(entry);
+    // Await (not fire-and-forget): the timelapse-regen CLI is a short-lived
+    // process that would exit before an un-awaited thumbnail finished, leaving
+    // the recap with no poster. generateThumbnailForEntry swallows its own
+    // errors, so awaiting it can't fail the job.
+    await generateThumbnailForEntry(entry);
     return {
       date: isoDate,
       produced: true,
