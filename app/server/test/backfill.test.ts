@@ -142,6 +142,45 @@ describe('runBackfill', () => {
     return () => { globalThis.fetch = original; };
   }
 
+  it('queries Frigate with has_clip=1 (integer), not the string "true"', async () => {
+    // Regression: Frigate 0.17's FastAPI validates has_clip as an int and
+    // rejects 'true' with a 422, which previously surfaced as "0 events".
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+    const { runBackfill } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    let capturedUrl = '';
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url: string | URL | Request) => {
+      capturedUrl = String(url);
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+    try {
+      await runBackfill({ nowMs: Date.now(), days: 1 });
+      expect(capturedUrl).toContain('has_clip=1');
+      expect(capturedUrl).not.toContain('has_clip=true');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('throws (does not report 0 events) when Frigate returns a non-OK status', async () => {
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+    const { runBackfill } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    const original = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response('{"detail":"bad"}', { status: 422 });
+    try {
+      await expect(runBackfill({ nowMs: Date.now(), days: 1 })).rejects.toThrow(/422/);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   it('exits cleanly when FRIGATE_URL is not set', async () => {
     const { runBackfill } = await import('../src/backfill.js');
     const db = await import('../src/db.js');

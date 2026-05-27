@@ -187,16 +187,22 @@ async function fetchFrigateEvents(
   url.searchParams.set('limit', String(EVENTS_PAGE_LIMIT));
   url.searchParams.set('after', String(Math.floor(afterSec)));
   url.searchParams.set('before', String(Math.ceil(beforeSec)));
-  // Only events with an end time (fully closed tracks) are recoverable.
-  url.searchParams.set('has_clip', 'true');
+  // Only events with a saved clip are recoverable. Frigate 0.17's FastAPI
+  // validates this query param as an integer, so it must be '1'/'0' — the
+  // string 'true' is rejected with a 422.
+  url.searchParams.set('has_clip', '1');
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 30_000);
   try {
     const res = await fetch(url.toString(), { signal: ctrl.signal });
     if (!res.ok) {
-      logger.warn({ status: res.status, url: url.toString() }, 'Frigate events API returned non-OK');
-      return [];
+      // Fail loudly: a rejected query must not masquerade as "0 events to
+      // recover". Surface the status + body so the cause is obvious.
+      const body = await res.text().catch(() => '');
+      throw new Error(
+        `Frigate events API returned ${res.status} for ${url.toString()}: ${body.slice(0, 300)}`,
+      );
     }
     const data = await res.json() as unknown;
     if (!Array.isArray(data)) {
