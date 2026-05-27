@@ -8,6 +8,14 @@
 // counts rotations with an 80 ms debounce (3 frames at 10 fps). On session
 // end the rotation count is converted to metres:
 //   metres = rotations × π × diameter_mm / 1000
+//
+// REUSABLE STATE MACHINE (DRY)
+// ----------------------------
+// PgmParser and RotationCounter are the pure, exported units. The live path
+// (startWheelSession / endWheelSession) feeds them from an RTSP ffmpeg pipe.
+// The backfill path (replayWheelDistance) feeds them from a Frigate recording
+// clip URL using the identical crop filter and sample rate. Neither path
+// duplicates any per-pixel or FSM logic.
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { Readable } from 'node:stream';
@@ -363,6 +371,84 @@ export function endWheelSession(cameraId: number): number | null {
   const metres = rotations * Math.PI * session.diameterMm / 1000;
   log.info({ cameraId, rotations, metres }, 'wheel session ended');
   return metres;
+}
+
+// ---------------------------------------------------------------------------
+// Recorded-footage replay — backfill distance from a Frigate clip URL
+// ---------------------------------------------------------------------------
+
+export interface ReplayWheelDistanceInput {
+  /** Frigate recording clip URL — the /api/<cam>/start/<s>/end/<e>/clip.mp4 form. */
+  clipUrl: string;
+  diameterMm: number;
+  bandX: number;
+  bandW: number;
+  bandY: number;
+  bandH: number;
+  thresholdPct: number;
+}
+
+/**
+ * Run the identical crop→PGM→rotation FSM pipeline over a recorded clip URL.
+ * Returns metres (rotations × π × diameter_mm / 1000), or null if ffmpeg fails
+ * or produces no frames.
+ *
+ * This is the ONLY place in the codebase where the odometer state machine runs
+ * over recordings. It reuses PgmParser and RotationCounter unchanged — no
+ * copy-paste of pixel logic.
+ */
+export async function replayWheelDistance(input: ReplayWheelDistanceInput): Promise<number | null> {
+  return new Promise((resolve) => {
+    const counter = new RotationCounter(input.thresholdPct);
+    const parser = new PgmParser((ratio) => {
+      counter.feed(ratio);
+    }, input.thresholdPct);
+
+    // Identical crop filter and sample rate as the live session.
+    const rawProc = spawn('ffmpeg', [
+      '-y',
+      '-i', input.clipUrl,
+      '-vf', `crop=iw*${input.bandW}/100:ih*${input.bandH}/100:iw*${input.bandX}/100:ih*${input.bandY}/100,format=gray`,
+      '-vsync', 'vfr',
+      '-r', String(SAMPLE_FPS),
+      '-f', 'image2pipe',
+      '-vcodec', 'pgm',
+      '-',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let framesReceived = false;
+
+    rawProc.stdout.on('data', (chunk: Buffer) => {
+      framesReceived = true;
+      parser.feed(chunk);
+    });
+
+    rawProc.stderr.on('data', () => {
+      // Swallow ffmpeg progress — errors surface via 'close'.
+    });
+
+    rawProc.on('error', (err) => {
+      log.warn({ clipUrl: input.clipUrl, err: err.message }, 'wheel-replay: ffmpeg spawn error');
+      resolve(null);
+    });
+
+    rawProc.on('close', (code) => {
+      if (code !== 0) {
+        log.warn({ clipUrl: input.clipUrl, code }, 'wheel-replay: ffmpeg exited non-zero');
+        resolve(null);
+        return;
+      }
+      if (!framesReceived) {
+        log.warn({ clipUrl: input.clipUrl }, 'wheel-replay: ffmpeg produced no frames');
+        resolve(null);
+        return;
+      }
+      const rotations = counter.getRotations();
+      const metres = rotations * Math.PI * input.diameterMm / 1000;
+      log.info({ clipUrl: input.clipUrl, rotations, metres }, 'wheel-replay: complete');
+      resolve(metres);
+    });
+  });
 }
 
 /**

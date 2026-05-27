@@ -10,48 +10,42 @@
 // one is found the event is skipped. This makes the tool safe to run multiple
 // times; it will always produce the same outcome.
 //
+// For wheel entries, distance backfill is also idempotent: if an entry already
+// has wheel_meters in its details blob, the replay is skipped on a second run.
+//
 // WHEEL DISTANCE
 // --------------
-// The real-time odometer works by sampling a live ffmpeg video stream, running
-// the dark-pixel state machine at high frequency, and counting LIGHT→DARK→LIGHT
-// rotations. For historical footage this is technically possible — extract frames
-// from the recording via ffmpeg at the same sample rate and feed them through the
-// same pixel classifier — BUT it is deliberately NOT implemented here for the
-// following reasons:
+// For each recovered (or already-existing) wheel entry the tool replays the
+// odometer state machine over the corresponding Frigate recording clip using
+// replayWheelDistance() from wheel-odometer.ts. That function reuses the same
+// PgmParser + RotationCounter units as the live odometer — there is no
+// duplicated pixel or FSM logic (DRY). The identical crop filter (bandX/W/Y/H)
+// and dark-pixel threshold from the camera's per-camera odometer config are
+// applied, and rotations are converted to metres with the same formula:
+//   metres = rotations × π × diameter_mm / 1000
 //
-//  1. The ROI box (wheel_band_*_pct) and threshold were tuned for the current
-//     camera position. The historical footage was recorded before the ~45° angle
-//     correction was finalised; running the same box over old footage would produce
-//     unreliable rotation counts.
-//  2. Frigate recordings are in sharded .ts segments. Extracting several hours of
-//     frames via sequential ffmpeg calls is extremely CPU-intensive for the Mac Mini
-//     (a typical 20-min wheel run at 5 fps sample rate = 6000 JPEG frames via 600
-//     individual ffmpeg invocations or one long pipe). Given that the entries
-//     themselves were ALREADY lost and the distance can never be authoritative,
-//     the cost/benefit is poor.
-//  3. The live wheel-odometer.ts already has its own ffmpeg pipeline; running a
-//     second one against recordings in parallel with a live session would require
-//     careful resource budgeting that is out of scope for a one-time recovery.
-//
-// RECOMMENDATION: recovered wheel entries will have duration_ms populated from
-// the Frigate event timestamps and an explanatory note in `details.backfill`.
-// The wheel_meters field is omitted (null). If precise historical distances are
-// needed in the future, a dedicated "replay odometer" pass over the recordings
-// can be implemented as a separate tool.
+// Distance backfill is skipped (log + continue) when:
+//   - the camera has wheel_mark_enabled = 0 or unconfigured odometer ROI
+//   - the entry's camera is missing / unresolvable
+//   - FRIGATE_URL is unset (the whole backfill is a no-op in that case)
+//   - the entry already has wheel_meters in its details (idempotency guard)
 //
 // USAGE (inside the container on the Mac Mini)
 // --------------------------------------------
-//   # Default: recovers the last 10 days (Frigate recording retention window)
+//   # Default: recovers the last 12 hours
 //   node dist/backfill.js
 //
-//   # Custom window (e.g. last 7 days only):
-//   node dist/backfill.js --days 7
+//   # Custom window by hours:
+//   node dist/backfill.js --hours 6
+//
+//   # Custom window by days (legacy):
+//   node dist/backfill.js --days 3
 //
 //   # Dry-run: show what would be written without touching the DB:
 //   node dist/backfill.js --dry-run
 //
 //   # Via tsx in dev (same machine as the server, same .env):
-//   pnpm -C app/server tsx src/backfill.ts -- --days 7 --dry-run
+//   pnpm -C app/server tsx src/backfill.ts -- --hours 6 --dry-run
 
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -62,6 +56,7 @@ import { childLogger } from './logger.js';
 import { matchKeyword } from './narrator.js';
 import { pickTemplate, render } from './narratives.js';
 import { generateThumbnailForEntry } from './thumbnails.js';
+import { replayWheelDistance } from './wheel-odometer.js';
 
 const logger = childLogger('backfill');
 
@@ -69,8 +64,8 @@ const logger = childLogger('backfill');
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Default look-back window matches Frigate's continuous-recording retention. */
-const DEFAULT_DAYS = 10;
+/** Default look-back window in hours. */
+export const DEFAULT_HOURS = 12;
 
 /**
  * How much temporal slop to allow when deduplicating against existing entries.
@@ -104,9 +99,8 @@ interface FrigateRestEvent {
 // ---------------------------------------------------------------------------
 
 /**
- * Returns true when a diary entry already exists that is close enough in time
- * and matches the given camera + activity to be considered a duplicate of the
- * candidate we are about to write.
+ * Returns the first matching diary entry that is close enough in time and
+ * matches the given camera + activity, or null when none found.
  *
  * Two entries are considered duplicates when:
  *   |candidate.occurredAt - existing.occurred_at| <= DEDUPE_SLOP_MS
@@ -116,6 +110,27 @@ interface FrigateRestEvent {
  * This is deliberately conservative: if the DB already has a real entry from
  * the live narrator that happened to capture the event at nearly the same time
  * but with a slightly different timestamp, we honour it and skip.
+ *
+ * Returns the matched row so callers can access its id for distance backfill.
+ */
+export function findExistingEntry(
+  cameraId: number | null,
+  activity: db.DiaryActivity,
+  occurredAtMs: number,
+  existingEntries: readonly db.DiaryEntryRow[],
+): db.DiaryEntryRow | null {
+  for (const e of existingEntries) {
+    if (e.activity !== activity) continue;
+    if (e.camera_id !== cameraId) continue;
+    if (Math.abs(e.occurred_at - occurredAtMs) <= DEDUPE_SLOP_MS) return e;
+  }
+  return null;
+}
+
+/**
+ * Returns true when a diary entry already exists that is close enough in time
+ * and matches the given camera + activity to be considered a duplicate.
+ * Thin wrapper around findExistingEntry for backward compat with tests.
  */
 export function isDuplicate(
   cameraId: number | null,
@@ -123,12 +138,7 @@ export function isDuplicate(
   occurredAtMs: number,
   existingEntries: readonly db.DiaryEntryRow[],
 ): boolean {
-  for (const e of existingEntries) {
-    if (e.activity !== activity) continue;
-    if (e.camera_id !== cameraId) continue;
-    if (Math.abs(e.occurred_at - occurredAtMs) <= DEDUPE_SLOP_MS) return true;
-  }
-  return false;
+  return findExistingEntry(cameraId, activity, occurredAtMs, existingEntries) !== null;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,10 +233,22 @@ export interface BackfillResult {
   skippedBelowDwell: number;
   written: number;
   thumbnailsQueued: number;
+  /** Wheel entries that had distance successfully replayed and written. */
+  distanceReplayed: number;
+  /** Wheel entries skipped for distance replay (disabled, no config, already set, etc.). */
+  distanceSkipped: number;
 }
 
 export interface BackfillOptions {
-  /** Look-back window in days. Default: DEFAULT_DAYS (10). */
+  /**
+   * Look-back window in hours. Takes precedence over `days` when both are
+   * supplied. Default: DEFAULT_HOURS (12).
+   */
+  hours?: number;
+  /**
+   * Look-back window in days (legacy convenience). Ignored when `hours` is
+   * also supplied. Provided for scripts that still use --days.
+   */
   days?: number;
   /** When true, do not write to the DB or filesystem. */
   dryRun?: boolean;
@@ -249,6 +271,12 @@ export interface BackfillOptions {
    * RNG for template selection — injectable for deterministic tests.
    */
   rng?: () => number;
+  /**
+   * Skip the wheel-distance replay step even for wheel entries.
+   * Useful in tests that don't have a real FRIGATE_URL or ffmpeg.
+   * Default: false.
+   */
+  skipDistanceReplay?: boolean;
 }
 
 /**
@@ -269,24 +297,32 @@ export async function runBackfill(opts: BackfillOptions = {}): Promise<BackfillR
       skippedBelowDwell: 0,
       written: 0,
       thumbnailsQueued: 0,
+      distanceReplayed: 0,
+      distanceSkipped: 0,
     };
   }
 
   const nowMs = opts.nowMs ?? Date.now();
-  const days = opts.days ?? DEFAULT_DAYS;
+  // --hours takes precedence; --days is the fallback; default is 12 hours.
+  const windowMs = opts.hours !== undefined
+    ? opts.hours * 60 * 60 * 1000
+    : opts.days !== undefined
+      ? opts.days * 24 * 60 * 60 * 1000
+      : DEFAULT_HOURS * 60 * 60 * 1000;
   const dryRun = opts.dryRun ?? false;
+  const skipDistanceReplay = opts.skipDistanceReplay ?? false;
   const minDwellMs = opts.minDwellMs
     ?? Math.max(0, Number.parseInt(db.getSetting('min_dwell_ms') ?? '2000', 10) || 2000);
   const petName = opts.petName ?? (db.getSetting('pet_name') ?? '');
   const rng = opts.rng ?? Math.random;
 
-  const afterMs = nowMs - days * 24 * 60 * 60 * 1000;
+  const afterMs = nowMs - windowMs;
   const afterSec = afterMs / 1000;
   const beforeSec = nowMs / 1000;
 
   logger.info(
     {
-      days,
+      windowHours: windowMs / (60 * 60 * 1000),
       dryRun,
       after: new Date(afterMs).toISOString(),
       before: new Date(nowMs).toISOString(),
@@ -310,6 +346,8 @@ export async function runBackfill(opts: BackfillOptions = {}): Promise<BackfillR
     skippedBelowDwell: 0,
     written: 0,
     thumbnailsQueued: 0,
+    distanceReplayed: 0,
+    distanceSkipped: 0,
   };
 
   for (const event of frigateEvents) {
@@ -347,12 +385,29 @@ export async function runBackfill(opts: BackfillOptions = {}): Promise<BackfillR
     }
 
     // The occurred_at for narrator entries is the END of the activity (endMs).
-    if (isDuplicate(cameraId, activity, endMs, existingEntries)) {
+    const existingEntry = findExistingEntry(cameraId, activity, endMs, existingEntries);
+    if (existingEntry !== null) {
       result.skippedDuplicate += 1;
       logger.debug(
         { eventId: event.id, camera: event.camera, activity, endMs },
         'backfill: skipping duplicate',
       );
+      // For wheel entries that already exist but lack wheel_meters, attempt
+      // distance replay even though we're not writing a new entry.
+      if (activity === 'wheel' && !dryRun && !skipDistanceReplay) {
+        await maybeReplayDistance({
+          cfg,
+          event,
+          startMs,
+          endMs,
+          cameraId,
+          entryId: existingEntry.id,
+          existingDetails: existingEntry.details,
+          result,
+        });
+      } else if (activity === 'wheel') {
+        result.distanceSkipped += 1;
+      }
       continue;
     }
 
@@ -391,6 +446,7 @@ export async function runBackfill(opts: BackfillOptions = {}): Promise<BackfillR
         'backfill: [DRY RUN] would write entry',
       );
       result.written += 1;
+      if (activity === 'wheel') result.distanceSkipped += 1;
       continue;
     }
 
@@ -410,7 +466,6 @@ export async function runBackfill(opts: BackfillOptions = {}): Promise<BackfillR
         camera: event.camera,
         backfill: true,
         frigate_event_id: event.id,
-        // wheel_meters intentionally omitted — see module-level doc comment.
       }),
     });
 
@@ -425,6 +480,22 @@ export async function runBackfill(opts: BackfillOptions = {}): Promise<BackfillR
       { entryId: entry.id, camera: event.camera, activity, durationMs },
       'backfill: wrote entry',
     );
+
+    // Replay wheel distance for newly written wheel entries.
+    if (activity === 'wheel' && !skipDistanceReplay) {
+      await maybeReplayDistance({
+        cfg,
+        event,
+        startMs,
+        endMs,
+        cameraId,
+        entryId: entry.id,
+        existingDetails: entry.details,
+        result,
+      });
+    } else if (activity === 'wheel') {
+      result.distanceSkipped += 1;
+    }
   }
 
   logger.info(result, 'backfill: complete');
@@ -432,11 +503,128 @@ export async function runBackfill(opts: BackfillOptions = {}): Promise<BackfillR
 }
 
 // ---------------------------------------------------------------------------
+// Wheel distance replay helpers
+// ---------------------------------------------------------------------------
+
+interface ReplayDistanceOpts {
+  cfg: ReturnType<typeof getConfig>;
+  event: FrigateRestEvent;
+  startMs: number;
+  endMs: number;
+  cameraId: number | null;
+  entryId: number;
+  existingDetails: string | null;
+  result: BackfillResult;
+}
+
+/**
+ * Attempt to compute and persist wheel_meters for a diary entry.
+ * Mutates `result.distanceReplayed` / `result.distanceSkipped`.
+ *
+ * Idempotency: if the details blob already contains wheel_meters, skip.
+ */
+async function maybeReplayDistance(opts: ReplayDistanceOpts): Promise<void> {
+  const { cfg, event, startMs, endMs, cameraId, entryId, existingDetails, result } = opts;
+
+  // Guard: entry already has wheel_meters — don't clobber on re-run.
+  if (existingDetails !== null) {
+    try {
+      const parsed = JSON.parse(existingDetails) as unknown;
+      if (
+        typeof parsed === 'object' && parsed !== null &&
+        'wheel_meters' in parsed &&
+        (parsed as Record<string, unknown>)['wheel_meters'] !== null
+      ) {
+        logger.debug({ entryId }, 'backfill: wheel entry already has wheel_meters — skipping replay');
+        result.distanceSkipped += 1;
+        return;
+      }
+    } catch {
+      // Malformed details JSON — fall through and attempt replay.
+    }
+  }
+
+  if (cameraId === null) {
+    logger.debug({ entryId, camera: event.camera }, 'backfill: no camera_id — skipping distance replay');
+    result.distanceSkipped += 1;
+    return;
+  }
+
+  const camera = db.getCameraById(cameraId);
+  if (!camera) {
+    logger.debug({ entryId, cameraId }, 'backfill: camera not found — skipping distance replay');
+    result.distanceSkipped += 1;
+    return;
+  }
+
+  if (camera.wheel_mark_enabled !== 1) {
+    logger.debug({ entryId, cameraId }, 'backfill: odometer disabled for camera — skipping distance replay');
+    result.distanceSkipped += 1;
+    return;
+  }
+
+  // Build the Frigate clip URL for this event's time span.
+  // Use the same endpoint convention as extractClip in frigate.ts:
+  //   /api/<cam>/start/<startSec>/end/<endSec>/clip.mp4
+  const cameraName = camera.live_src ?? camera.name;
+  const startSec = Math.floor(startMs / 1000);
+  const endSec = Math.ceil(endMs / 1000);
+  const clipUrl = new URL(
+    `/api/${encodeURIComponent(cameraName)}/start/${startSec}/end/${endSec}/clip.mp4`,
+    cfg.FRIGATE_URL,
+  ).toString();
+
+  logger.info({ entryId, cameraId, clipUrl }, 'backfill: replaying wheel distance');
+
+  let metres: number | null = null;
+  try {
+    metres = await replayWheelDistance({
+      clipUrl,
+      diameterMm: camera.wheel_diameter_mm,
+      bandX: camera.wheel_band_x_pct,
+      bandW: camera.wheel_band_width_pct,
+      bandY: camera.wheel_band_y_pct,
+      bandH: camera.wheel_band_height_pct,
+      thresholdPct: camera.wheel_threshold_pct,
+    });
+  } catch (err) {
+    logger.warn({ entryId, err: err instanceof Error ? err.message : String(err) }, 'backfill: replayWheelDistance threw');
+    result.distanceSkipped += 1;
+    return;
+  }
+
+  if (metres === null) {
+    logger.warn({ entryId }, 'backfill: distance replay returned null — no frames or ffmpeg error');
+    result.distanceSkipped += 1;
+    return;
+  }
+
+  // Merge wheel_meters into the existing details blob (preserves backfill/frigate_event_id).
+  let detailsObj: Record<string, unknown> = {};
+  if (existingDetails !== null) {
+    try {
+      const parsed = JSON.parse(existingDetails) as unknown;
+      if (typeof parsed === 'object' && parsed !== null) {
+        detailsObj = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Malformed — start fresh (keeps the new wheel_meters at minimum).
+    }
+  }
+  detailsObj['wheel_meters'] = metres;
+  db.updateDiaryEntryDetails(entryId, detailsObj);
+
+  result.distanceReplayed += 1;
+  logger.info({ entryId, metres }, 'backfill: wheel_meters written');
+}
+
+// ---------------------------------------------------------------------------
 // CLI entrypoint (mirrors bootstrap.ts pattern exactly)
 // ---------------------------------------------------------------------------
 
 interface CliArgs {
-  days: number;
+  hours: number | undefined;
+  days: number | undefined;
   dryRun: boolean;
   help: boolean;
 }
@@ -445,16 +633,29 @@ function parseCli(argv: readonly string[]): CliArgs {
   const { values } = parseArgs({
     args: [...argv],
     options: {
-      days: { type: 'string', default: String(DEFAULT_DAYS) },
+      hours: { type: 'string' },
+      days: { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
     strict: true,
     allowPositionals: false,
   });
-  const daysRaw = Number.parseInt(values.days ?? String(DEFAULT_DAYS), 10);
-  const days = Number.isFinite(daysRaw) && daysRaw > 0 ? daysRaw : DEFAULT_DAYS;
+
+  let hours: number | undefined;
+  if (values.hours !== undefined) {
+    const raw = Number.parseInt(values.hours, 10);
+    hours = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HOURS;
+  }
+
+  let days: number | undefined;
+  if (values.days !== undefined) {
+    const raw = Number.parseInt(values.days, 10);
+    days = Number.isFinite(raw) && raw > 0 ? raw : undefined;
+  }
+
   return {
+    hours,
     days,
     dryRun: Boolean(values['dry-run']),
     help: Boolean(values.help),
@@ -463,16 +664,18 @@ function parseCli(argv: readonly string[]): CliArgs {
 
 function usage(): string {
   return [
-    'Usage: backfill [--days <n>] [--dry-run]',
+    'Usage: backfill [--hours <n>] [--days <n>] [--dry-run]',
     '  (prod: `node dist/backfill.js`; dev: `pnpm -C app/server tsx src/backfill.ts -- …`)',
     '',
     'Recovers diary entries dropped during the clock-skew window by re-processing',
-    'Frigate historical events within the recording retention period.',
+    'Frigate historical events. Also replays the wheel odometer state machine over',
+    'recorded footage to compute and store distance (wheel_meters) for wheel entries.',
     '',
     'FRIGATE_URL must be configured or the tool exits cleanly without writing anything.',
     '',
     'Options:',
-    `  --days <n>   Look-back window in days (default: ${DEFAULT_DAYS})`,
+    `  --hours <n>  Look-back window in hours (default: ${DEFAULT_HOURS}); takes precedence over --days`,
+    '  --days <n>   Look-back window in days (legacy; ignored when --hours is supplied)',
     '  --dry-run    Print what would be written without modifying the DB',
     '  -h, --help   Show this help',
   ].join('\n');
@@ -496,7 +699,10 @@ export async function runCli(argv: readonly string[]): Promise<number> {
   db.getDb();
 
   try {
-    const result = await runBackfill({ days: args.days, dryRun: args.dryRun });
+    const backfillOpts: BackfillOptions = { dryRun: args.dryRun };
+    if (args.hours !== undefined) backfillOpts.hours = args.hours;
+    if (args.days !== undefined) backfillOpts.days = args.days;
+    const result = await runBackfill(backfillOpts);
     const tag = args.dryRun ? '[DRY RUN] ' : '';
     process.stdout.write(
       `${tag}backfill complete:\n` +
@@ -505,7 +711,9 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       `  skipped (no dur):     ${result.skippedNoDuration}\n` +
       `  skipped (dwell):      ${result.skippedBelowDwell}\n` +
       `  entries written:      ${result.written}\n` +
-      `  thumbnails queued:    ${result.thumbnailsQueued}\n`,
+      `  thumbnails queued:    ${result.thumbnailsQueued}\n` +
+      `  distance replayed:    ${result.distanceReplayed}\n` +
+      `  distance skipped:     ${result.distanceSkipped}\n`,
     );
     return 0;
   } catch (err) {

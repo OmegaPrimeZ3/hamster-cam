@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // NOTE: DEDUPE_SLOP_MS and isDuplicate are pure functions with no side-effects;
 // they do not need vi.resetModules() isolation. We import them once statically.
-import { DEDUPE_SLOP_MS, isDuplicate } from '../src/backfill.js';
+import { DEFAULT_HOURS, DEDUPE_SLOP_MS, isDuplicate } from '../src/backfill.js';
 
 let workdir: string;
 const baseEnv = { ...process.env };
@@ -377,6 +377,423 @@ describe('runBackfill', () => {
       expect(entries.some((e) => e.activity === 'water')).toBe(true);
     } finally {
       restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Default window / --hours arg tests
+// ---------------------------------------------------------------------------
+
+describe('runBackfill default 12-hour window', () => {
+  it('DEFAULT_HOURS constant is 12', () => {
+    expect(DEFAULT_HOURS).toBe(12);
+  });
+
+  it('uses 12-hour window when neither hours nor days is supplied', async () => {
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+    const { runBackfill } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    // Set nowMs to a known value. Event is 11 hours ago — inside 12h window.
+    const nowMs = 1_700_000_000_000;
+    const elevenHoursAgoMs = nowMs - 11 * 60 * 60 * 1000;
+    const evt = {
+      id: 'w1',
+      camera: 'hamster_cam_1',
+      label: 'hamster',
+      start_time: elevenHoursAgoMs / 1000 - 120,
+      end_time: elevenHoursAgoMs / 1000,
+      has_snapshot: true,
+      zones: ['food'],
+    };
+
+    let capturedUrl = '';
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url: string | URL | Request) => {
+      capturedUrl = url.toString();
+      return new Response(JSON.stringify([evt]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    try {
+      db.createCamera({
+        name: 'Cam 1',
+        emoji: '📷',
+        stream_url: 'rtsp://x/1',
+        live_src: 'hamster_cam_1',
+        enabled: true,
+      });
+      await runBackfill({ nowMs, minDwellMs: 1, rng: () => 0 });
+
+      // The 'after' param in the URL should be approximately nowMs - 12h.
+      const parsedUrl = new URL(capturedUrl);
+      const afterParam = Number(parsedUrl.searchParams.get('after'));
+      const expectedAfter = Math.floor((nowMs - 12 * 60 * 60 * 1000) / 1000);
+      expect(afterParam).toBe(expectedAfter);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('hours option overrides days option', async () => {
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+    const { runBackfill } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    const nowMs = 1_700_000_000_000;
+    let capturedUrl = '';
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url: string | URL | Request) => {
+      capturedUrl = url.toString();
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    try {
+      // hours=6 with days=3 — hours should win → window = 6h.
+      await runBackfill({ nowMs, hours: 6, days: 3 });
+
+      const parsedUrl = new URL(capturedUrl);
+      const afterParam = Number(parsedUrl.searchParams.get('after'));
+      const expectedAfter = Math.floor((nowMs - 6 * 60 * 60 * 1000) / 1000);
+      expect(afterParam).toBe(expectedAfter);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('runCli defaults to 12h window (no args)', async () => {
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+    const { runCli } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    let capturedUrl = '';
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url: string | URL | Request) => {
+      capturedUrl = url.toString();
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const stdoutChunks: string[] = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk: string | Uint8Array) => {
+      stdoutChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+      return true;
+    };
+
+    try {
+      const code = await runCli([]);
+      expect(code).toBe(0);
+
+      const parsedUrl = new URL(capturedUrl);
+      const afterParam = Number(parsedUrl.searchParams.get('after'));
+      const nowApprox = Date.now();
+      const expectedWindowMs = 12 * 60 * 60 * 1000;
+      // Allow ±5s for test timing slop.
+      expect(afterParam).toBeGreaterThan(Math.floor((nowApprox - expectedWindowMs) / 1000) - 5);
+      expect(afterParam).toBeLessThan(Math.floor((nowApprox - expectedWindowMs) / 1000) + 5);
+    } finally {
+      globalThis.fetch = original;
+      process.stdout.write = origWrite;
+    }
+  });
+
+  it('runCli --hours 3 sets a 3-hour window', async () => {
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+    const { runCli } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    let capturedUrl = '';
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url: string | URL | Request) => {
+      capturedUrl = url.toString();
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = () => true;
+
+    try {
+      const code = await runCli(['--hours', '3']);
+      expect(code).toBe(0);
+
+      const parsedUrl = new URL(capturedUrl);
+      const afterParam = Number(parsedUrl.searchParams.get('after'));
+      const nowApprox = Date.now();
+      expect(afterParam).toBeGreaterThan(Math.floor((nowApprox - 3 * 60 * 60 * 1000) / 1000) - 5);
+      expect(afterParam).toBeLessThan(Math.floor((nowApprox - 3 * 60 * 60 * 1000) / 1000) + 5);
+    } finally {
+      globalThis.fetch = original;
+      process.stdout.write = origWrite;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wheel distance replay via RotationCounter (pure state-machine path)
+// ---------------------------------------------------------------------------
+
+describe('wheel distance backfill — RotationCounter state machine', () => {
+  // These tests exercise the pure RotationCounter directly — no ffmpeg, no DB,
+  // no mocking of child_process. They verify the rotation-count → metres math
+  // that replayWheelDistance uses (same RotationCounter class).
+
+  it('synthetic LIGHT/DARK sequence → correct rotation count and metres', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const LIGHT = 0.0;
+    const DARK = 1.0;
+    const counter = new RotationCounter(50);
+
+    // 3 rotations: each is 3 light + 3 dark + 3 light (rising edge = 1 rotation).
+    for (let r = 0; r < 3; r += 1) {
+      for (let i = 0; i < 3; i += 1) counter.feed(LIGHT);
+      for (let i = 0; i < 3; i += 1) counter.feed(DARK);
+      for (let i = 0; i < 3; i += 1) counter.feed(LIGHT);
+    }
+
+    expect(counter.getRotations()).toBe(3);
+    // metres = 3 × π × 152 / 1000
+    const diameterMm = 152.0;
+    const metres = counter.getRotations() * Math.PI * diameterMm / 1000;
+    expect(metres).toBeCloseTo(3 * Math.PI * 152 / 1000, 4);
+  });
+
+  it('zero rotations when frames never go dark', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const counter = new RotationCounter(50);
+    for (let i = 0; i < 20; i += 1) counter.feed(0.0);
+    expect(counter.getRotations()).toBe(0);
+    const metres = counter.getRotations() * Math.PI * 152 / 1000;
+    expect(metres).toBe(0);
+  });
+
+  it('debounce prevents counting a 2-frame blip as a rotation', async () => {
+    const { RotationCounter } = await import('../src/wheel-odometer.js');
+    const counter = new RotationCounter(50);
+    // Establish light.
+    for (let i = 0; i < 3; i += 1) counter.feed(0.0);
+    // 2-frame dark blip (below DEBOUNCE_FRAMES=3).
+    counter.feed(1.0);
+    counter.feed(1.0);
+    // Back to light — no rotation should be counted.
+    for (let i = 0; i < 3; i += 1) counter.feed(0.0);
+    expect(counter.getRotations()).toBe(0);
+  });
+
+  it('distance backfill writes wheel_meters onto an existing wheel entry', async () => {
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+
+    // We need to mock replayWheelDistance so no real ffmpeg is called.
+    vi.doMock('../src/wheel-odometer.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../src/wheel-odometer.js')>();
+      return {
+        ...actual,
+        replayWheelDistance: async () => 1.234,
+      };
+    });
+
+    const { runBackfill } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    // Create a camera with the odometer enabled.
+    const cam = db.createCamera({
+      name: 'Cam 1',
+      emoji: '📷',
+      stream_url: 'rtsp://x/1',
+      live_src: 'hamster_cam_1',
+      enabled: true,
+      wheel_mark_enabled: true,
+      wheel_diameter_mm: 152.0,
+      wheel_band_x_pct: 0,
+      wheel_band_width_pct: 100,
+      wheel_band_y_pct: 50,
+      wheel_band_height_pct: 10,
+      wheel_threshold_pct: 50,
+    });
+    expect(cam).toBeDefined();
+
+    const nowMs = Date.now();
+    const evt = {
+      id: 'w-dist-1',
+      camera: 'hamster_cam_1',
+      label: 'hamster',
+      start_time: nowMs / 1000 - 120,
+      end_time: nowMs / 1000 - 5,
+      has_snapshot: true,
+      zones: ['wheel'],
+    };
+
+    const original = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([evt]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+    try {
+      const result = await runBackfill({ nowMs, hours: 1, rng: () => 0 });
+      expect(result.written).toBe(1);
+      expect(result.distanceReplayed).toBe(1);
+      expect(result.distanceSkipped).toBe(0);
+
+      const entries = db.listDiaryEntriesBetween(nowMs - 60 * 60 * 1000, nowMs + 1);
+      const wheelEntry = entries.find((e) => e.activity === 'wheel');
+      expect(wheelEntry).toBeDefined();
+      const details = JSON.parse(wheelEntry?.details ?? '{}') as Record<string, unknown>;
+      expect(details['wheel_meters']).toBeCloseTo(1.234, 3);
+    } finally {
+      globalThis.fetch = original;
+      vi.doUnmock('../src/wheel-odometer.js');
+    }
+  });
+
+  it('distance backfill skips when camera has wheel_mark_enabled=false', async () => {
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+
+    vi.doMock('../src/wheel-odometer.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../src/wheel-odometer.js')>();
+      return {
+        ...actual,
+        replayWheelDistance: async () => 9999, // Should never be reached.
+      };
+    });
+
+    const { runBackfill } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    // Odometer disabled.
+    db.createCamera({
+      name: 'Cam 1',
+      emoji: '📷',
+      stream_url: 'rtsp://x/1',
+      live_src: 'hamster_cam_1',
+      enabled: true,
+      wheel_mark_enabled: false,
+    });
+
+    const nowMs = Date.now();
+    const evt = {
+      id: 'w-skip-1',
+      camera: 'hamster_cam_1',
+      label: 'hamster',
+      start_time: nowMs / 1000 - 120,
+      end_time: nowMs / 1000 - 5,
+      has_snapshot: true,
+      zones: ['wheel'],
+    };
+
+    const original = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([evt]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+    try {
+      const result = await runBackfill({ nowMs, hours: 1, rng: () => 0 });
+      expect(result.written).toBe(1);
+      expect(result.distanceReplayed).toBe(0);
+      expect(result.distanceSkipped).toBe(1);
+
+      // wheel_meters should NOT be in the details.
+      const entries = db.listDiaryEntriesBetween(nowMs - 60 * 60 * 1000, nowMs + 1);
+      const wheelEntry = entries.find((e) => e.activity === 'wheel');
+      expect(wheelEntry).toBeDefined();
+      const details = JSON.parse(wheelEntry?.details ?? '{}') as Record<string, unknown>;
+      expect(details['wheel_meters']).toBeUndefined();
+    } finally {
+      globalThis.fetch = original;
+      vi.doUnmock('../src/wheel-odometer.js');
+    }
+  });
+
+  it('distance backfill is idempotent — does not clobber existing wheel_meters on second run', async () => {
+    process.env['FRIGATE_URL'] = 'http://localhost:5000';
+
+    let replayCallCount = 0;
+    vi.doMock('../src/wheel-odometer.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../src/wheel-odometer.js')>();
+      return {
+        ...actual,
+        replayWheelDistance: async () => {
+          replayCallCount += 1;
+          return 2.0;
+        },
+      };
+    });
+
+    const { runBackfill } = await import('../src/backfill.js');
+    const db = await import('../src/db.js');
+    db.getDb();
+
+    db.createCamera({
+      name: 'Cam 1',
+      emoji: '📷',
+      stream_url: 'rtsp://x/1',
+      live_src: 'hamster_cam_1',
+      enabled: true,
+      wheel_mark_enabled: true,
+      wheel_diameter_mm: 152.0,
+      wheel_band_x_pct: 0,
+      wheel_band_width_pct: 100,
+      wheel_band_y_pct: 50,
+      wheel_band_height_pct: 10,
+      wheel_threshold_pct: 50,
+    });
+
+    const nowMs = Date.now();
+    const evt = {
+      id: 'w-idem-1',
+      camera: 'hamster_cam_1',
+      label: 'hamster',
+      start_time: nowMs / 1000 - 120,
+      end_time: nowMs / 1000 - 5,
+      has_snapshot: true,
+      zones: ['wheel'],
+    };
+
+    const original = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify([evt]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+    try {
+      // First run: writes entry + distance.
+      const r1 = await runBackfill({ nowMs, hours: 1, rng: () => 0 });
+      expect(r1.written).toBe(1);
+      expect(r1.distanceReplayed).toBe(1);
+      expect(replayCallCount).toBe(1);
+
+      // Second run: entry is duplicate (skipped), and wheel_meters already set.
+      const r2 = await runBackfill({ nowMs, hours: 1, rng: () => 0 });
+      expect(r2.written).toBe(0);
+      expect(r2.skippedDuplicate).toBe(1);
+      expect(r2.distanceReplayed).toBe(0);
+      expect(r2.distanceSkipped).toBe(1);
+      // replayWheelDistance must not have been called a second time.
+      expect(replayCallCount).toBe(1);
+    } finally {
+      globalThis.fetch = original;
+      vi.doUnmock('../src/wheel-odometer.js');
     }
   });
 });

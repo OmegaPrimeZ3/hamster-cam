@@ -272,6 +272,7 @@ interface Statements {
   diaryClearMediaOlderThan: Database.Statement;
   diaryUpdateThumbnailPath: Database.Statement;
   diaryUpdateClipPath: Database.Statement;
+  diaryUpdateDetails: Database.Statement;
   diaryMissingThumbnail: Database.Statement;
   // badges
   badgeInsertDaily: Database.Statement;
@@ -529,6 +530,9 @@ function statements(): Statements {
     ),
     diaryUpdateClipPath: db.prepare(
       'UPDATE diary_entries SET clip_path = @clip_path WHERE id = @id',
+    ),
+    diaryUpdateDetails: db.prepare(
+      'UPDATE diary_entries SET details = @details WHERE id = @id',
     ),
     // Backfill query: entries that lack a thumbnail, have a resolvable camera,
     // and fall within the Frigate recording retention window (passed as a
@@ -1305,6 +1309,14 @@ export function updateDiaryEntryThumbnailPath(id: number, relPath: string): void
 /** Persist a cached clip path onto an existing diary entry row. */
 export function updateDiaryEntryClipPath(id: number, relPath: string): void {
   statements().diaryUpdateClipPath.run({ id, clip_path: relPath });
+}
+
+/**
+ * Overwrite the details JSON blob on an existing diary entry.
+ * Used by the backfill tool to attach wheel_meters after-the-fact.
+ */
+export function updateDiaryEntryDetails(id: number, details: Record<string, unknown>): void {
+  statements().diaryUpdateDetails.run({ id, details: JSON.stringify(details) });
 }
 
 /**
