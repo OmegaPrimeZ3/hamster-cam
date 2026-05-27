@@ -11,9 +11,18 @@
 // Date key: nightStart's local date (the evening the night began), so the
 // night of May 25 21:00 → May 26 06:00 is labelled "2026-05-25".
 //
+// IMPORTANT — TIMEZONE: "local" means the process timezone (process.env.TZ or
+// the system default). On Linux servers with no TZ set, this is UTC — meaning
+// nightEnd = 06:00 UTC, nightStart = 21:00 UTC the previous evening. Make sure
+// the systemd unit sets TZ= to match the operator's timezone (e.g. TZ=America/New_York)
+// so the window aligns with the hamster's actual overnight activity.
+//
 // Safety gate: if GEMINI_API_KEY is unset the job logs and returns without
 // throwing. Network errors are also swallowed — the narrator path must
 // never be disrupted by an optional AI feature.
+//
+// MODEL NOTE: Default is gemini-2.5-flash (stable). Do NOT configure
+// gemini-2.0-flash — it is deprecated and returns 400 INVALID_ARGUMENT.
 
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
@@ -102,6 +111,20 @@ export async function runRecapJob(
   // Log diagnostic info at every run so operators can see exactly what the
   // job found — critical for debugging "recap not appearing" without needing
   // to manually query the DB.
+  //
+  // Also warn if TZ is not set — the window math uses local time, so on a
+  // server with no TZ configured (defaulting to UTC) the window will be
+  // wrong for operators in non-UTC timezones.
+  if (!process.env['TZ']) {
+    logger.warn(
+      { job: 'recap' },
+      'overnight recap: TZ env var is not set — window uses UTC. ' +
+        'Set TZ=<your/timezone> in the systemd EnvironmentFile to align ' +
+        'the overnight window with actual local midnight.',
+    );
+  }
+
+  const geminiModel = cfg.GEMINI_MODEL ?? 'gemini-2.5-flash';
   logger.info(
     {
       job: 'recap',
@@ -111,7 +134,8 @@ export async function runRecapJob(
       all_entries_in_window: allEntries.length,
       source_entries: sourceEntries.length,
       min_required: MIN_SOURCE_ENTRIES,
-      model: cfg.GEMINI_MODEL ?? 'gemini-2.0-flash',
+      model: geminiModel,
+      tz: process.env['TZ'] ?? '(system default)',
     },
     'overnight recap: job running',
   );
@@ -128,15 +152,13 @@ export async function runRecapJob(
   const bulletList = buildBulletList(sourceEntries);
   const prompt = buildPrompt(petName, bulletList);
 
-  const geminiModel = cfg.GEMINI_MODEL ?? 'gemini-2.0-flash';
   let recapText: string;
   try {
     recapText = await callGemini(cfg.GEMINI_API_KEY, geminiModel, prompt, fetchFn);
   } catch (err) {
     // Log at ERROR level (not warn) so this surfaces clearly in production.
-    // GeminiApiError carries HTTP status + body — critical for diagnosing
-    // 400 (bad model name), 403 (quota/invalid key), 429 (rate limit), etc.
     if (err instanceof GeminiApiError) {
+      // HTTP error: 400 = bad model name, 403 = quota/key issue, 429 = rate limit.
       logger.error(
         {
           job: 'recap',
@@ -144,8 +166,25 @@ export async function runRecapJob(
           model: geminiModel,
           http_status: err.httpStatus,
           response_body: err.responseBody.slice(0, 500),
+          hint: err.httpStatus === 400
+            ? 'Check GEMINI_MODEL — gemini-2.0-flash is deprecated; use gemini-2.5-flash'
+            : err.httpStatus === 403
+              ? 'Check GEMINI_API_KEY validity and quota'
+              : undefined,
         },
-        'overnight recap: Gemini API call failed — check GEMINI_API_KEY and GEMINI_MODEL',
+        'overnight recap: Gemini API HTTP error — check GEMINI_API_KEY and GEMINI_MODEL',
+      );
+    } else if (err instanceof GeminiSafetyError) {
+      // Safety block: prompt triggered Gemini's content filters.
+      logger.error(
+        {
+          job: 'recap',
+          night: isoDate,
+          model: geminiModel,
+          finish_reason: err.finishReason,
+          block_reason: err.blockReason,
+        },
+        'overnight recap: Gemini blocked response (safety/policy filter)',
       );
     } else {
       logger.error(
@@ -174,7 +213,7 @@ export async function runRecapJob(
     snapshot_id: null,
     media_path: null,
     details: JSON.stringify({ source_entry_count: sourceEntries.length }),
-    ai_model: cfg.GEMINI_MODEL ?? 'gemini-2.0-flash',
+    ai_model: geminiModel,
   });
 
   logger.info(
@@ -221,9 +260,31 @@ async function callGemini(
   }
 
   const json = await res.json() as GeminiResponse;
-  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+  // Detect safety-blocked responses: candidates present but content is absent,
+  // or finishReason is 'SAFETY'. This happens when the prompt triggers Gemini's
+  // safety filters — the response is 200 OK but useless.
+  const firstCandidate = json?.candidates?.[0];
+  if (firstCandidate !== undefined) {
+    const finishReason = firstCandidate.finishReason;
+    if (finishReason === 'SAFETY' || finishReason === 'RECITATION' || finishReason === 'OTHER') {
+      const blocked = json.promptFeedback?.blockReason;
+      throw new GeminiSafetyError(
+        `Gemini response blocked (finishReason=${finishReason}${blocked ? `, blockReason=${blocked}` : ''})`,
+        finishReason,
+        blocked ?? null,
+      );
+    }
+  }
+
+  // Check for empty or missing candidates array.
+  if (!Array.isArray(json?.candidates) || json.candidates.length === 0) {
+    throw new Error('Gemini returned no candidates in response');
+  }
+
+  const text = firstCandidate?.content?.parts?.[0]?.text;
   if (typeof text !== 'string' || text.trim().length === 0) {
-    throw new Error('Gemini returned empty or unexpected response shape');
+    throw new Error('Gemini candidate has no usable text in parts');
   }
   return text.trim();
 }
@@ -233,7 +294,29 @@ interface GeminiResponse {
     content?: {
       parts?: Array<{ text?: string }>;
     };
+    /** Why the candidate generation stopped. 'STOP' is normal. */
+    finishReason?: string;
   }>;
+  /** Present when the entire request is blocked before generation. */
+  promptFeedback?: {
+    blockReason?: string;
+  };
+}
+
+/**
+ * Thrown by callGemini when Gemini blocks the response for safety / policy
+ * reasons (finishReason SAFETY/RECITATION/OTHER). Distinct from GeminiApiError
+ * (HTTP error) so callers can log more useful diagnostics.
+ */
+class GeminiSafetyError extends Error {
+  constructor(
+    message: string,
+    readonly finishReason: string,
+    readonly blockReason: string | null,
+  ) {
+    super(message);
+    this.name = 'GeminiSafetyError';
+  }
 }
 
 function buildBulletList(entries: db.DiaryEntryRow[]): string {

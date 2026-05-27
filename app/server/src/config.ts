@@ -41,8 +41,12 @@ const envSchema = z.object({
   MQTT_PASSWORD: z.string().optional(),
   FRIGATE_URL: z.string().url().optional(),
   // Gemini recap job — both optional; job skips cleanly if key is unset.
+  // Default model: gemini-2.5-flash (stable as of 2026-05). Do NOT use
+  // gemini-2.0-flash — it is deprecated and will be shut down; calls return
+  // a 400 INVALID_ARGUMENT. If you have a previously configured GEMINI_MODEL
+  // pointing at a deprecated ID, update it to "gemini-2.5-flash".
   GEMINI_API_KEY: z.string().optional(),
-  GEMINI_MODEL: z.string().optional().default('gemini-2.0-flash'),
+  GEMINI_MODEL: z.string().optional().default('gemini-2.5-flash'),
   NODE_ENV: z
     .enum(['development', 'production', 'test'])
     .optional()

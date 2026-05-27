@@ -94,9 +94,54 @@ function makeSuccessFetch(text: string): typeof globalThis.fetch {
   };
 }
 
-function makeErrorFetch(status: number): typeof globalThis.fetch {
+function makeErrorFetch(status: number, body = ''): typeof globalThis.fetch {
   return async () => {
-    return { ok: false, status, json: async () => ({}) } as Response;
+    return {
+      ok: false,
+      status,
+      text: async () => body,
+      json: async () => ({}),
+    } as Response;
+  };
+}
+
+/**
+ * Simulates a 200 OK response from Gemini where the candidate is present but
+ * content is absent (safety block). finishReason indicates the block type.
+ */
+function makeSafetyBlockFetch(finishReason = 'SAFETY'): typeof globalThis.fetch {
+  return async () => {
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{ finishReason }],
+        promptFeedback: { blockReason: 'SAFETY' },
+      }),
+    } as Response;
+  };
+}
+
+/**
+ * Simulates a 200 OK response with an empty candidates array.
+ */
+function makeEmptyCandidatesFetch(): typeof globalThis.fetch {
+  return async () => {
+    return {
+      ok: true,
+      json: async () => ({ candidates: [] }),
+    } as Response;
+  };
+}
+
+/**
+ * Simulates a 200 OK response with no candidates key at all.
+ */
+function makeMissingCandidatesFetch(): typeof globalThis.fetch {
+  return async () => {
+    return {
+      ok: true,
+      json: async () => ({}),
+    } as Response;
   };
 }
 
@@ -181,7 +226,8 @@ describe('runRecapJob', () => {
     expect(entry!.kind).toBe('recap');
     expect(entry!.activity).toBe('recap');
     expect(entry!.narrative).toBe(mockText);
-    expect(entry!.ai_model).toBe('gemini-2.0-flash');
+    // Default model is now gemini-2.5-flash (gemini-2.0-flash is deprecated).
+    expect(entry!.ai_model).toBe('gemini-2.5-flash');
   });
 
   it('keys the result date to the night START (the evening)', async () => {
@@ -359,5 +405,156 @@ describe('runRecapJob', () => {
     // That is below MIN_SOURCE_ENTRIES (3), so the job must skip.
     const result = await runRecapJob(REF_DATE, { fetch: makeSuccessFetch('Should not be called') });
     expect(result.skipped).toBe('too_few_entries');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Response parsing: safety blocks and missing/empty candidates
+  // ---------------------------------------------------------------------------
+
+  it('handles a safety-blocked response (finishReason=SAFETY) without throwing', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    const result = await runRecapJob(REF_DATE, { fetch: makeSafetyBlockFetch('SAFETY') });
+    expect(result.skipped).toBe('api_error');
+    expect(result.diary_entry_id).toBeNull();
+  });
+
+  it('handles a RECITATION-blocked response without throwing', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    const result = await runRecapJob(REF_DATE, { fetch: makeSafetyBlockFetch('RECITATION') });
+    expect(result.skipped).toBe('api_error');
+    expect(result.diary_entry_id).toBeNull();
+  });
+
+  it('handles an empty candidates array without throwing', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    const result = await runRecapJob(REF_DATE, { fetch: makeEmptyCandidatesFetch() });
+    expect(result.skipped).toBe('api_error');
+    expect(result.diary_entry_id).toBeNull();
+  });
+
+  it('handles a missing candidates key without throwing', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    const result = await runRecapJob(REF_DATE, { fetch: makeMissingCandidatesFetch() });
+    expect(result.skipped).toBe('api_error');
+    expect(result.diary_entry_id).toBeNull();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Model default: ensure the default is the stable gemini-2.5-flash, not the
+  // deprecated gemini-2.0-flash which returns 400 INVALID_ARGUMENT.
+  // ---------------------------------------------------------------------------
+
+  it('uses gemini-2.5-flash as the default model (not the deprecated gemini-2.0-flash)', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    // Do NOT set GEMINI_MODEL — verify the default.
+    delete process.env['GEMINI_MODEL'];
+
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    let capturedUrl = '';
+    const capturingFetch: typeof globalThis.fetch = async (input) => {
+      capturedUrl = typeof input === 'string' ? input : (input as Request).url ?? '';
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: 'Peanut ran all night.' }] } }],
+        }),
+      } as Response;
+    };
+
+    const result = await runRecapJob(REF_DATE, { fetch: capturingFetch });
+    expect(result.skipped).toBe(false);
+    expect(capturedUrl).toContain('gemini-2.5-flash');
+    expect(capturedUrl).not.toContain('gemini-2.0-flash');
+  });
+
+  it('uses a custom GEMINI_MODEL when explicitly configured', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    process.env['GEMINI_MODEL'] = 'gemini-2.5-flash-lite';
+
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    let capturedUrl = '';
+    const capturingFetch: typeof globalThis.fetch = async (input) => {
+      capturedUrl = typeof input === 'string' ? input : (input as Request).url ?? '';
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: 'Peanut ran all night.' }] } }],
+        }),
+      } as Response;
+    };
+
+    await runRecapJob(REF_DATE, { fetch: capturingFetch });
+    expect(capturedUrl).toContain('gemini-2.5-flash-lite');
+  });
+
+  it('stores the configured model name in the ai_model column of the diary entry', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    process.env['GEMINI_MODEL'] = 'gemini-2.5-flash';
+
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    const result = await runRecapJob(REF_DATE, {
+      fetch: makeSuccessFetch('Peanut had a wonderful night.'),
+    });
+    expect(result.skipped).toBe(false);
+
+    const db = await import('../src/db.js');
+    const entry = db.getDiaryEntryById(result.diary_entry_id!);
+    expect(entry!.ai_model).toBe('gemini-2.5-flash');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Window: verify the midnight span is correct
+  // ---------------------------------------------------------------------------
+
+  it('correctly spans midnight: entry at 23:59 is inside the window', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    const db = await import('../src/db.js');
+    db.setSetting('pet_name', 'Peanut');
+
+    // Three entries: one right before midnight, one right after, one at 03:00.
+    const justBeforeMidnight = new Date('2026-05-20T23:59:00').getTime();
+    const justAfterMidnight  = new Date('2026-05-21T00:01:00').getTime();
+    const at0300             = new Date('2026-05-21T03:00:00').getTime();
+
+    for (const ts of [justBeforeMidnight, justAfterMidnight, at0300]) {
+      db.createDiaryEntry({
+        occurred_at: ts,
+        kind: 'narrative',
+        activity: 'wheel',
+        narrative: 'Running',
+        pet_name: 'Peanut',
+        camera_id: null,
+        from_camera_id: null,
+        to_camera_id: null,
+        duration_ms: 5_000,
+        snapshot_id: null,
+        media_path: null,
+        details: null,
+      });
+    }
+
+    // All 3 fall within [21:00 May-20, 06:00 May-21) — should produce a recap.
+    const result = await runRecapJob(REF_DATE, { fetch: makeSuccessFetch('All three!') });
+    expect(result.skipped).toBe(false);
+    expect(result.diary_entry_id).not.toBeNull();
   });
 });
