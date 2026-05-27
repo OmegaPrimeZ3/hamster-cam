@@ -6,15 +6,34 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// ---------------------------------------------------------------------------
+// Hoisted file-scope mock for wheel-odometer.
+//
+// vi.mock() is hoisted by Vitest before any imports, so it takes effect for
+// every dynamic import in this file regardless of parallel scheduling.
+// importOriginal preserves the real RotationCounter (used by pure state-machine
+// tests); only replayWheelDistance is replaced with a controllable spy.
+// ---------------------------------------------------------------------------
+vi.mock('../src/wheel-odometer.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/wheel-odometer.js')>();
+  return {
+    ...actual,
+    replayWheelDistance: vi.fn(),
+  };
+});
+
 // NOTE: DEDUPE_SLOP_MS and isDuplicate are pure functions with no side-effects;
 // they do not need vi.resetModules() isolation. We import them once statically.
 import { DEFAULT_HOURS, DEDUPE_SLOP_MS, isDuplicate } from '../src/backfill.js';
+import { replayWheelDistance } from '../src/wheel-odometer.js';
 
 let workdir: string;
 const baseEnv = { ...process.env };
 
 beforeEach(() => {
   vi.resetModules();
+  // Reset the hoisted replayWheelDistance spy so each test starts clean.
+  vi.mocked(replayWheelDistance).mockReset();
   workdir = mkdtempSync(join(tmpdir(), 'hamster-backfill-'));
   Object.assign(process.env, baseEnv);
   process.env['DATABASE_PATH'] = join(workdir, 'hamster.db');
@@ -637,14 +656,8 @@ describe('wheel distance backfill — RotationCounter state machine', () => {
   it('distance backfill writes wheel_meters onto an existing wheel entry', async () => {
     process.env['FRIGATE_URL'] = 'http://localhost:5000';
 
-    // We need to mock replayWheelDistance so no real ffmpeg is called.
-    vi.doMock('../src/wheel-odometer.js', async (importOriginal) => {
-      const actual = await importOriginal<typeof import('../src/wheel-odometer.js')>();
-      return {
-        ...actual,
-        replayWheelDistance: async () => 1.234,
-      };
-    });
+    // Hoisted mock (see top of file) — control per-test via vi.mocked().
+    vi.mocked(replayWheelDistance).mockResolvedValue(1.234);
 
     const { runBackfill } = await import('../src/backfill.js');
     const db = await import('../src/db.js');
@@ -698,20 +711,14 @@ describe('wheel distance backfill — RotationCounter state machine', () => {
       expect(details['wheel_meters']).toBeCloseTo(1.234, 3);
     } finally {
       globalThis.fetch = original;
-      vi.doUnmock('../src/wheel-odometer.js');
     }
   });
 
   it('distance backfill skips when camera has wheel_mark_enabled=false', async () => {
     process.env['FRIGATE_URL'] = 'http://localhost:5000';
 
-    vi.doMock('../src/wheel-odometer.js', async (importOriginal) => {
-      const actual = await importOriginal<typeof import('../src/wheel-odometer.js')>();
-      return {
-        ...actual,
-        replayWheelDistance: async () => 9999, // Should never be reached.
-      };
-    });
+    // Should never be reached — if it is, the returned value would corrupt results.
+    vi.mocked(replayWheelDistance).mockResolvedValue(9999);
 
     const { runBackfill } = await import('../src/backfill.js');
     const db = await import('../src/db.js');
@@ -759,24 +766,13 @@ describe('wheel distance backfill — RotationCounter state machine', () => {
       expect(details['wheel_meters']).toBeUndefined();
     } finally {
       globalThis.fetch = original;
-      vi.doUnmock('../src/wheel-odometer.js');
     }
   });
 
   it('distance backfill is idempotent — does not clobber existing wheel_meters on second run', async () => {
     process.env['FRIGATE_URL'] = 'http://localhost:5000';
 
-    let replayCallCount = 0;
-    vi.doMock('../src/wheel-odometer.js', async (importOriginal) => {
-      const actual = await importOriginal<typeof import('../src/wheel-odometer.js')>();
-      return {
-        ...actual,
-        replayWheelDistance: async () => {
-          replayCallCount += 1;
-          return 2.0;
-        },
-      };
-    });
+    vi.mocked(replayWheelDistance).mockResolvedValue(2.0);
 
     const { runBackfill } = await import('../src/backfill.js');
     const db = await import('../src/db.js');
@@ -820,7 +816,7 @@ describe('wheel distance backfill — RotationCounter state machine', () => {
       const r1 = await runBackfill({ nowMs, hours: 1, rng: () => 0 });
       expect(r1.written).toBe(1);
       expect(r1.distanceReplayed).toBe(1);
-      expect(replayCallCount).toBe(1);
+      expect(vi.mocked(replayWheelDistance).mock.calls.length).toBe(1);
 
       // Second run: entry is duplicate (skipped), and wheel_meters already set.
       const r2 = await runBackfill({ nowMs, hours: 1, rng: () => 0 });
@@ -829,10 +825,9 @@ describe('wheel distance backfill — RotationCounter state machine', () => {
       expect(r2.distanceReplayed).toBe(0);
       expect(r2.distanceSkipped).toBe(1);
       // replayWheelDistance must not have been called a second time.
-      expect(replayCallCount).toBe(1);
+      expect(vi.mocked(replayWheelDistance).mock.calls.length).toBe(1);
     } finally {
       globalThis.fetch = original;
-      vi.doUnmock('../src/wheel-odometer.js');
     }
   });
 });

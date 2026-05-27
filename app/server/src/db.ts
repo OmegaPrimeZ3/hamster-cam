@@ -203,9 +203,17 @@ export function getDb(dbPath?: string): Database.Database {
   return db;
 }
 
-/** Test helper — closes & forgets the cached handle. */
+/** Test helper — checkpoints WAL then closes & forgets the cached handle. */
 export function resetDbForTests(): void {
   if (cached) {
+    // Checkpoint the WAL before closing so macOS releases the WAL file
+    // immediately. Without this, rmSync in afterEach can hit ENOTEMPTY because
+    // the WAL file is still open at the OS level.
+    try {
+      cached.db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch {
+      // Non-fatal — close anyway.
+    }
     cached.db.close();
     cached = null;
   }
