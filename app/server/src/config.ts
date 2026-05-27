@@ -68,6 +68,11 @@ const envSchema = z.object({
   // "http://localhost:5173,http://localhost:5174"). Ignored when NODE_ENV is
   // not 'development'. Keep empty in production .env.
   DEV_ORIGINS: z.string().optional(),
+
+  // Absolute path to the CC0 background-music file mixed into recap videos.
+  // If unset or the file is absent the recap video is produced silently.
+  // See app/server/assets/MUSIC_NOTICE.md for the recommended track.
+  RECAP_MUSIC_PATH: z.string().optional(),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

@@ -451,6 +451,75 @@ async function defaultLookup(hostname: string): Promise<{ address: string; famil
 }
 
 // ---------------------------------------------------------------------------
+// fetchHamsterEvents — query Frigate's REST events API for a time window
+// ---------------------------------------------------------------------------
+
+/** One event from GET /api/events (subset we need for the recap job). */
+export interface FrigateDetectionEvent {
+  id: string;
+  camera: string;
+  label: string;
+  /** Unix seconds (float). */
+  start_time: number;
+  /** Unix seconds (float), or null when still in progress. */
+  end_time: number | null;
+  has_clip: boolean;
+  has_snapshot: boolean;
+  zones: string[];
+}
+
+/**
+ * Query Frigate's `/api/events` REST endpoint for detections between
+ * `afterSec` and `beforeSec` (both Unix seconds). Optionally filter by label
+ * (default: 'hamster'). Returns [] when FRIGATE_URL is unset, the request
+ * fails, or Frigate returns no events.
+ *
+ * This is the same endpoint the backfill tool uses; kept here so timelapse
+ * and other jobs have a shared, tested client.
+ */
+export async function fetchHamsterEvents(
+  afterSec: number,
+  beforeSec: number,
+  label = 'hamster',
+): Promise<FrigateDetectionEvent[]> {
+  const cfg = getConfig();
+  if (!cfg.FRIGATE_URL) return [];
+
+  const url = new URL('/api/events', cfg.FRIGATE_URL);
+  url.searchParams.set('limit', '1000');
+  url.searchParams.set('after', String(Math.floor(afterSec)));
+  url.searchParams.set('before', String(Math.ceil(beforeSec)));
+  url.searchParams.set('label', label);
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15_000);
+  try {
+    const res = await fetch(url.toString(), { signal: ctrl.signal });
+    if (!res.ok) return [];
+    const data = await res.json() as unknown;
+    if (!Array.isArray(data)) return [];
+    return data.filter(isValidDetectionEvent);
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isValidDetectionEvent(raw: unknown): raw is FrigateDetectionEvent {
+  if (typeof raw !== 'object' || raw === null) return false;
+  const r = raw as Record<string, unknown>;
+  return (
+    typeof r['id'] === 'string' &&
+    typeof r['camera'] === 'string' &&
+    typeof r['label'] === 'string' &&
+    typeof r['start_time'] === 'number' &&
+    (r['end_time'] === null || typeof r['end_time'] === 'number') &&
+    Array.isArray(r['zones'])
+  );
+}
+
+// ---------------------------------------------------------------------------
 // extractClip — ffmpeg-driven recording window grab
 // ---------------------------------------------------------------------------
 

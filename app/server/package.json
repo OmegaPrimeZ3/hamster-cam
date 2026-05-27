@@ -19,7 +19,8 @@
     }
   },
   "bin": {
-    "hamster": "dist/bootstrap.js"
+    "hamster": "dist/bootstrap.js",
+    "timelapse-regen": "dist/timelapse-regen.js"
   },
   "scripts": {
     "dev": "tsx watch src/dev.ts",
@@ -31,7 +32,8 @@
     "migrate": "tsx src/migrate.ts",
     "bootstrap-admin": "tsx src/bootstrap.ts",
     "diary-cleanup": "tsx src/diary-cleanup.ts",
-    "backfill": "tsx src/backfill.ts"
+    "backfill": "tsx src/backfill.ts",
+    "timelapse-regen": "tsx src/timelapse-regen.ts"
   },
   "dependencies": {
     "@fastify/cookie": "10.0.1",
