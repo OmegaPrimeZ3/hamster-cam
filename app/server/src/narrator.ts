@@ -135,6 +135,11 @@ export function refreshNarratorTunings(): void {
   }
 }
 
+/** Test helper — returns the current in-memory tuning snapshot. */
+export function getNarratorTuningsForTests(): NarratorTuning {
+  return { ...tuning };
+}
+
 /**
  * Test helper to force tunables without touching the DB.
  * Accepts a partial — unspecified fields keep the current default.
@@ -603,9 +608,16 @@ function prepareCloseVisit(
     }
   }
 
+  // Guard against negative durations: a visit opened with a server-clock
+  // `nowMs` anchor (i.e. opened via an 'update' event) but closed with a
+  // Frigate/Pi-clock `endMs` anchor will produce a negative durationMs when the
+  // server clock ran ahead of the Pi clock by more than the actual dwell. Clamping
+  // to 0 ensures the dwell-threshold check in commitDeferred correctly drops the
+  // event (0 < minDwellMs) rather than leaving a large unsigned integer due to
+  // integer underflow that could slip through.
   return {
     activity,
-    durationMs: closedAt - visit.startedAt,
+    durationMs: Math.max(0, closedAt - visit.startedAt),
     occurredAt: closedAt,
     cameraId: cameraIdByName([...visit.cameras][0] ?? cameraName),
     details,

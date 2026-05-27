@@ -36,7 +36,7 @@ import * as db from './db.js';
 import { resolveSession } from './session.js';
 import * as frigate from './frigate.js';
 import { triggerForgotPassword, registerAccount, ZyphrEmailTaken } from './zyphr.js';
-import { saveManualSnapshot, getRecentEvents, getPetStatus } from './narrator.js';
+import { saveManualSnapshot, getRecentEvents, getPetStatus, refreshNarratorTunings } from './narrator.js';
 import { startShareJob } from './share.js';
 
 // ---------------------------------------------------------------------------
@@ -516,6 +516,8 @@ const settingsRouter = router({
         kv[key] = typeof value === 'boolean' ? String(value) : String(value);
       }
       db.setSettings(kv);
+      // Propagate narrator-tuning changes immediately — no restart required.
+      refreshNarratorTunings();
       return parseSettingsKV(db.getSettings());
     }),
 
