@@ -1,0 +1,42 @@
+# One-shot unit that ensures NTP is enabled and synchronized before
+# time-sensitive services start. Deploy to /etc/systemd/system/ on each Pi.
+#
+# Why a separate unit instead of relying on systemd-timesyncd alone?
+# systemd-timesyncd starts early but does not block the boot sequence — a
+# service that Orders=After=time-sync.target still starts before the first
+# NTP correction completes if the clock is badly skewed. This unit adds a
+# concrete "wait for synchronization" gate that go2rtc.service can depend on,
+# so the first frame timestamp is always within a second of real time.
+#
+#   sudo cp ntp-sync.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ntp-sync.service
+
+[Unit]
+Description=Ensure NTP synchronized before camera services start (hamster-cam)
+Documentation=https://github.com/aaroncoppock/hamster-cam
+# systemd-timesyncd must be running before we ask it to synchronize.
+After=systemd-timesyncd.service network-online.target
+Wants=systemd-timesyncd.service network-online.target
+# The standard target other services use to declare "I need synced time".
+Before=time-sync.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# 1. Unconditionally enable NTP (idempotent — safe to run on every boot).
+ExecStart=/usr/bin/timedatectl set-ntp true
+
+# 2. Wait (up to 30 s) for the first successful NTP sync.
+#    systemd-wait-sync is on Raspberry Pi OS Lite; if it is somehow absent,
+#    the leading `-` absorbs the failure so go2rtc still starts rather than
+#    blocking the entire boot.
+ExecStart=-/usr/lib/systemd/systemd-time-wait-sync
+
+# 3. Log the resulting clock state to the journal so every boot has a
+#    dated record of "did NTP succeed?".
+ExecStart=/usr/bin/timedatectl show --no-pager
+
+[Install]
+WantedBy=multi-user.target

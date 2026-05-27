@@ -1,8 +1,12 @@
 [Unit]
 Description=go2rtc — RTSP listener for the hamster-cam Pi Zero
 Documentation=https://github.com/AlexxIT/go2rtc https://github.com/aaroncoppock/hamster-cam
-After=network-online.target
-Wants=network-online.target
+# ntp-sync.service gates on a confirmed NTP synchronization so the first
+# frame timestamp is correct. Without this, a Pi that lost power for hours
+# starts go2rtc with a clock that is hours behind the Mac Mini, producing
+# negative zone-visit durations that the diary pipeline silently drops.
+After=network-online.target ntp-sync.service
+Wants=network-online.target ntp-sync.service
 
 [Service]
 Type=simple

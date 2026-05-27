@@ -71,6 +71,64 @@ sudo apt install -y v4l-utils ffmpeg curl iw
 - `iw` is needed to disable WiFi power-save (Step 7).
 
 
+## Step 3b - Configure NTP time synchronization
+
+**This step is load-bearing.** The Pi Zero 2 W has no hardware real-time
+clock. After a power cycle the clock starts at the epoch (or the last saved
+timestamp) and can be hours behind the Mac Mini. When the Mac Mini's
+zone-visit processor subtracts Pi event times from server times the result
+goes negative and diary entries are silently dropped. Correct time is not
+cosmetic.
+
+We use `systemd-timesyncd` — it is already on Raspberry Pi OS Lite (no
+install required), SNTP accuracy (~10–50 ms) is more than adequate for
+camera event timestamps, and it integrates with the same systemd paradigm
+as the rest of this stack.
+
+On the Pi (over SSH):
+
+```
+# 1. Install the drop-in NTP config (Cloudflare primary, NTP pool fallbacks,
+#    aggressive initial polling, SD-friendly save interval).
+sudo mkdir -p /etc/systemd/timesyncd.conf.d
+
+# From the dev machine — copy the drop-in, then on the Pi move it into place:
+# scp pi-zero/timesyncd.conf hamster@hamster-cam-1.local:/tmp/
+# ssh hamster@hamster-cam-1.local "sudo mv /tmp/timesyncd.conf /etc/systemd/timesyncd.conf.d/hamster-cam.conf && sudo chmod 644 /etc/systemd/timesyncd.conf.d/hamster-cam.conf"
+
+# 2. Enable NTP and restart timesyncd to pick up the new config.
+sudo timedatectl set-ntp true
+sudo systemctl restart systemd-timesyncd
+```
+
+Wait ~10 seconds, then verify:
+
+```
+timedatectl
+# Must show:
+#   NTP service: active
+#   System clock synchronized: yes
+
+# Also confirm the clock matches the server within a second or two:
+date -u   # compare with `date -u` on the Mac Mini — they should agree
+```
+
+The one-shot `ntp-sync.service` unit (deployed in Step 7 along with the
+go2rtc units) makes this gate explicit: go2rtc declares
+`After=ntp-sync.service` so it will not start until a confirmed NTP sync
+has completed. This means a Pi that boots into a degraded network (no NTP
+reachable) blocks go2rtc for up to 30 seconds rather than writing garbage
+timestamps. If NTP is completely unavailable the unit exits anyway (the
+`ExecStart=-` absorbs the failure) and go2rtc starts with whatever clock
+state exists — the behavior degrades gracefully rather than looping.
+
+The `SaveIntervalSec=600` key in the drop-in causes timesyncd to write the
+current time to `/var/lib/systemd/timesync/clock` every 10 minutes. On the
+next boot timesyncd reads this file and sets the clock to "last known good
+time" before touching the network, so even before NTP contacts the first
+server the timestamps are within minutes of reality rather than at epoch.
+
+
 ## Step 4 - Verify the USB camera and the hardware H264 encoder
 
 ```
@@ -203,10 +261,11 @@ The Mac Mini side reads the same password from
 
 ## Step 7 - Install the systemd service and watchdog
 
-The repo ships five files for the Pi:
+The repo ships seven files for the Pi:
 
 - `pi-zero/go2rtc.service` - systemd unit with Restart=always and
-  EnvironmentFile=/etc/go2rtc/go2rtc.env
+  EnvironmentFile=/etc/go2rtc/go2rtc.env. Declares `After=ntp-sync.service`
+  so it will not start before a confirmed NTP sync (see Step 3b).
 - `pi-zero/go2rtc-watchdog.sh` - probes the local go2rtc HTTP and
   RTSP ports; restarts the service on 3 consecutive failures and
   reboots the Pi on 10 consecutive failures
@@ -219,6 +278,14 @@ The repo ships five files for the Pi:
   adds latency/jitter and periodic stalls to a continuous stream. This
   is REQUIRED for a smooth live view — it was the decisive fix for the
   multi-camera lag. Needs `iw` (installed in Step 3).
+- `pi-zero/ntp-sync.service` - one-shot gate that calls
+  `timedatectl set-ntp true`, waits up to 30 s for the first sync, then
+  logs the result. go2rtc declares `After=` on this so timestamps are
+  always valid before the first frame is written.
+- `pi-zero/timesyncd.conf` - drop-in for `/etc/systemd/timesyncd.conf.d/`
+  that sets Cloudflare as the primary NTP server, configures aggressive
+  initial polling, and sets a 10-minute save interval (protects the SD
+  card while still keeping the "last known time" file fresh). See Step 3b.
 
 Install them from your dev machine:
 
@@ -228,6 +295,8 @@ scp pi-zero/go2rtc-watchdog.sh hamster@hamster-cam-1.local:/tmp/
 scp pi-zero/go2rtc-watchdog.service hamster@hamster-cam-1.local:/tmp/
 scp pi-zero/go2rtc-watchdog.timer hamster@hamster-cam-1.local:/tmp/
 scp pi-zero/wifi-powersave-off.service hamster@hamster-cam-1.local:/tmp/
+scp pi-zero/ntp-sync.service hamster@hamster-cam-1.local:/tmp/
+scp pi-zero/timesyncd.conf hamster@hamster-cam-1.local:/tmp/
 
 ssh hamster@hamster-cam-1.local '
   sudo mv /tmp/go2rtc.service /etc/systemd/system/
@@ -235,14 +304,27 @@ ssh hamster@hamster-cam-1.local '
   sudo mv /tmp/go2rtc-watchdog.service /etc/systemd/system/
   sudo mv /tmp/go2rtc-watchdog.timer /etc/systemd/system/
   sudo mv /tmp/wifi-powersave-off.service /etc/systemd/system/
+  sudo mv /tmp/ntp-sync.service /etc/systemd/system/
+  sudo mkdir -p /etc/systemd/timesyncd.conf.d
+  sudo mv /tmp/timesyncd.conf /etc/systemd/timesyncd.conf.d/hamster-cam.conf
   sudo chmod +x /usr/local/sbin/go2rtc-watchdog.sh
-  sudo chmod 644 /etc/systemd/system/go2rtc.service /etc/systemd/system/go2rtc-watchdog.service /etc/systemd/system/go2rtc-watchdog.timer /etc/systemd/system/wifi-powersave-off.service
+  sudo chmod 644 /etc/systemd/system/go2rtc.service \
+                 /etc/systemd/system/go2rtc-watchdog.service \
+                 /etc/systemd/system/go2rtc-watchdog.timer \
+                 /etc/systemd/system/wifi-powersave-off.service \
+                 /etc/systemd/system/ntp-sync.service \
+                 /etc/systemd/timesyncd.conf.d/hamster-cam.conf
 
   sudo systemctl daemon-reload
+  sudo timedatectl set-ntp true
+  sudo systemctl restart systemd-timesyncd
+  sudo systemctl enable --now ntp-sync.service
   sudo systemctl enable --now go2rtc
   sudo systemctl enable --now go2rtc-watchdog.timer
   sudo systemctl enable --now wifi-powersave-off.service
 
+  # Confirm NTP is active and clock is synchronized
+  timedatectl          # → "NTP service: active", "System clock synchronized: yes"
   # Confirm power-save is now off
   iw dev wlan0 get power_save   # → "Power save: off"
 '
@@ -326,6 +408,12 @@ Before moving on to Frigate configuration on the Mac Mini, confirm:
 - [ ] All three Pis are reachable via SSH at hamster-cam-{1,2,3}.local
 - [ ] Each Pi has a unique SSH host key (`ssh-keyscan -t ed25519
       hamster-cam-{1,2,3}.local` returns three different fingerprints)
+- [ ] NTP is active and clock is synchronized on each Pi:
+      `timedatectl` shows `NTP service: active` and
+      `System clock synchronized: yes`
+- [ ] The Pi's clock matches the server within 2 seconds:
+      `date -u` on the Pi vs `date -u` on the Mac Mini
+- [ ] `systemctl status ntp-sync.service` is "active (exited)" on each Pi
 - [ ] `systemctl status go2rtc` is "active (running)" on each Pi
 - [ ] `systemctl status go2rtc-watchdog.timer` is "active (waiting)"
       on each Pi
