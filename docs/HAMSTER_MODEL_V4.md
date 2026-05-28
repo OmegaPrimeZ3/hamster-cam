@@ -1,0 +1,443 @@
+# Hamster detector V4 — recall pass battle plan
+
+**Companion to:** [`HAMSTER_MODEL_PLAN.md`](./HAMSTER_MODEL_PLAN.md) (v1 build) and
+[`HAMSTER_MODEL_TUNING.md`](./HAMSTER_MODEL_TUNING.md) (the agent-executable
+runbook the v3 precision pass was built from). This doc is V4-specific — read
+the tuning runbook first if you're new to the pipeline.
+
+> Last updated: 2026-05-28 · Author: Aaron + Claude (planning session)
+> Status: **planning** — no execution yet, awaiting go-order for Phase 0.
+
+---
+
+## 1. Mission
+
+V3 is live and doing the job we built it for: **precision**. It stopped firing
+on the white bedding fluff and the wooden house (confirmed 0/200 FPs at conf
+0.50 on the negative eval; 2 days of clean production since 2026-05-26).
+
+The cost of that precision is recall — Frigate is still running at a
+conservative `threshold: 0.65`, well above the v3 model's natural operating
+point, and we don't yet know whether the live object masks are eating real
+Remy tracks. V4 is the **recall pass**: catch the tunnel pokes, the partially
+occluded sleepy curl-ups, and the quick wheel passes that V3 is currently
+missing, without giving back any of the precision V3 earned.
+
+**Acceptance:**
+
+- Cage-test mAP50 **≥ 0.85** AND strictly **> V3's score** on the same
+  held-out set.
+- **0/200 false fires** on the V3 negative eval at the live operating point
+  (conf ≥ 0.60).
+- Frigate threshold relaxed `0.65 → 0.60` (or 0.55 if precision holds at
+  conf 0.55 in eval).
+- Verified live across a full day/night cycle.
+
+---
+
+## 2. Current battlefield (verified 2026-05-28)
+
+### Live Frigate filter state (`mac-mini/frigate-config.yml`)
+
+| Setting | Live value | Notes |
+|---|---|---|
+| Global `objects.filters.hamster.min_score` | 0.55 | unchanged from v3 deploy |
+| Global `objects.filters.hamster.threshold` | **0.65** | Phase K **partially applied** — was 0.80 at v3 deploy, lowered since |
+| Per-camera `threshold` override | **removed** | both cams defer to global 0.65 |
+| Per-camera `min_score` override | 0.5 (cam1 + cam2) | set **below** global 0.55 — see open question §10.1 |
+| Object masks (cam1) | 3 polygons | cage edges + reflection-prone region |
+| Object masks (cam2) | 4 polygons | cage edges + hide-side region |
+| Zones (cam1) | wheel, food, water, tunnel | |
+| Zones (cam2) | bathroom, wheel | cam2 **physically cannot see** bed/hide — see [`project_camera_fov`](../) memory; do **not** add zones to cam2 it can't see |
+
+### Live model
+
+- `/opt/hamster-cam/models/hamster_y9.onnx` = **V3** (deployed 2026-05-26
+  ~20:47 UTC). Previous v1 backed up as `hamster_y9.prev.onnx`.
+- Compose bind: `./models:/config/model_cache` (NOT `storage/model_cache` —
+  the original runbook §10 had this wrong).
+- Repo: V1/V2/V3 ONNX + .pt all parked under `models/hamster/v{1,2,3}/`
+  (commit `c8472e5`, `.gitignore` exception in place).
+
+### What was wrong in my first-pass plan (preserved here for the historical record)
+
+- I read the live threshold as `0.80` — it's `0.65`. Phase K relax is
+  half-done.
+- I treated object masks as a footnote — they're 7 polygons covering real
+  estate, and the `scripts/mask-audit/` tool was built precisely to verify
+  they aren't eating tracks. **Mask audit is a hard gate, not a footnote.**
+- I flagged missing `bed`/`hide` zones on cam2 as a gap — they're correctly
+  absent (cam2 FoV doesn't cover those areas).
+
+---
+
+## 3. Pre-V4 inputs (data on hand)
+
+### Positives
+
+- **523 night cage positives** at `~/pet-models/hamster/local/cage_pos/` on
+  the dev Mac, harvested 2026-05-25.
+  - Auto-labeled with **v1** weights → labels contaminated by v1's
+    fluff/house false fires.
+  - **Must be re-auto-labeled with V3 weights and [HUMAN] reviewed** before
+    use.
+- **Daytime positives: not yet harvested.** Three full days of post-V3
+  production footage exist on the host.
+
+### Negatives
+
+- **200 cage negatives** at `~/pet-models/hamster/local/cage_neg/` —
+  reviewed, used in V3 training. Reused as-is in V4. V3 already enables them
+  in `pets/hamster.yaml` `local_sources:`.
+
+### Held-out test set
+
+- **Does not exist yet.** Gate J in the V3 plan was a vibe — V3 was deployed
+  on negative-eval + 200-frame precision check only. V4 will build the cage
+  test set (Phase 2) **before** training.
+
+---
+
+## 4. Phase 0 — pre-flight (no model work)
+
+**Owner: Claude + Aaron · Time: ~90 min · No model changes.**
+
+### 0.1 Mask audit (MANDATORY GATE) — `scripts/mask-audit/`
+
+The seven live mask polygons are doing real work. If any clip a real Remy
+travel path, V4's extra recall gets eaten by Frigate before it ever shows up
+as a detection — and we'd blame the wrong layer.
+
+- [ ] On dev Mac, run `./scripts/mask-audit/audit.sh 48` (48h window).
+- [ ] Open `scripts/mask-audit/out/index.html`.
+- [ ] Eyeball every **orange-bordered tile** (short duration + low score).
+      Cluster of orange along a red polygon edge → that mask is eating
+      tracks.
+- [ ] For any offending polygon: **shrink or delete it** (edit live config
+      via Frigate UI; it writes the file back). Re-run audit to confirm.
+- [ ] Commit `scripts/mask-audit/` to the repo — currently untracked.
+
+**Exit criterion:** zero polygons confirmed to eat real tracks, OR the
+offending polygons trimmed and re-verified.
+
+### 0.2 V3-at-live-settings baseline capture
+
+We need numbers V4 must beat. The numbers must be measured at the **current**
+operating point, not the old 0.80 one.
+
+- [ ] SSH `omegaprime@project-server`. Pull 48h of events:
+      `curl -s "http://127.0.0.1:5000/api/events?after=$(date -d '-48 hours' +%s)&cameras=hamster_cam_1,hamster_cam_2&has_snapshot=1&limit=2000"`.
+- [ ] Bucket events by `top_score`: counts in `[0.55, 0.65)`, `[0.65, 0.75)`,
+      `[0.75, 0.85)`, `[0.85, 1.0]` per camera per day.
+- [ ] Pull diary-entry counts per day from the SQLite DB (or app stats).
+- [ ] Pull `detectors.ov.inference_speed`, per-camera `detection_fps`, and
+      any model/onnx errors from `docker logs --tail=2000 hamster-frigate`.
+- [ ] Stash all of the above to `docs/v4_baseline.txt` (committed). This is
+      the **line in the sand**.
+
+### 0.3 Resolve the per-camera vs global `min_score` ambiguity
+
+Both global `min_score: 0.55` and per-cam `min_score: 0.5` exist. Frigate's
+behaviour here is the operating point we need to reproduce in eval.
+
+- [ ] Identify any live event with `0.50 ≤ top_score < 0.55`. If those
+      exist → per-cam wins, effective floor is 0.5. If not → global wins,
+      effective floor is 0.55.
+- [ ] Document the answer in §10.1.
+- [ ] **If per-cam is dead config**, decide whether to delete the per-cam
+      `min_score: 0.5` lines (preferred — eliminates ambiguity) or align
+      them to global. Folds into Phase 5 deploy diff.
+
+---
+
+## 5. Phase 1 — harvest (autonomous + [HUMAN] review)
+
+**Owner: Claude (auto) + Aaron (box review) · Time: ~90 min auto + 30–60 min
+HUMAN.**
+
+### 1.1 Pull daytime + recent night events
+
+Per `HAMSTER_MODEL_TUNING.md` §G.1 — but with **two changes vs V3**:
+
+- **Auto-label with V3 weights**, not v1. V3 doesn't fire on fluff/house, so
+  its pre-boxes are clean of those false fires.
+- **Tag mask-overlapping frames.** If the audit (0.1) recommended shrinking
+  any polygon, tag frames whose detection box falls inside the
+  (pre-shrink) polygon — these are training-data gold (real Remy frames
+  Frigate is currently discarding).
+
+```sh
+# On the host:
+mkdir -p /tmp/harvest/{day,night}
+AFTER_DAY=$(date -d '2026-05-26 07:00' +%s)
+AFTER_NIGHT=$(date -d '2026-05-26 22:00' +%s)
+for win in day night; do
+  case $win in
+    day)   A=$AFTER_DAY;;
+    night) A=$AFTER_NIGHT;;
+  esac
+  curl -s "http://127.0.0.1:5000/api/events?after=${A}&cameras=hamster_cam_1,hamster_cam_2&has_snapshot=1&limit=2000" \
+    | jq -r '.[].id' \
+    | while read id; do
+        curl -s "http://127.0.0.1:5000/api/events/${id}/snapshot.jpg?bbox=0&crop=0" \
+          -o "/tmp/harvest/${win}/${id}.jpg"
+      done
+done
+tar czf /tmp/harvest.tar.gz -C /tmp harvest
+```
+
+Then `scp` back to dev Mac under `~/pet-models/hamster/harvest/`.
+
+**Target counts:**
+
+- ~300–500 day positives (across cam1/cam2)
+- Augment the existing 523 night positives with new night data (event
+  recovery only — don't re-harvest the existing IDs)
+- Balanced cam1/cam2 ratio
+
+If short, **append-only** — let the cage record another day or two and
+re-pull. Don't train hungry.
+
+### 1.2 Auto-label with V3
+
+```sh
+yolo detect predict model=models/hamster/v3/best.pt \
+  source=~/pet-models/hamster/harvest/day imgsz=320 conf=0.25 save_txt=True \
+  project=~/pet-models/hamster/harvest name=autolabel_day
+# repeat for /harvest/night
+```
+
+For the existing 523-frame `cage_pos/` set, **re-run V3 auto-label** on top —
+don't trust the v1 labels still in that directory.
+
+### 1.3 [HUMAN] box review (the work that buys accuracy)
+
+- [ ] Push frames + V3 pre-labels to a free Roboflow project (or local
+      labelImg / Label Studio).
+- [ ] Tighten loose boxes, add the misses (sleeping/curled/partial Remy is
+      the high-value class), delete phantom boxes on reflections.
+- [ ] Budget 30–60 min. Skipping this step makes V4 a re-skin of V3.
+- [ ] Export reviewed as YOLOv8 to
+      `~/pet-models/hamster/local/cage_pos/{images,labels}` —
+      **overwrite** the contaminated v1 labels.
+
+---
+
+## 6. Phase 2 — held-out cage test set (mandatory)
+
+**Owner: Aaron · Time: ~15 min HUMAN.**
+
+You can't tune what you can't measure. V3 deployed without this; V4 will not.
+
+- [ ] From the §1 reviewed pool, set aside **80–120 frames** —
+      mix cam1/cam2, day/night, easy/occluded/sleeping — under
+      `~/pet-models/hamster/cage_test/{images,labels}`.
+- [ ] Write `cage_test.yaml` (`split: test`, paths absolute).
+- [ ] **These frames never touch train or val.** Move them out of
+      `cage_pos/` before §3 build runs, so the deterministic split can't
+      leak them.
+
+---
+
+## 7. Phase 3 — train V4
+
+**Owner: Claude (autonomous) · Time: ~30–60 min on MPS.**
+
+### 3.1 Config delta on `scripts/pet-model/pets/hamster.yaml`
+
+```yaml
+local_sources:
+  - path: ~/pet-models/hamster/local/cage_neg
+    role: negative
+  - path: ~/pet-models/hamster/local/cage_pos   # enable for V4 recall pass
+    role: positive
+
+local_oversample: 4    # was 2 — cage data is dwarfed by ~2700 public positives
+epochs: 200             # was 150
+patience: 60            # was 50
+
+# augment block unchanged from V3 (Phase I knobs already wired)
+# base_model: yolov9t.pt  — only bump to yolov9s if Phase J fails
+```
+
+### 3.2 Train
+
+```sh
+export ROBOFLOW_API_KEY=...   # verify .env has a valid 20-char private key
+./scripts/pet-model/run.sh scripts/pet-model/pets/hamster.yaml
+```
+
+### 3.3 Park artifacts
+
+- [ ] `mkdir -p models/hamster/v4`
+- [ ] Copy `best.pt`, `hamster_y9.onnx`, `hamster.txt` into it.
+- [ ] Commit (`.gitignore` exception already in place).
+
+---
+
+## 8. Phase 4 — Gate J (the only gate that matters)
+
+**Owner: Claude (autonomous) · Time: ~5 min.**
+
+### 4.1 Cage-test mAP50
+
+```sh
+yolo detect val model=models/hamster/v3/best.pt data=cage_test.yaml imgsz=320 split=test
+yolo detect val model=models/hamster/v4/best.pt data=cage_test.yaml imgsz=320 split=test
+```
+
+### 4.2 Negative eval
+
+Re-run the 200-frame negative eval (Phase H artifact) on V4 at conf 0.50,
+0.55, 0.60, 0.65.
+
+### 4.3 Decision
+
+V4 **ships only if all four hold**:
+
+- [ ] Cage-test mAP50 ≥ 0.85
+- [ ] Cage-test mAP50 strictly > V3's score on the same set
+- [ ] 0/200 FPs at the live operating point (whatever §10.1 resolved to)
+- [ ] Gate C (no embedded NMS, shape `[1,3,320,320]`) passes
+
+If any fail: **do not deploy.** Diagnose. Usually = need more cage data
+(append-only re-harvest), or oversample tweak, or backbone bump to
+yolov9s. Public mAP is not a tiebreaker.
+
+---
+
+## 9. Phase 5 — deploy + Phase K finalization
+
+**Owner: Claude (auto for SCP/edit/restart) + Aaron (sign-off) · Time:
+~15 min + 24h watch.**
+
+One restart, two changes, one rollback button.
+
+### 5.1 SCP V4 ONNX
+
+```sh
+scp models/hamster/v4/hamster_y9.onnx \
+  omegaprime@project-server:/opt/hamster-cam/models/hamster_y9_v4.onnx
+ssh omegaprime@project-server "ls -la /opt/hamster-cam/models/"
+```
+
+**Keep `hamster_y9_v3.onnx`** (current production, currently named just
+`hamster_y9.onnx`) untouched as the rollback target — rename it first:
+
+```sh
+ssh omegaprime@project-server \
+  "cd /opt/hamster-cam/models && cp hamster_y9.onnx hamster_y9_v3.onnx"
+```
+
+### 5.2 Edit live Frigate config
+
+Three coordinated edits (Frigate UI or scp):
+
+1. `model.path: /config/model_cache/hamster_y9_v4.onnx`
+2. `objects.filters.hamster.threshold: 0.65 → 0.60` (or 0.55 if Phase 4
+   showed V4 holds precision at conf 0.55).
+3. Resolve per-cam `min_score: 0.5` ambiguity from §10.1 (either delete the
+   per-cam line, or align to global).
+
+### 5.3 Restart + verify
+
+```sh
+ssh omegaprime@project-server "docker compose -f /opt/hamster-cam/docker-compose.yml restart frigate"
+ssh omegaprime@project-server "docker logs --tail=200 hamster-frigate | grep -iE 'model|onnx|error'"
+ssh omegaprime@project-server "curl -s http://127.0.0.1:5000/api/stats | jq '.detectors.ov, .cameras'"
+```
+
+Expect: clean model load, `inference_speed` ~10–25 ms, both cams
+`detection_fps > 0` on motion, no ONNX errors.
+
+### 5.4 [HUMAN] sign-off
+
+- [ ] Eyeball Frigate debug view across a full day/night cycle.
+- [ ] Watch the app diary — tunnel/wheel/partial Remy events should appear
+      that previously fell below the 0.65 threshold.
+- [ ] Compare event count and diary entries to §0.2 baseline.
+
+### 5.5 Rollback (if needed)
+
+```sh
+ssh omegaprime@project-server \
+  "cd /opt/hamster-cam/models && cp hamster_y9_v3.onnx hamster_y9.onnx"
+# revert frigate-config threshold to 0.65
+ssh omegaprime@project-server "docker compose -f /opt/hamster-cam/docker-compose.yml restart frigate"
+```
+
+Under 60 seconds.
+
+---
+
+## 10. Open questions / decisions log
+
+### 10.1 Per-camera vs global `min_score`
+
+Both `0.5` (per-cam) and `0.55` (global) exist in the live config.
+Pending §0.3.
+
+- [ ] Answer: _(fill in after 0.3)_
+- [ ] Action: _(delete per-cam line | align to global | leave as-is)_
+
+### 10.2 Backbone — yolov9t vs yolov9s
+
+V3 used `yolov9t.pt`. V4 will start there. If Phase 4 fails Gate J on
+recall, bump to `yolov9s.pt` and re-run §7. Re-verify
+`detectors.ov.inference_speed` stays under the 5 fps detect budget at 320.
+
+- [ ] Decision: _(yolov9t default; revisit only if Gate J fails)_
+
+### 10.3 Final threshold target
+
+- [ ] Conservative: 0.65 → 0.60 (small step, safer).
+- [ ] Aggressive: 0.65 → 0.55 (full Phase K — only if V4 is clean at conf
+      0.55 in negative eval).
+
+### 10.4 `tpicos-2-maurcio/hamster-and-guinea-pig` dataset
+
+Currently commented out of `pets/hamster.yaml`. The Phase J test set in V4
+gives us the measurement to decide. Defer to a hypothetical V5.
+
+---
+
+## 11. Hard no-gos (don't break these)
+
+- **Do not** train on the 523 night frames with their existing v1 labels —
+  re-label with V3 first.
+- **Do not** skip Phase 2 (held-out test set). "Better recognition" without
+  numbers is not a deliverable.
+- **Do not** bundle Phase K relax with V4 as a single change in §5.2 unless
+  you have ONE rollback button (current plan does — model + threshold flip
+  together, rollback restores both).
+- **Do not** delete `hamster_y9_v3.onnx` from the host. V3 is the insurance
+  policy.
+- **Do not** suggest adding zones to cam2 that it can't physically see (bed,
+  hide, food, water, tunnel). See [`project_camera_fov`](../) memory.
+
+---
+
+## 12. Human gates (everything else is autonomous)
+
+1. **[HUMAN]** §0.1 mask audit visual review.
+2. **[HUMAN]** §0.3 per-cam `min_score` empirical check (or delegate to
+   Claude with a clear "look at events with top_score in [0.50, 0.55)" ask).
+3. **[HUMAN]** Confirm `ROBOFLOW_API_KEY` in `.env` is still the 20-char
+   private key.
+4. **[HUMAN]** §1.3 box review of harvested cage frames — **the work that
+   actually buys accuracy**.
+5. **[HUMAN]** §5.4 live debug-view sign-off across a day/night cycle.
+
+---
+
+## 13. Definition of done
+
+A versioned `hamster_y9_v4.onnx` deployed at
+`/opt/hamster-cam/models/hamster_y9_v4.onnx`, with Frigate `threshold`
+relaxed from 0.65, that:
+
+- Beats V3 on a cage-held-out test set (mAP50 ≥ 0.85 AND > V3),
+- Holds 0/200 FPs on the negative eval at the new live threshold,
+- Survives 24h of live operation without an uptick in phantom diary
+  entries vs the §0.2 baseline,
+- Has a one-line rollback to V3.

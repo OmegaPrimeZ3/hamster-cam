@@ -1,0 +1,284 @@
+V4 BASELINE — captured 2026-05-28T18:46Z (PDT 11:46)
+Window: last 48h (after 2026-05-26T18:46Z)
+Host: omegaprime@project-server
+Container: hamster-frigate started 2026-05-27T04:15:50Z (~38h ago)
+
+=============================================================================
+  HEADLINE FINDING — read this first
+=============================================================================
+
+The "baseline" below is NOT a clean V3-at-live-settings line in the sand.
+The live stack is in a degraded state right now:
+
+  - hamster_cam_2 ffmpeg process is in a CRASH LOOP.
+    1059 crashes on 2026-05-27, 435 on 2026-05-28-so-far → roughly one
+    cam2 ffmpeg crash every 60-150 seconds, sustained.
+  - hamster_cam_1 has 822 crashes since current container start too,
+    rate lower but non-zero.
+  - `ping hamster-cam-2.local` from the host returns "Temporary failure
+    in name resolution" — mDNS to the cam2 Pi is broken from the host
+    right now (possible Pi offline / mDNS responder dead / host resolver
+    flake — needs an infra dig).
+  - Stats snapshot shows detection_fps=0.0 on BOTH cams at the moment
+    of capture. process_fps=5 is the raw stream, so detect threads are
+    just idle in this sampling window — but with the crash cadence on
+    cam2 it is plausibly a partial-outage too.
+  - The model itself looks fine: detectors.ov.inference_speed=14.38ms,
+    no model/onnx errors in 2000 lines of log. V3 ONNX is loading and
+    running cleanly. **The crash loop is not a model problem.**
+
+What this means for V4:
+  - These 48h numbers reflect V3 model + a degraded cam2 pipeline.
+    Diary entry counts (49/27/9 by day) and cam2's 313 events very
+    likely UNDERCOUNT what a healthy V3 would have produced — recall
+    is being eaten upstream of the model.
+  - V4 vs V3 A/B will be confounded if we deploy onto this stack.
+  - **Recommendation: fix the cam2 ffmpeg crash loop + mDNS resolution
+    first, let the stack stabilise for 24-48h, RE-RUN Phase 0.2 to
+    capture a clean baseline, THEN proceed to V4 Phases 1–5.**
+    This is an infra-engineer problem, not a model problem.
+
+=============================================================================
+  V3 OPERATING POINT (the model state V4 must beat)
+=============================================================================
+
+  Model:     /opt/hamster-cam/models/hamster_y9.onnx  (V3, deployed 2026-05-26)
+  Detector:  openvino on GPU (Intel UHD 630)
+  Type:      yolo-generic, 320x320, float NCHW, no embedded NMS
+  Inference: 14.38 ms (well under the 5fps detect budget)
+
+  Frigate filter floor (live config — mac-mini/frigate-config.yml):
+    Global  objects.filters.hamster.min_score: 0.55
+    Global  objects.filters.hamster.threshold: 0.65
+    Per-cam threshold: (removed, both cams defer to global 0.65)
+    Per-cam min_score: 0.5 on both cams (set BELOW global 0.55)
+
+  Object masks live on the cage:
+    hamster_cam_1: 3 polygons (cage edges / reflection regions)
+    hamster_cam_2: 4 polygons (cage edges / hide-side region)
+
+  Zones:
+    hamster_cam_1: wheel, food, water, tunnel
+    hamster_cam_2: bathroom, wheel
+      (cam2 FoV cannot see bed/hide/food/water/tunnel — by design)
+
+=============================================================================
+  PHASE 0.3 RESOLVED — per-camera vs global min_score
+=============================================================================
+
+  Empirical answer: ZERO events stored with top_score < 0.65 on either
+  camera over 48h. Global threshold 0.65 is the dominant event-level
+  gate. The per-camera `min_score: 0.5` line is DEAD CONFIG for
+  event-level filtering — it can only affect per-frame inference
+  filtering, which we cannot observe from event records.
+
+  Action (for Phase 5.2 V4 deploy diff):
+    - Delete the per-camera `min_score: 0.5` lines OR align them to
+      the global 0.55. Either kills the ambiguity. Recommend delete.
+    - Eval V4 at the actual operating point: threshold 0.65.
+
+=============================================================================
+  FRIGATE EVENT COUNTS — 48h, by camera, by top_score band
+=============================================================================
+
+  ## hamster_cam_1 — 156 events
+    has_clip: 156/156 (100.0%)
+    has_snapshot: 156/156 (100.0%)
+    duration_s: mean=77.4 median=6.5 p90=71.2 max=8101.6  (note the
+                long tail — stuck-event symptom; see notes below)
+    score bands (totals):
+      0.00-0.50: 0
+      0.50-0.55: 0
+      0.55-0.65: 0    ← threshold gate confirmed
+      0.65-0.75: 47
+      0.75-0.85: 64
+      0.85-1.00: 45
+    by day (PDT):
+      day          0.00-0.50  0.50-0.55  0.55-0.65  0.65-0.75  0.75-0.85  0.85-1.00
+      2026-05-26       0          0           0          22         25         23
+      2026-05-27       0          0           0          18         33         19
+      2026-05-28       0          0           0           7          6          3
+    zone hits (multi-zone events count once per zone):
+      tunnel: 20
+      wheel: 11
+      food: 8
+      water: 8
+
+  ## hamster_cam_2 — 313 events
+    has_clip: 313/313 (100.0%)
+    has_snapshot: 313/313 (100.0%)
+    duration_s: mean=37.0 median=10.4 p90=56.6 max=3109.8
+    score bands (totals):
+      0.00-0.50: 0
+      0.50-0.55: 0
+      0.55-0.65: 0    ← threshold gate confirmed
+      0.65-0.75: 128
+      0.75-0.85: 129
+      0.85-1.00: 56
+    by day (PDT):
+      day          0.00-0.50  0.50-0.55  0.55-0.65  0.65-0.75  0.75-0.85  0.85-1.00
+      2026-05-26       0          0           0          60         62         28
+      2026-05-27       0          0           0          50         47         26
+      2026-05-28       0          0           0          18         20          2
+    zone hits:
+      bathroom: 16
+      wheel: 4
+      (293 of cam2's 313 events fired outside any zone → exploring)
+
+  Notes:
+    - Cam2 produces ~2x the events of cam1, despite the crash loop —
+      consistent with cam2 covering the busier side of the cage.
+    - Long-tail durations (max 8101s on cam1, 3109s on cam2) =
+      classic "stuck on exploring" pattern from
+      [[project_diary_exploring_collapse]] — empty/missing zones +
+      120s coalescer = one growing entry.
+    - Cam2 zone coverage is 20/313 = 6.4% — by design (only 2 zones
+      in cam2's FoV) but means the narrative is overwhelmingly
+      "exploring" on cam2.
+
+=============================================================================
+  DIARY ENTRY COUNTS — 48h, from app DB (sqlite, /opt/hamster-cam/db/hamster.db)
+=============================================================================
+
+  TOTAL last 48h: 85 entries
+
+  by kind:
+    narrative: 81
+    timelapse: 2
+    recap: 2
+
+  by activity, by day (PDT):
+    day          activity   n
+    2026-05-26   exploring  17
+    2026-05-26   wheel      15
+    2026-05-26   bathroom    7
+    2026-05-26   water       5
+    2026-05-26   tunnel      4
+    2026-05-26   food        1
+    2026-05-27   exploring  13
+    2026-05-27   tunnel      7
+    2026-05-27   food        3
+    2026-05-27   wheel       1
+    2026-05-27   timelapse   1
+    2026-05-27   recap       1
+    2026-05-27   bathroom    1
+    2026-05-28   exploring   4
+    2026-05-28   food        2
+    2026-05-28   tunnel      1
+    2026-05-28   timelapse   1
+    2026-05-28   recap       1
+
+  by camera:
+    Camera 1:    46
+    Camera 2:    35
+    (NULL):       4   ← residual camera_id resolution misses
+                       (pre-fix-13c97b2 entries; deploy of fix pending)
+
+  Daily totals (narrative-only):
+    2026-05-26: 49
+    2026-05-27: 25 (-49%)
+    2026-05-28: 7  (partial day, ~12h elapsed at capture)
+
+  Concerns:
+    - The 49 → 25 → 7 drop is suspicious. Three plausible drivers:
+      (a) cam2 crash loop is eating real detections (likely contributor)
+      (b) Remy's actual activity dropped (always possible)
+      (c) something else infra-side (mDNS, network) intermittently
+          degrading detect on either cam
+      Can't disambiguate from this data alone.
+
+=============================================================================
+  CAM2 CRASH LOOP — quantified
+=============================================================================
+
+  Crashes per day (watchdog.hamster_cam_2 "Ffmpeg process crashed"):
+    2026-05-23:  376    ← log shows crashes pre-dating V3 deploy
+    2026-05-24:  589
+    2026-05-25:  638
+    2026-05-26:  765
+    2026-05-27: 1059   (~53/hr, one every ~68s)
+    2026-05-28:  435   (~23/hr-so-far, one every ~155s)
+
+  Crashes per day (watchdog.hamster_cam_1):
+    Total since current container start: 822
+    Lower rate, but non-zero — cam1 is also flaky.
+
+  Error sequences seen:
+    A) RTSP timeout to Pi:
+         "streams: dial tcp 192.168.1.202:8554: i/o timeout"
+         "method DESCRIBE failed: 404 Not Found" (go2rtc has no upstream)
+    B) Packet corruption / lost sync:
+         "RTP: PT=60: bad cseq <X> expected=<Y>"
+         "Non-monotonic DTS; previous: N, current: 0"
+    C) VAAPI decode failures (THIS SHOULDN'T BE HAPPENING per the
+       config comment "no hwaccel here on purpose"):
+         "[AVHWFramesContext] Failed to sync surface 0xN: 23 (internal
+          decoding error)"
+         "[hwdownload] Failed to download frame: -5"
+         "[vf#1:0] Error while filtering: Input/output error"
+    D) mDNS resolution:
+         `ping hamster-cam-2.local` from host returns "Temporary
+          failure in name resolution" at capture time
+
+  These are infra issues, NOT model issues. No model/onnx errors in
+  the log. V3 ONNX is fine.
+
+=============================================================================
+  WHAT V4 MUST BEAT (when re-baselined post-infra-fix)
+=============================================================================
+
+  On a CLEAN stack — these are the deltas to watch:
+
+  Recall lift goals:
+    - Cam1 events/day: > 22/18 (51-pct day averages, adjusted for
+      threshold relax 0.65 → 0.60 in Phase 5.2)
+    - Cam2 events/day: > 53/49 ditto, MINUS whatever was crash-loop
+      contamination
+    - Diary narrative entries/day: > ~37/day average (49+25)/2
+      (with re-baselined-clean number replacing the dirty side)
+    - Wheel zone hits on cam1: > 11 (very low — recall debt obvious)
+    - Tunnel zone hits on cam1: > 20
+
+  Precision floor goals (DO NOT REGRESS):
+    - 0/200 FPs on the negative eval at conf 0.65
+    - inference_speed stays comfortably under 25ms
+
+  Diary-specific (V4 won't move these directly — surfaced for context):
+    - "exploring" share of cam2 entries stays high regardless (cam2
+      zone coverage is 6%, by FoV design). Not a V4 metric.
+
+=============================================================================
+  ARTIFACTS — staged outside the repo (do not commit raw events JSON)
+=============================================================================
+
+  Locally on dev Mac (/tmp/v4_baseline/):
+    events_hamster_cam_1.json   raw Frigate event records, 48h
+    events_hamster_cam_2.json   raw Frigate event records, 48h
+    frigate_stats.json          snapshot of /api/stats at capture
+    frigate_log_errors.txt      filtered docker logs (errors/warnings)
+    diary_summary.txt           sqlite output (per-day, per-activity, per-camera)
+    bucketed_summary.txt        bucket.py output (this file's source for the bucket tables)
+    bucket.py                   the bucketing script (kept with the artifacts)
+
+  Re-run the bucketing:
+    cd /tmp/v4_baseline && python3 bucket.py
+
+=============================================================================
+  NEXT — recommended order before any V4 model work
+=============================================================================
+
+  1. Fix the cam2 ffmpeg crash loop (infra-engineer territory):
+     - Confirm hamster-cam-2.local is up and the Pi go2rtc is healthy
+       (this likely overlaps with [[project_cam2_reboots]]).
+     - Confirm host mDNS resolver (avahi/systemd-resolved) is alive
+       and not stuck.
+     - Investigate why ffmpeg is engaging VAAPI ([AVHWFramesContext]
+       in errors) — the Frigate config comment explicitly says no
+       hwaccel; either the comment is stale or the global ffmpeg
+       preset (preset-rtsp-restream) is bringing it in.
+     - Confirm cam1's 822 crashes too — possibly same root cause.
+  2. Let the stack run clean for 24h.
+  3. Re-run Phase 0.2 (this script) — overwrite this file with the
+     clean baseline.
+  4. THEN run Phase 0.1 mask audit (still pending), 0.3 confirmation,
+     and proceed to Phase 1 harvest.
