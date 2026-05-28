@@ -28,6 +28,13 @@
 #                           OFF by default — the remote copy is host-authoritative:
 #                           Frigate's zone editor writes zone coordinates back into
 #                           it, and it holds the host-specific WebRTC LAN IP.
+#                           NOTE: mac-mini/frigate-config.yml is gitignored — seed
+#                           it locally from frigate-config.example.yml first:
+#                             cp mac-mini/frigate-config.example.yml \
+#                                mac-mini/frigate-config.yml
+#                           This flag is mainly useful when you want a one-way
+#                           push of bulk local edits; for live tuning the
+#                           operator edits the Mini's copy directly.
 #   --infra-only          — skip the image build+ship step; only sync infra
 #                           configs and run compose up. Useful when only
 #                           Caddyfile / frigate config / mosquitto config changed.
@@ -195,6 +202,7 @@ log "syncing Mac Mini infra configs"
 rsync_nodelete \
     --exclude='.env' \
     --exclude='frigate-config.yml' \
+    --exclude='frigate-config.example.yml' \
     --exclude='storage/' \
     --exclude='caddy/data/' \
     --exclude='caddy/config/' \
@@ -202,7 +210,10 @@ rsync_nodelete \
     mac-mini/ "${REMOTE}:${MAC_MINI_PATH}/"
 # frigate-config.yml is excluded above because it is host-authoritative:
 # Frigate's zone editor writes zone coordinates back into the Mini's copy,
-# and it holds the host-specific WebRTC candidate LAN IP.
+# and it holds the host-specific WebRTC candidate LAN IP. It is also
+# gitignored — see .gitignore and frigate-config.example.yml.
+# frigate-config.example.yml is excluded so we never overwrite the live
+# Mini config with the template by accident.
 
 # ----------------------------------------------------------------------
 # 3b. Optional: push the dev machine's .env to the Mac Mini.
@@ -225,7 +236,12 @@ fi
 if [[ "$SYNC_FRIGATE_CONFIG" == "1" ]]; then
     FRIGATE_CFG="mac-mini/frigate-config.yml"
     if [[ ! -f "$FRIGATE_CFG" ]]; then
-        echo "deploy.sh: --sync-frigate-config passed but ${FRIGATE_CFG} not found." >&2
+        cat >&2 <<EOF
+deploy.sh: --sync-frigate-config passed but ${FRIGATE_CFG} not found.
+${FRIGATE_CFG} is gitignored — seed it from the tracked template:
+  cp mac-mini/frigate-config.example.yml ${FRIGATE_CFG}
+…then edit it for your setup and re-run.
+EOF
         exit 2
     fi
     BACKUP_NAME="frigate-config.yml.bak-$(date -u +%Y%m%dT%H%M%SZ)"

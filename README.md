@@ -153,17 +153,22 @@ Roughly four hours spread across an evening or two. The TL;DR:
 2. **Flash two Pi Zero 2 Ws** as RTSP camera servers (go2rtc + H264
    hardware encode via VideoCore IV). See [`docs/SETUP_PI_ZERO.md`](docs/SETUP_PI_ZERO.md).
 3. **Copy `.env.example` to `.env`** on the Mac Mini and fill it in.
-4. From your dev machine: `./deploy.sh` — cross-builds the linux/amd64
+4. **Copy `mac-mini/frigate-config.example.yml` to
+   `mac-mini/frigate-config.yml`** and tweak it for your setup (camera
+   stream names, the Mac Mini's WebRTC LAN IP, zones, masks). The real
+   file is gitignored and host-authoritative — see the *Configuration &
+   secrets* section below.
+5. From your dev machine: `./deploy.sh` — cross-builds the linux/amd64
    app image, ships it to the Mini over SSH, and brings up the full
    Docker Compose stack (Mosquitto, Frigate, Caddy, hamster-app). No
    host Node or pnpm required on the Mini.
-5. **Configure Frigate:** point it at your Pi RTSP streams, define zones
+6. **Configure Frigate:** point it at your Pi RTSP streams, define zones
    (wheel, food, water…) in the Frigate UI.
-6. **Set up DDNS + Caddy + auth.** Forward the non-standard HTTPS port
+7. **Set up DDNS + Caddy + auth.** Forward the non-standard HTTPS port
    at your router (`CADDY_HTTPS_PORT`, default `2053`, TCP **and** UDP
    for HTTP/3). Add a Cloudflare Origin Rule that maps edge `:443` →
    origin `:2053` so visitors use the clean URL.
-7. **Open the URL on a tablet**, run the onboarding wizard, done.
+8. **Open the URL on a tablet**, run the onboarding wizard, done.
 
 Detailed Mac Mini and Pi Zero setup guides:
 - [`docs/SETUP_MAC_MINI.md`](docs/SETUP_MAC_MINI.md)
@@ -274,6 +279,35 @@ The shipped `go2rtc.service` references it via `EnvironmentFile=`, so
 go2rtc reads the password at boot without it ever appearing on a
 command line or in `/proc`.
 
+### Frigate config (`frigate-config.yml`)
+
+Frigate's config is treated the same way as `.env`: the real file
+(`mac-mini/frigate-config.yml`) is **gitignored**, and an annotated
+template ([`mac-mini/frigate-config.example.yml`](mac-mini/frigate-config.example.yml))
+ships in the repo. Seed it once:
+
+```sh
+cp mac-mini/frigate-config.example.yml mac-mini/frigate-config.yml
+```
+
+Then edit the new file for **your** setup — at minimum:
+
+- **`go2rtc.webrtc.candidates`** — set this to the Mac Mini's LAN IP
+  so WebRTC live view works (otherwise the player falls back to MSE).
+- **`go2rtc.streams`** — one entry per Pi Zero, using your DHCP-
+  reserved hostnames / IPs.
+- **`cameras.<name>.zones`** — draw boxes in Frigate's web zone
+  editor and paste the generated coordinates here (the zone *name*
+  picks the diary activity; see
+  [`docs/SETUP_MAC_MINI.md`](docs/SETUP_MAC_MINI.md) Step 8.5 for the
+  full keyword table).
+
+The file is **host-authoritative** — Frigate's zone editor writes
+coordinates back into the Mini's copy, and operator-tuned object masks
+accumulate there over time. `deploy.sh` deliberately does not overwrite
+it on a normal deploy; pass `--sync-frigate-config` to push your local
+copy (and the script backs up the remote one first).
+
 ### What's NOT in `.env`
 
 - **Admin account credentials.** The first admin is created via the
@@ -285,9 +319,11 @@ command line or in `/proc`.
   `cameras`, and `notification_preferences` tables — configured
   through the UI.
 
-> **Never commit `.env`.** The repo's root `.gitignore` lists it.
-> Always commit changes to `.env.example` so contributors can see
-> what's expected.
+> **Never commit `.env` or `frigate-config.yml`.** Both are listed in
+> the repo's root `.gitignore`. Commit changes to `.env.example` and
+> `frigate-config.example.yml` instead so contributors see what's
+> expected without leaking your secrets, LAN topology, or pet-specific
+> tuning.
 
 ## Optional features & how to enable them
 

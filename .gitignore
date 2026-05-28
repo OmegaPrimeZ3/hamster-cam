@@ -25,6 +25,14 @@ coverage/
 .env.*.local
 !.env.example
 
+# Frigate config — host-authoritative (Frigate's zone editor writes back
+# into it, it holds the host's WebRTC LAN IP, and it accumulates
+# operator-tuned masks). Keep the .example template tracked, ignore the
+# real file. Seed it once with:
+#   cp mac-mini/frigate-config.example.yml mac-mini/frigate-config.yml
+/mac-mini/frigate-config.yml
+!/mac-mini/frigate-config.example.yml
+
 # SQLite database files and on-host storage
 /db/*.db
 /db/*.db-*

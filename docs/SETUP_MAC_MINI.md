@@ -183,13 +183,28 @@ are needed.
 
 ## Step 6 — Copy infra configs to the Mac Mini
 
-`deploy.sh` handles this for normal updates, but on first setup you
-can copy manually:
+First seed `mac-mini/frigate-config.yml` on the **dev machine** from
+the tracked example, since the real file is gitignored:
+
+```sh
+# On the dev machine, in the repo root
+cp mac-mini/frigate-config.example.yml mac-mini/frigate-config.yml
+# Edit the new file — at minimum the WebRTC LAN IP (Step 8.3) and
+# the go2rtc stream URLs (Step 8.1). Zones can be drawn later in
+# Frigate's web UI (Step 8.5).
+```
+
+`deploy.sh` handles config sync for normal updates, but on first setup
+you can copy manually:
 
 ```sh
 # From the dev machine, in the repo root
-rsync -av mac-mini/ YOUR_USERNAME@<mac-mini-ip>:/opt/hamster-cam/
+rsync -av --exclude='frigate-config.example.yml' \
+    mac-mini/ YOUR_USERNAME@<mac-mini-ip>:/opt/hamster-cam/
 ```
+
+The `--exclude` keeps the template off the Mini — only the real
+`frigate-config.yml` should live at `/opt/hamster-cam/`.
 
 Every config lands at the **project root** (`/opt/hamster-cam/`),
 because that is where `docker-compose.yml`'s relative bind mounts
@@ -248,6 +263,22 @@ docker compose ps mosquitto
 Frigate is configured via `/opt/hamster-cam/frigate-config.yml` (the
 compose file mounts it to `/config/config.yml` inside the container).
 The repo ships a template that pulls camera credentials from `.env`.
+
+> **The real `frigate-config.yml` is gitignored** (it accumulates
+> host-specific values: the Mac Mini's WebRTC LAN IP, zones drawn in
+> Frigate's web editor, operator-tuned object masks). The repo ships
+> [`mac-mini/frigate-config.example.yml`](../mac-mini/frigate-config.example.yml)
+> as the annotated template. If you haven't already, seed it on the
+> dev machine before any of the steps below:
+>
+> ```sh
+> cp mac-mini/frigate-config.example.yml mac-mini/frigate-config.yml
+> ```
+>
+> Once it's on the Mini, the **Mini's copy is authoritative** — edit
+> it directly with `ssh`/`vim`, or push bulk changes from the dev
+> machine with `./deploy.sh --sync-frigate-config` (the remote copy is
+> backed up to `frigate-config.yml.bak-<ts>` first).
 
 ### 8.1 — Camera configuration
 
