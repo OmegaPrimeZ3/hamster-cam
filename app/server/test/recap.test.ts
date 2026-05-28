@@ -521,6 +521,78 @@ describe('runRecapJob', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Task 4 — recap_names personalisation
+  // ---------------------------------------------------------------------------
+
+  it('buildPromptForTest includes a greeting instruction when names are set', async () => {
+    const { buildPromptForTest } = await import('../src/jobs/recap.js');
+
+    const prompt = buildPromptForTest('Remy', '- 22:00 — wheel for 10 min', ['Maya', 'Leo']);
+
+    // Must instruct the model to open with a greeting.
+    expect(prompt).toContain('Hello Maya and Leo');
+    // Word budget bumped to 90 for named greeting.
+    expect(prompt).toContain('90 words');
+  });
+
+  it('buildPromptForTest handles a single name', async () => {
+    const { buildPromptForTest } = await import('../src/jobs/recap.js');
+
+    const prompt = buildPromptForTest('Remy', '- 22:00 — wheel for 10 min', ['Maya']);
+    expect(prompt).toContain('Hello Maya');
+    expect(prompt).toContain('90 words');
+  });
+
+  it('buildPromptForTest handles three names with Oxford comma', async () => {
+    const { buildPromptForTest } = await import('../src/jobs/recap.js');
+
+    const prompt = buildPromptForTest('Remy', '- 22:00 — wheel for 10 min', ['Maya', 'Leo', 'Sam']);
+    expect(prompt).toContain('Maya, Leo, and Sam');
+  });
+
+  it('buildPromptForTest is unchanged from baseline when names are empty', async () => {
+    const { buildPromptForTest } = await import('../src/jobs/recap.js');
+
+    const baseline = buildPromptForTest('Remy', '- 22:00 — wheel for 10 min', []);
+    // No greeting instruction in the baseline.
+    expect(baseline).not.toContain('greeting');
+    // Word budget unchanged at 80.
+    expect(baseline).toContain('80 words');
+  });
+
+  it('records greeting_names in diary entry details when recap_names is set', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const db = await import('../src/db.js');
+    db.setSetting('recap_names', 'Maya,Leo');
+
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    const result = await runRecapJob(REF_DATE, { fetch: makeSuccessFetch('Peanut ran all night.') });
+    expect(result.skipped).toBe(false);
+
+    const entry = db.getDiaryEntryById(result.diary_entry_id!);
+    const details = JSON.parse(entry!.details ?? '{}') as Record<string, unknown>;
+    expect(details['greeting_names']).toEqual(['Maya', 'Leo']);
+  });
+
+  it('does NOT record greeting_names in details when recap_names is empty', async () => {
+    process.env['GEMINI_API_KEY'] = 'test-key';
+    const db = await import('../src/db.js');
+    db.setSetting('recap_names', '');
+
+    const { runRecapJob } = await import('../src/jobs/recap.js');
+    await seedOvernightDiaryEntries(5, REF_DATE);
+
+    const result = await runRecapJob(REF_DATE, { fetch: makeSuccessFetch('Peanut ran all night.') });
+    expect(result.skipped).toBe(false);
+
+    const entry = db.getDiaryEntryById(result.diary_entry_id!);
+    const details = JSON.parse(entry!.details ?? '{}') as Record<string, unknown>;
+    expect(details['greeting_names']).toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------------------
   // Window: verify the midnight span is correct
   // ---------------------------------------------------------------------------
 

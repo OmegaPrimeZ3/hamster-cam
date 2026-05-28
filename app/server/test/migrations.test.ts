@@ -53,6 +53,8 @@ const SEED_SETTINGS_KEYS = [
   'snapshot_retention_days', 'timelapse_retention_days', 'audit_retention_days',
   'disk_warn_pct', 'disk_critical_pct',
   'transition_window_ms', 'min_dwell_ms', 'share_rate_limit_per_hour',
+  // Added by migration 0022 (Nightly Recap tab settings).
+  'timelapse_enabled', 'recap_video_zone_priority', 'recap_names',
 ] as const;
 
 describe('migrations', () => {

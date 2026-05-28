@@ -432,6 +432,19 @@ const settingsSchema = z.object({
   distance_unit: z.enum(['mi', 'km']),
   /** Whether the nightly AI recap job is enabled. Defaults to true. */
   recap_enabled: z.boolean(),
+  /** On/off gate for the nightly VIDEO timelapse job. Defaults to true. */
+  timelapse_enabled: z.boolean(),
+  /**
+   * CSV of activity keywords in priority order for clip selection in the
+   * timelapse job. Empty string = no override = current temporal behavior.
+   * Valid tokens: wheel,food,water,bathroom,resting,tunnel,exploring,hiding.
+   */
+  recap_video_zone_priority: z.string(),
+  /**
+   * CSV of names for the AI recap greeting, e.g. "Maya,Leo".
+   * Empty = no greeting (current behavior unchanged).
+   */
+  recap_names: z.string(),
 });
 export type SettingsDTO = z.infer<typeof settingsSchema>;
 
@@ -472,6 +485,9 @@ function parseSettingsKV(kv: db.SettingsKV): SettingsDTO {
     share_rate_limit_per_hour: num('share_rate_limit_per_hour', 10),
     distance_unit: rawDistUnit === 'km' ? 'km' : 'mi',
     recap_enabled: bool('recap_enabled', true),
+    timelapse_enabled: bool('timelapse_enabled', true),
+    recap_video_zone_priority: get('recap_video_zone_priority', ''),
+    recap_names: get('recap_names', ''),
   };
 }
 

@@ -149,8 +149,17 @@ export async function runRecapJob(
   }
 
   const petName = db.getSetting('pet_name') ?? 'the hamster';
+
+  // Parse recap_names: "Maya,Leo" → ['Maya', 'Leo']. Empty string (the
+  // default) means no personalised greeting — prompt is unchanged from today.
+  const rawRecapNames = db.getSetting('recap_names') ?? '';
+  const recapNames = rawRecapNames
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
   const bulletList = buildBulletList(sourceEntries);
-  const prompt = buildPrompt(petName, bulletList);
+  const prompt = buildPrompt(petName, bulletList, recapNames);
 
   let recapText: string;
   try {
@@ -212,7 +221,12 @@ export async function runRecapJob(
     duration_ms: null,
     snapshot_id: null,
     media_path: null,
-    details: JSON.stringify({ source_entry_count: sourceEntries.length }),
+    details: JSON.stringify({
+      source_entry_count: sourceEntries.length,
+      // Record which names were used for the greeting so the entry is
+      // self-describing; omitted when the feature is not configured.
+      ...(recapNames.length > 0 && { greeting_names: recapNames }),
+    }),
     ai_model: geminiModel,
   });
 
@@ -334,16 +348,58 @@ function buildBulletList(entries: db.DiaryEntryRow[]): string {
     .join('\n');
 }
 
-function buildPrompt(petName: string, bulletList: string): string {
+/**
+ * Build the Gemini prompt for the overnight recap.
+ *
+ * When `names` is non-empty the model is asked to OPEN with a short,
+ * child-friendly greeting addressed to those names before the recap paragraph.
+ * Natural grammar: one name → "Hello Maya,"; two → "Hello Maya and Leo,";
+ * three or more → Oxford-style "Hello Maya, Leo, and Sam,".
+ *
+ * The word-budget guidance is bumped to ~90 words (from 80) to accommodate
+ * the greeting without crowding out the recap paragraph itself.
+ *
+ * When `names` is empty the prompt is exactly the same as before — no new
+ * instructions, no word-budget change.
+ */
+function buildPrompt(petName: string, bulletList: string, names: string[]): string {
+  const hasNames = names.length > 0;
+
+  // Build a natural Oxford-style join for 1, 2, or 3+ names.
+  const greetingNames = (() => {
+    if (names.length === 0) return '';
+    if (names.length === 1) return names[0] ?? '';
+    if (names.length === 2) return `${names[0]} and ${names[1]}`;
+    // Three or more: "Maya, Leo, and Sam"
+    const allButLast = names.slice(0, -1).join(', ');
+    return `${allButLast}, and ${names[names.length - 1]}`;
+  })();
+
+  const greetingInstruction = hasNames
+    ? `Start with a short, warm greeting addressed to ${greetingNames} ` +
+      `(e.g. "Hello ${greetingNames},") on its own line before the recap paragraph. ` +
+      `Keep the greeting to one short sentence. ` +
+      `The greeting does not count toward the word budget for the recap paragraph. `
+    : '';
+
+  const wordBudget = hasNames ? 90 : 80;
+
   return (
     `You are writing one short, warm, child-friendly storybook paragraph (2–4 sentences) ` +
     `about what the pet hamster ${petName} got up to overnight. ` +
     `Use only the facts in the activity log below. ` +
     `Write in past tense, third person. Do not invent new facts. ` +
-    `Keep it under 80 words. End on a cozy note.\n\n` +
+    `${greetingInstruction}` +
+    `Keep it under ${wordBudget} words. End on a cozy note.\n\n` +
     `Last night's activity log:\n${bulletList}`
   );
 }
+
+/**
+ * Exported purely for unit tests — allows verifying prompt shape without
+ * running the full job lifecycle.
+ */
+export const buildPromptForTest = buildPrompt;
 
 /**
  * Return a timestamp for 06:00:00.000 local time on the same calendar day as

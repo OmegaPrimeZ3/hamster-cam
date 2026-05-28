@@ -186,13 +186,6 @@ export function PetSettings(): JSX.Element {
         onChange={(v) => update.mutate({ auto_rotate: v })}
       />
 
-      <Toggle
-        label="📖 AI Nightly Recap"
-        hint="A warm storybook summary of each day, written automatically."
-        checked={s.recap_enabled}
-        onChange={(v) => update.mutate({ recap_enabled: v })}
-      />
-
       <Field label="Account">
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
           <button type="button" className="hc-btn" onClick={() => setShowChangePw((v) => !v)}>

@@ -14,6 +14,7 @@ import { UserSettings } from './UserSettings';
 import { AuditSettings } from './AuditSettings';
 import { ShareSettings } from './ShareSettings';
 import { NotificationSettings } from './NotificationSettings';
+import { RecapSettings } from './RecapSettings';
 
 export interface SettingsDrawerProps {
   open: boolean;
@@ -21,10 +22,11 @@ export interface SettingsDrawerProps {
   initialTab?: SettingsTabId;
 }
 
-export type SettingsTabId = 'pet' | 'cameras' | 'users' | 'audit' | 'sharing' | 'notifications';
+export type SettingsTabId = 'pet' | 'recap' | 'cameras' | 'users' | 'audit' | 'sharing' | 'notifications';
 
 const TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: 'pet', label: 'Pet' },
+  { id: 'recap', label: 'Nightly Recap' },
   { id: 'cameras', label: 'Cameras' },
   { id: 'users', label: 'Users' },
   { id: 'audit', label: 'Audit' },
@@ -116,6 +118,7 @@ export function SettingsDrawer({ open, onOpenChange, initialTab = 'pet' }: Setti
 
             <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
               <Tabs.Content value="pet"><PetSettings /></Tabs.Content>
+              <Tabs.Content value="recap"><RecapSettings /></Tabs.Content>
               <Tabs.Content value="cameras"><CameraSettings /></Tabs.Content>
               <Tabs.Content value="users"><UserSettings /></Tabs.Content>
               <Tabs.Content value="audit"><AuditSettings /></Tabs.Content>

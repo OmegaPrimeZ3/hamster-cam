@@ -823,3 +823,264 @@ describe('FfmpegError stderr surfacing', () => {
     await expect(runTimelapseJob(runTime)).resolves.not.toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task 2 — timelapse_enabled=false skips the job
+// ---------------------------------------------------------------------------
+
+describe('runTimelapseForDate — timelapse_enabled setting', () => {
+  it('skips (produced=false, no diary entry) when timelapse_enabled=false', async () => {
+    const runTime = new Date('2026-05-25T06:05:00');
+    const windowStart = new Date('2026-05-24T22:00:00').getTime();
+    // Seed plenty of snapshots so the job would normally succeed.
+    await seedNSnapshots(30, windowStart);
+
+    // Disable the timelapse job via the settings KV store.
+    const db = await import('../src/db.js');
+    db.setSetting('timelapse_enabled', 'false');
+
+    const { runTimelapseJob } = await import('../src/jobs/timelapse.js');
+    const result = await runTimelapseJob(runTime);
+
+    expect(result.produced).toBe(false);
+    expect(result.media_path).toBeNull();
+    expect(result.diary_entry_id).toBeNull();
+    // Date is still populated (job returns early with correct isoDate).
+    expect(result.date).toBe('2026-05-24');
+
+    // Confirm no timelapse diary entry was written.
+    const nightEnd = new Date('2026-05-25T06:00:00').getTime();
+    const nightStart = nightEnd - 8 * 60 * 60 * 1000;
+    const entries = db.listDiaryEntriesBetween(nightStart - 1, nightEnd + 1);
+    expect(entries.filter((e) => e.kind === 'timelapse')).toHaveLength(0);
+  });
+
+  it('runs normally when timelapse_enabled=true (explicit)', async () => {
+    const runTime = new Date('2026-05-25T06:05:00');
+    const windowStart = new Date('2026-05-24T22:00:00').getTime();
+    await seedNSnapshots(30, windowStart);
+
+    const db = await import('../src/db.js');
+    db.setSetting('timelapse_enabled', 'true');
+
+    const { runTimelapseJob } = await import('../src/jobs/timelapse.js');
+    const result = await runTimelapseJob(runTime);
+
+    // With timelapse_enabled=true it should produce as normal.
+    expect(result.produced).toBe(true);
+    expect(result.diary_entry_id).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 3 — clip priority ordering (tagClipsWithActivity + prioritiseClips)
+// ---------------------------------------------------------------------------
+
+describe('tagClipsWithActivityForTest', () => {
+  it('tags a clip with the activity of the best-overlapping narrative entry', async () => {
+    const db = await import('../src/db.js');
+    const { tagClipsWithActivityForTest } = await import('../src/jobs/timelapse.js');
+
+    const cam = db.createCamera({ name: 'tag-cam', emoji: '📷', stream_url: 'rtsp://host/tag', enabled: true, live_src: 'tag-cam' });
+
+    // Clip at midMs=5000ms, 4s duration → covers [3000, 7000] ms.
+    const clip = {
+      absPath: '/fake/clip.mp4',
+      durationS: 4,
+      midMs: 5000,
+      camera: 'tag-cam',
+    };
+
+    // Narrative entry at occurred_at=2000ms, duration=6000ms → covers [2000, 8000] ms.
+    // Overlap with clip = [3000, 7000] = 4000ms → should be the best match.
+    const narrativeEntry = {
+      id: 1,
+      occurred_at: 2000,
+      kind: 'narrative' as const,
+      activity: 'wheel' as const,
+      narrative: 'Running on the wheel',
+      pet_name: 'Remy',
+      camera_id: cam.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 6000,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+      ai_model: null,
+      created_by: null,
+      thumbnail_path: null,
+      clip_path: null,
+    };
+
+    const cameraNameToId = new Map<string, number>([['tag-cam', cam.id]]);
+
+    const result = tagClipsWithActivityForTest([clip], [narrativeEntry], cameraNameToId);
+    expect(result).toHaveLength(1);
+    expect(result[0]!.activity).toBe('wheel');
+  });
+
+  it('falls back to "exploring" when no narrative entry overlaps the clip', async () => {
+    const db = await import('../src/db.js');
+    const { tagClipsWithActivityForTest } = await import('../src/jobs/timelapse.js');
+
+    const cam = db.createCamera({ name: 'nooverlap-cam', emoji: '📷', stream_url: 'rtsp://host/no', enabled: true, live_src: 'nooverlap-cam' });
+
+    // Clip at midMs=100_000ms.
+    const clip = {
+      absPath: '/fake/clip.mp4',
+      durationS: 4,
+      midMs: 100_000,
+      camera: 'nooverlap-cam',
+    };
+
+    // Narrative entry way before the clip — no overlap.
+    const narrativeEntry = {
+      id: 2,
+      occurred_at: 1000,
+      kind: 'narrative' as const,
+      activity: 'food' as const,
+      narrative: 'Eating',
+      pet_name: 'Remy',
+      camera_id: cam.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 5000,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+      ai_model: null,
+      created_by: null,
+      thumbnail_path: null,
+      clip_path: null,
+    };
+
+    const cameraNameToId = new Map<string, number>([['nooverlap-cam', cam.id]]);
+
+    const result = tagClipsWithActivityForTest([clip], [narrativeEntry], cameraNameToId);
+    expect(result[0]!.activity).toBe('exploring');
+  });
+});
+
+describe('prioritiseClipsForTest', () => {
+  it('places the top-priority activity clip first and guarantees it survives MAX_CLIPS trim', async () => {
+    const { prioritiseClipsForTest } = await import('../src/jobs/timelapse.js');
+
+    // Build 6 clips (over MAX_CLIPS=5) with various activities.
+    // The 'wheel' clip is not earliest (midMs=5000) so temporal order would not
+    // put it first. With priority=['wheel','food'], it must end up first.
+    const clips = [
+      { absPath: '/c/food1.mp4', durationS: 3, midMs: 1000, camera: 'c', activity: 'food' as const },
+      { absPath: '/c/food2.mp4', durationS: 3, midMs: 2000, camera: 'c', activity: 'food' as const },
+      { absPath: '/c/explore.mp4', durationS: 3, midMs: 3000, camera: 'c', activity: 'exploring' as const },
+      { absPath: '/c/water.mp4',  durationS: 3, midMs: 4000, camera: 'c', activity: 'water' as const },
+      { absPath: '/c/wheel.mp4',  durationS: 4, midMs: 5000, camera: 'c', activity: 'wheel' as const },
+      { absPath: '/c/rest.mp4',   durationS: 3, midMs: 6000, camera: 'c', activity: 'resting' as const },
+    ];
+
+    const { clips: ordered, featuredTopActivity } = prioritiseClipsForTest(clips, ['wheel', 'food', 'water']);
+
+    // Guaranteed: at most MAX_CLIPS results.
+    expect(ordered.length).toBeLessThanOrEqual(5);
+
+    // The 'wheel' clip must be first (guaranteed top-priority).
+    expect(ordered[0]!.absPath).toBe('/c/wheel.mp4');
+
+    // featuredTopActivity must identify 'wheel'.
+    expect(featuredTopActivity).toBe('wheel');
+  });
+
+  it('picks the LONGEST top-priority clip when there are multiple wheel clips', async () => {
+    const { prioritiseClipsForTest } = await import('../src/jobs/timelapse.js');
+
+    const clips = [
+      { absPath: '/c/wheel-short.mp4', durationS: 3, midMs: 1000, camera: 'c', activity: 'wheel' as const },
+      { absPath: '/c/wheel-long.mp4',  durationS: 5, midMs: 2000, camera: 'c', activity: 'wheel' as const },
+      { absPath: '/c/food.mp4',        durationS: 3, midMs: 3000, camera: 'c', activity: 'food' as const },
+    ];
+
+    const { clips: ordered } = prioritiseClipsForTest(clips, ['wheel', 'food']);
+
+    // The longer wheel clip must be chosen as the guaranteed first slot.
+    expect(ordered[0]!.absPath).toBe('/c/wheel-long.mp4');
+  });
+
+  it('returns clips in priority order when no top-priority match exists', async () => {
+    const { prioritiseClipsForTest } = await import('../src/jobs/timelapse.js');
+
+    // No wheel clips — top priority is 'wheel' but nothing matches.
+    // 'food' is second priority.
+    const clips = [
+      { absPath: '/c/water.mp4',   durationS: 3, midMs: 1000, camera: 'c', activity: 'water' as const },
+      { absPath: '/c/food.mp4',    durationS: 3, midMs: 2000, camera: 'c', activity: 'food' as const },
+      { absPath: '/c/explore.mp4', durationS: 3, midMs: 3000, camera: 'c', activity: 'exploring' as const },
+    ];
+
+    const { clips: ordered, featuredTopActivity } = prioritiseClipsForTest(clips, ['wheel', 'food', 'water']);
+
+    // featuredTopActivity null — no wheel clip exists.
+    expect(featuredTopActivity).toBeNull();
+
+    // Clips ordered: food (rank 1) before water (rank 2) before exploring (unlisted).
+    expect(ordered[0]!.activity).toBe('food');
+    expect(ordered[1]!.activity).toBe('water');
+    expect(ordered[2]!.activity).toBe('exploring');
+  });
+
+  it('returns clips unchanged when priority list is empty', async () => {
+    const { prioritiseClipsForTest } = await import('../src/jobs/timelapse.js');
+
+    const clips = [
+      { absPath: '/c/a.mp4', durationS: 3, midMs: 3000, camera: 'c', activity: 'wheel' as const },
+      { absPath: '/c/b.mp4', durationS: 3, midMs: 1000, camera: 'c', activity: 'food' as const },
+    ];
+
+    const { clips: ordered, featuredTopActivity } = prioritiseClipsForTest(clips, []);
+
+    // Empty priority → unchanged (same reference array, same order).
+    expect(ordered).toBe(clips);
+    expect(featuredTopActivity).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 3 — zone priority integration: details JSON records zone_priority
+// ---------------------------------------------------------------------------
+
+describe('runTimelapseJob — zone_priority details field', () => {
+  it('details.zone_priority is present when recap_video_zone_priority is set', async () => {
+    const runTime = new Date('2026-05-25T06:05:00');
+    const windowStart = new Date('2026-05-24T22:00:00').getTime();
+    await seedNSnapshots(30, windowStart);
+
+    const db = await import('../src/db.js');
+    db.setSetting('recap_video_zone_priority', 'wheel,food,water');
+
+    const { runTimelapseJob } = await import('../src/jobs/timelapse.js');
+    const result = await runTimelapseJob(runTime);
+
+    expect(result.produced).toBe(true);
+    const entry = db.getDiaryEntryById(result.diary_entry_id!);
+    const details = JSON.parse(entry!.details ?? '{}') as Record<string, unknown>;
+    expect(Array.isArray(details['zone_priority'])).toBe(true);
+    expect(details['zone_priority']).toEqual(['wheel', 'food', 'water']);
+  });
+
+  it('details has no zone_priority field when recap_video_zone_priority is empty', async () => {
+    const runTime = new Date('2026-05-25T06:05:00');
+    const windowStart = new Date('2026-05-24T22:00:00').getTime();
+    await seedNSnapshots(30, windowStart);
+
+    const db = await import('../src/db.js');
+    db.setSetting('recap_video_zone_priority', '');
+
+    const { runTimelapseJob } = await import('../src/jobs/timelapse.js');
+    const result = await runTimelapseJob(runTime);
+
+    expect(result.produced).toBe(true);
+    const entry = db.getDiaryEntryById(result.diary_entry_id!);
+    const details = JSON.parse(entry!.details ?? '{}') as Record<string, unknown>;
+    expect(details['zone_priority']).toBeUndefined();
+    expect(details['featured_top_activity']).toBeUndefined();
+  });
+});

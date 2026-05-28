@@ -205,6 +205,15 @@ export async function runTimelapseForDate(
 ): Promise<TimelapseRunResult> {
   const cfg = getConfig();
 
+  // Short-circuit if the video timelapse job has been disabled in settings.
+  // Mirrors exactly how recap.ts handles recap_enabled so the two jobs are
+  // symmetrical. The diary entry is NOT written when disabled (same as recap).
+  const timelapseEnabledRaw = db.getSetting('timelapse_enabled');
+  if (timelapseEnabledRaw === 'false' || timelapseEnabledRaw === '0') {
+    logger.info({ job: 'timelapse', skipped: 'disabled' });
+    return { date: isoDate, produced: false, media_path: null, diary_entry_id: null };
+  }
+
   const computedNightEnd = nightEnd ?? computeNightEnd(isoDate);
   const computedNightStart = nightStart ?? (computedNightEnd - NIGHT_WINDOW_MS);
 
@@ -253,18 +262,33 @@ export async function runTimelapseForDate(
     return { date: isoDate, produced: false, media_path: null, diary_entry_id: null };
   }
 
-  // Load narrative entries for camera-priority scoring.
+  // Load narrative entries for camera-priority scoring (still frames) and,
+  // when zone priority is active, for clip activity inference.
   const narrativeEntries = db.listDiaryEntriesByKindBetween('narrative', computedNightStart, computedNightEnd);
+
+  // Parse the zone-priority setting: "wheel,food,water" → ['wheel','food','water'].
+  // Empty string (the default) means no zone-priority override — all clip logic
+  // below is gated on this list being non-empty.
+  const rawZonePriority = db.getSetting('recap_video_zone_priority') ?? '';
+  const zonePriorityList = rawZonePriority
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 
   const stagingDir = await mkdtemp(join(tmpdir(), 'hamster-tl-'));
 
   try {
-    // Fetch and normalise video clips from Frigate.
-    const clipSegments = await fetchAndNormaliseClips(
+    // Fetch and normalise video clips from Frigate. When zonePriorityList is
+    // non-empty the function also tags clips by activity and reorders them so
+    // the top-priority activity's clip is guaranteed included. When empty the
+    // behaviour is byte-for-byte unchanged from the original temporal path.
+    const { segments: clipSegments, featuredTopActivity } = await fetchAndNormaliseClips(
       detectionEvents,
       computedNightStart,
       computedNightEnd,
       stagingDir,
+      narrativeEntries,
+      zonePriorityList,
     );
 
     logger.info(
@@ -342,6 +366,13 @@ export async function runTimelapseForDate(
         activity_guided: narrativeEntries.length > 0,
         hamster_filtered: detectionEvents.length > 0,
         music: musicPath !== null,
+        // Zone-priority fields — present only when the feature is active.
+        // Allows operators to confirm which priority list was applied and
+        // which activity got the guaranteed first-clip slot.
+        ...(zonePriorityList.length > 0 && {
+          zone_priority: zonePriorityList,
+          featured_top_activity: featuredTopActivity,
+        }),
       }),
     });
 
@@ -412,6 +443,124 @@ interface ClipSegment {
   midMs: number;
   /** Camera name from the detection event. */
   camera: string;
+  /**
+   * Inferred activity from the best-overlapping narrative diary entry.
+   * Set when recap_video_zone_priority is non-empty; undefined otherwise
+   * (no activity-awareness needed for the default temporal path).
+   */
+  activity?: DiaryActivity;
+}
+
+// ---------------------------------------------------------------------------
+// Activity-aware clip prioritisation (zone_priority feature)
+// ---------------------------------------------------------------------------
+
+/**
+ * Tag each clip with the activity inferred from the best-overlapping narrative
+ * diary entry on the same camera. "Best overlap" = the narrative entry whose
+ * time window [occurred_at, occurred_at + duration_ms] has the most overlap
+ * with [clip.midMs − durationS/2*1000, clip.midMs + durationS/2*1000].
+ *
+ * Camera matching: the clip's `camera` string (Frigate live_src / name) is
+ * resolved to a camera_id via the provided lookup map, then compared to
+ * narrative entries' camera_id.
+ *
+ * If no narrative entry overlaps the clip on the same camera, the clip falls
+ * back to 'exploring' — lowest-priority sentinel for any unlisted activity.
+ *
+ * This is a pure function; it never touches the DB or filesystem.
+ */
+function tagClipsWithActivity(
+  clips: ClipSegment[],
+  narrativeEntries: DiaryEntryRow[],
+  cameraNameToId: Map<string, number>,
+): ClipSegment[] {
+  return clips.map((clip) => {
+    const camId = cameraNameToId.get(clip.camera);
+    const halfMs = clip.durationS * 500; // durationS * 1000 / 2
+    const clipStart = clip.midMs - halfMs;
+    const clipEnd = clip.midMs + halfMs;
+
+    let bestActivity: DiaryActivity = 'exploring';
+    let bestOverlap = 0;
+
+    for (const entry of narrativeEntries) {
+      // Only match entries on the same camera.
+      if (camId === undefined || entry.camera_id !== camId) continue;
+      // Skip activities we can't sensibly prioritise.
+      if (entry.activity === null) continue;
+
+      const entryStart = entry.occurred_at;
+      const entryEnd = entry.occurred_at + (entry.duration_ms ?? 0);
+      const overlap = Math.max(0, Math.min(entryEnd, clipEnd) - Math.max(entryStart, clipStart));
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestActivity = entry.activity ?? 'exploring';
+      }
+    }
+
+    return { ...clip, activity: bestActivity };
+  });
+}
+
+/**
+ * Reorder clips to honour a priority list (CSV → string[]).
+ *
+ * Rules:
+ *   1. Among clips whose activity matches the TOP priority keyword, pick the
+ *      LONGEST clip (still clamped — it's already the clamped durationS) as
+ *      the guaranteed inclusion. This clip is placed first.
+ *   2. Remaining clip slots (MAX_CLIPS − 1) are filled from the rest, sorted
+ *      by activity priority rank (lower index = higher priority), with ties
+ *      broken by original temporal order (midMs ascending).
+ *   3. If no clip matches the top-priority activity at all, the rule is a
+ *      no-op and clips are sorted by priority rank / temporal order as normal.
+ *   4. Total count is capped at MAX_CLIPS (same constraint as before).
+ *
+ * When `priorityList` is empty the function returns the input unchanged
+ * (caller should gate on non-empty before calling, but defensive is fine).
+ */
+function prioritiseClips(
+  clips: ClipSegment[],
+  priorityList: string[],
+): { clips: ClipSegment[]; featuredTopActivity: string | null } {
+  if (priorityList.length === 0) return { clips, featuredTopActivity: null };
+
+  // Build activity → rank lookup (lower index = higher priority).
+  const rankOf = (activity: string | undefined): number => {
+    if (!activity) return priorityList.length; // unlisted → lowest rank
+    const idx = priorityList.indexOf(activity);
+    return idx === -1 ? priorityList.length : idx;
+  };
+
+  const topKeyword = priorityList[0];
+
+  // Find the best candidate for the guaranteed top-priority slot: among clips
+  // matching the top keyword, pick the longest (prefer more footage of what matters).
+  const topCandidates = clips.filter((c) => c.activity === topKeyword);
+  const guaranteedClip = topCandidates.length > 0
+    ? topCandidates.reduce((best, c) => (c.durationS > best.durationS ? c : best))
+    : null;
+
+  const featuredTopActivity = guaranteedClip !== null ? (topKeyword ?? null) : null;
+
+  // Build the remaining pool: all clips except the guaranteed one, sorted by
+  // priority rank then temporal order. Cap at MAX_CLIPS − 1 (or MAX_CLIPS if
+  // no guaranteed clip).
+  const remaining = clips
+    .filter((c) => c !== guaranteedClip)
+    .sort((a, b) => {
+      const rankDiff = rankOf(a.activity) - rankOf(b.activity);
+      return rankDiff !== 0 ? rankDiff : a.midMs - b.midMs;
+    });
+
+  const remainingSlots = MAX_CLIPS - (guaranteedClip !== null ? 1 : 0);
+  const selected = remaining.slice(0, remainingSlots);
+
+  // Guaranteed clip goes first; rest follow in priority/temporal order.
+  const ordered = guaranteedClip !== null ? [guaranteedClip, ...selected] : selected;
+
+  return { clips: ordered, featuredTopActivity };
 }
 
 /**
@@ -419,15 +568,22 @@ interface ClipSegment {
  * from Frigate, normalise it to TARGET_W×TARGET_H at OUTPUT_FPS H.264, and
  * return the list. Failures are silently skipped. At most MAX_CLIPS clips.
  * Clips are spread temporally (at most one per TIMELINE_BUCKET).
+ *
+ * When `zonePriorityList` is non-empty, clips are tagged with their inferred
+ * activity (from narrativeEntries) and then reordered so the top-priority
+ * activity's clip is guaranteed included and placed first in the returned list.
+ * When empty, behaviour is byte-for-byte unchanged from the original.
  */
 async function fetchAndNormaliseClips(
   events: FrigateDetectionEvent[],
   nightStartMs: number,
   nightEndMs: number,
   stagingDir: string,
-): Promise<ClipSegment[]> {
+  narrativeEntries?: DiaryEntryRow[],
+  zonePriorityList?: string[],
+): Promise<{ segments: ClipSegment[]; featuredTopActivity: string | null }> {
   const cfg = getConfig();
-  if (!cfg.FRIGATE_URL) return [];
+  if (!cfg.FRIGATE_URL) return { segments: [], featuredTopActivity: null };
 
   // Filter to events with sufficient duration.
   const candidates = events
@@ -437,7 +593,7 @@ async function fetchAndNormaliseClips(
     })
     .sort((a, b) => a.start_time - b.start_time);
 
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) return { segments: [], featuredTopActivity: null };
 
   // Spread selection: divide the night into MAX_CLIPS buckets and pick the
   // longest event in each bucket. This ensures clips represent the whole night.
@@ -540,7 +696,46 @@ async function fetchAndNormaliseClips(
     }
   }
 
-  return segments;
+  // ---- Zone-priority clip reordering ----
+  // Only active when recap_video_zone_priority is non-empty. The default path
+  // (empty priority list) is byte-for-byte identical to the original: clips
+  // come back in temporal order, no activity inference performed.
+  const hasPriority = zonePriorityList !== undefined && zonePriorityList.length > 0;
+  if (!hasPriority || narrativeEntries === undefined) {
+    return { segments, featuredTopActivity: null };
+  }
+
+  // Build camera name → camera_id lookup from all cameras. We match the
+  // Frigate event camera string (which equals live_src or name) to a row id
+  // so we can join clips to narrative entries (which carry camera_id).
+  const allCameras = db.listCameras();
+  const cameraNameToId = new Map<string, number>();
+  for (const cam of allCameras) {
+    // live_src is the canonical Frigate identifier (from migration 0015).
+    if (cam.live_src) cameraNameToId.set(cam.live_src, cam.id);
+    // Also register by name as a fallback.
+    cameraNameToId.set(cam.name, cam.id);
+  }
+
+  // Tag each collected clip with an inferred activity from narrative entries.
+  const taggedSegments = tagClipsWithActivity(segments, narrativeEntries, cameraNameToId);
+
+  // Reorder to guarantee the top-priority activity's clip is included first.
+  const { clips: prioritisedSegments, featuredTopActivity } = prioritiseClips(
+    taggedSegments,
+    zonePriorityList,
+  );
+
+  logger.debug(
+    {
+      zone_priority: zonePriorityList,
+      featured_top_activity: featuredTopActivity,
+      clip_count: prioritisedSegments.length,
+    },
+    'timelapse: clip zone-priority applied',
+  );
+
+  return { segments: prioritisedSegments, featuredTopActivity };
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,3 +1306,9 @@ export const stageAndWriteConcatForTest = stageAndWriteConcat;
 
 /** Exported purely for unit tests. */
 export const stderrSummaryForTest = stderrSummary;
+
+/** Exported purely for unit tests. */
+export const tagClipsWithActivityForTest = tagClipsWithActivity;
+
+/** Exported purely for unit tests. */
+export const prioritiseClipsForTest = prioritiseClips;
