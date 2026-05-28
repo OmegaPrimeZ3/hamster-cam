@@ -9,6 +9,7 @@
 
 import Database from 'better-sqlite3';
 
+import { emitDiaryEvent } from './diary-events.js';
 import { migrate } from './migrate.js';
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1228,10 @@ export function createDiaryEntry(input: CreateDiaryEntryInput): DiaryEntryRow {
   const id = Number(result.lastInsertRowid);
   const row = statements().diaryById.get(id) as DiaryEntryRow | undefined;
   if (!row) throw new Error(`createDiaryEntry: row ${id} not found immediately after insert`);
+  // Notify SSE subscribers so the diary UI can prepend the entry without
+  // waiting for the next poll. Synchronous; listeners only push onto buffered
+  // response streams.
+  emitDiaryEvent({ kind: 'create', row });
   return row;
 }
 
@@ -1252,6 +1257,9 @@ export function extendDiaryEntry(
   statements().diaryExtend.run({ id, occurred_at: occurredAt, duration_ms: durationMs });
   const row = statements().diaryById.get(id) as DiaryEntryRow | undefined;
   if (!row) throw new Error(`extendDiaryEntry: row ${id} not found`);
+  // Same-activity coalescing produced a longer span on an existing row — push
+  // the updated row so subscribers can replace their cached copy in place.
+  emitDiaryEvent({ kind: 'update', row });
   return row;
 }
 

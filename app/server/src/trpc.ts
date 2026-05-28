@@ -367,7 +367,7 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
 // Update this constant if you change record.retain.days in Frigate's config.
 const FRIGATE_RECORDING_RETENTION_MS = 10 * 24 * 60 * 60 * 1000; // 10 days
 
-function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
+export function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
   // clip_available resolution order (mirrors ensureClip):
   //   1. Already extracted and cached on disk → always available regardless of age.
   //   2. Timelapse mp4 via media_path → always available regardless of age.

@@ -16,6 +16,7 @@ import { trpc } from '../trpc';
 import type { RouterOutputs } from '../trpc';
 import { DiaryEntry } from './DiaryEntry';
 import { DiaryRangePicker } from './DiaryRangePicker';
+import { useDiaryStream } from '../hooks/useDiaryStream';
 import { useTTSEnabled } from '../hooks/useTTSEnabled';
 import { speak } from '../lib/tts';
 import { getDistanceUnit } from '../lib/trpc-extensions';
@@ -86,6 +87,11 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
     { from: resolvedRange.from, to: resolvedRange.to },
     { refetchInterval: 30_000 },
   );
+
+  // Real-time push: SSE merges new/updated entries into the React Query cache
+  // immediately. The 30 s polling above stays as a fallback for anything lost
+  // between disconnect and EventSource auto-reconnect.
+  useDiaryStream({ from: resolvedRange.from, to: resolvedRange.to });
 
   // seenIdsRef tracks which entry IDs have already been spoken. When the range
   // changes we need to mark the entire newly-loaded set as seen so we don't

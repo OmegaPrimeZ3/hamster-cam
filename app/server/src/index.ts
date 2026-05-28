@@ -50,6 +50,7 @@ import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
 import { initVapidKeys } from './push.js';
 import { startFrigateStatsPoller, stopFrigateStatsPoller } from './frigate.js';
+import { registerDiaryStream } from './diary-stream.js';
 import { closeWss, registerLiveWsProxy } from './live-ws.js';
 import { resolveSession } from './session.js';
 import { appRouter, createContext } from './trpc.js';
@@ -108,6 +109,11 @@ export async function buildServer(): Promise<AppServer> {
   // Live-view WebSocket proxy: /live/ws?src=<go2rtc-stream-name>
   // Auth + SSRF guard are inside registerLiveWsProxy; no additional middleware needed here.
   registerLiveWsProxy(app);
+
+  // Diary push: GET /diary/stream
+  // SSE feed of newly created/extended diary entries. Auth is checked inside
+  // the handler. Polling on the frontend stays at 30 s as a fallback.
+  registerDiaryStream(app);
 
   // Private media — all three directories are behind the same session guard.
   // /snapshots/* — JPEG captures written by activity.snapshot

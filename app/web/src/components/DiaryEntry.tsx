@@ -23,7 +23,7 @@ import { motion, useReducedMotion } from 'framer-motion';
 import { Share2, Play, Volume2, Square, Trash2 } from 'lucide-react';
 import type { RouterOutputs } from '../trpc';
 import { trpc } from '../trpc';
-import { relativeTime, formatDuration } from '../lib/time';
+import { absoluteTime, relativeTime, formatDuration } from '../lib/time';
 import { activityStyle } from '../lib/activity-style';
 import { ShareDialog } from './ShareDialog';
 import { ClipPlayerDialog } from './ClipPlayerDialog';
@@ -69,6 +69,7 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
     isAdmin || (entry.kind === 'snapshot' && entry.created_by === user?.id);
 
   const relative = relativeTime(entry.occurred_at, now);
+  const absolute = absoluteTime(entry.occurred_at, now);
   const duration = entry.duration_ms != null ? formatDuration(entry.duration_ms) : null;
   const style = activityStyle(entry.activity ?? null);
   const isRecap = entry.activity === 'recap';
@@ -213,6 +214,18 @@ export function DiaryEntry({ entry, now, ttsEnabled = true, distanceUnit = 'mi' 
             {relative}
             {duration ? ` · ${duration}` : ''}
             {distanceSuffix}
+          </small>
+          <small
+            style={{
+              color: 'var(--text-muted)',
+              opacity: 0.75,
+              fontSize: 12,
+              marginTop: -2,
+            }}
+          >
+            <time dateTime={new Date(entry.occurred_at).toISOString()}>
+              {absolute}
+            </time>
           </small>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             {showViewClip && (

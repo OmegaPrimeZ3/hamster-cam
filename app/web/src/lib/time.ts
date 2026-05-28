@@ -35,6 +35,27 @@ export function relativeTime(at: number, now: number = Date.now()): string {
   return atDate.toLocaleDateString();
 }
 
+/**
+ * Absolute timestamp for a diary entry — paired with relativeTime so the
+ * reader gets the friendly read AND the precise wall-clock time. Examples:
+ *   "Tue, May 27, 3:14 PM"     (within the current year)
+ *   "May 27, 2024, 3:14 PM"    (a prior year — weekday dropped, year added)
+ *
+ * `now` is injectable for tests; defaults to wall-clock so the year-drop
+ * heuristic uses the real current year.
+ */
+export function absoluteTime(at: number, now: number = Date.now()): string {
+  const d = new Date(at);
+  const sameYear = d.getFullYear() === new Date(now).getFullYear();
+  return d.toLocaleString(undefined, {
+    ...(sameYear ? { weekday: 'short' } : { year: 'numeric' }),
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
 export function formatDuration(ms: number): string {
   if (ms < MIN) {
     const s = Math.max(1, Math.round(ms / 1000));

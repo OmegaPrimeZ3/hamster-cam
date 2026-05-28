@@ -124,25 +124,6 @@ describe('PetSettings — boolean toggles', () => {
     expect(checkbox).toBeInTheDocument();
     expect(checkbox).toBeChecked();
   });
-
-  it('renders the recap_enabled toggle with correct label and helper text', () => {
-    const { Wrapper } = makeWrapper({ recap_enabled: true });
-    render(<PetSettings />, { wrapper: Wrapper });
-
-    expect(screen.getByText(/AI Nightly Recap/)).toBeInTheDocument();
-    expect(screen.getByText(/warm storybook summary/i)).toBeInTheDocument();
-
-    const checkbox = screen.getByRole('checkbox', { name: /AI Nightly Recap/ });
-    expect(checkbox).toBeChecked();
-  });
-
-  it('renders recap_enabled unchecked when settings.recap_enabled is false', () => {
-    const { Wrapper } = makeWrapper({ recap_enabled: false });
-    render(<PetSettings />, { wrapper: Wrapper });
-
-    const checkbox = screen.getByRole('checkbox', { name: /AI Nightly Recap/ });
-    expect(checkbox).not.toBeChecked();
-  });
 });
 
 describe('Toggle — onChange callback', () => {

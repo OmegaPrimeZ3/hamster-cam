@@ -23,6 +23,7 @@ import { TRPCClientError } from '@trpc/client';
 import type { AppRouter } from '@hamster-cam/server/trpc';
 import { trpc } from '../trpc';
 import type { RouterOutputs } from '../trpc';
+import { absoluteTime } from '../lib/time';
 
 type Entry = RouterOutputs['activity']['today'][number];
 type ClipData = RouterOutputs['clip']['get'];
@@ -72,7 +73,10 @@ export function ClipPlayerDialog({ entry, open, onOpenChange, title = 'Watch cli
             {title}
           </Dialog.Title>
           <p id="clip-help" style={{ color: 'var(--text-muted)', marginTop: 0, marginBottom: 12 }}>
-            {petName} on camera
+            {petName} on camera ·{' '}
+            <time dateTime={new Date(entry.occurred_at).toISOString()}>
+              {absoluteTime(entry.occurred_at)}
+            </time>
           </p>
 
           <ClipBody

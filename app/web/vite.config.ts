@@ -46,7 +46,7 @@ export default defineConfig({
         // App shell SPA fallback so the PWA boots offline on any deep link.
         navigateFallback: '/index.html',
         // ALWAYS bypass the SW for these — they must hit the live backend.
-        navigateFallbackDenylist: [/^\/trpc/, /^\/auth/, /^\/snapshots/, /^\/stream/, /^\/live/, /^\/api/],
+        navigateFallbackDenylist: [/^\/trpc/, /^\/auth/, /^\/snapshots/, /^\/stream/, /^\/live/, /^\/diary\/stream/, /^\/api/],
         runtimeCaching: [
           {
             // Auth endpoints — never cache.
@@ -95,6 +95,11 @@ export default defineConfig({
             urlPattern: /\/live\/.*/i,
             handler: 'NetworkOnly',
           },
+          {
+            // Diary SSE feed — long-lived streaming response, never cache.
+            urlPattern: /\/diary\/stream/i,
+            handler: 'NetworkOnly',
+          },
         ],
       },
     }),
@@ -115,6 +120,7 @@ export default defineConfig({
         '/snapshots': { target: backend, changeOrigin: false },
         '/stream':    { target: backend, changeOrigin: false, ws: true },
         '/live':      { target: backend, changeOrigin: false, ws: true },
+        '/diary':     { target: backend, changeOrigin: false },
       };
     })(),
   },
