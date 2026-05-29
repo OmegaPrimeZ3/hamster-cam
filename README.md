@@ -145,6 +145,26 @@ The Mac Mini is the brain. Any always-on Linux box with an Intel iGPU
 (for OpenVINO) or a Coral USB stick will work — a NUC, an old laptop,
 even a beefier Raspberry Pi 5 with a Coral.
 
+### Alternative: one Pi 5 / Pi 4 / Pi 3 B+ instead of two Pi Zero 2 W's
+
+If your cameras sit within ~3 ft of each other you can consolidate to a
+**single more capable Pi** hosting both USB cameras. Trade-offs:
+
+- Wins: 5 GHz WiFi (or wired Ethernet) eliminates the 2.4 GHz
+  channel-contention pattern that bites Pi Zero W's hard; proper USB
+  host controllers replace the Pi Zero's OTG-mode workarounds; one
+  device to admin instead of two.
+- Costs: single point of failure; **Pi 5 specifically has no hardware
+  H264 encoder** so it software-encodes (manageable on the quad A76);
+  one bad USB camera can affect the other via shared bus.
+- Recommended choice for the role: **Pi 4 (8 GB)** — value sweet spot,
+  has the hardware H264 encoder Pi 5 lost. Pi 5 if you want WiFi 6 and
+  future NPU/Coral headroom. Pi 3 B+ if you have one lying around.
+
+Bring-up steps and a board comparison table are in
+[`docs/SETUP_PI_HOST.md`](docs/SETUP_PI_HOST.md). The Mac Mini side
+collapses to a single hostname with two RTSP paths.
+
 ## Quick start
 
 Roughly four hours spread across an evening or two. The TL;DR:
@@ -170,9 +190,10 @@ Roughly four hours spread across an evening or two. The TL;DR:
    origin `:2053` so visitors use the clean URL.
 8. **Open the URL on a tablet**, run the onboarding wizard, done.
 
-Detailed Mac Mini and Pi Zero setup guides:
+Detailed Mac Mini and Pi setup guides:
 - [`docs/SETUP_MAC_MINI.md`](docs/SETUP_MAC_MINI.md)
-- [`docs/SETUP_PI_ZERO.md`](docs/SETUP_PI_ZERO.md)
+- [`docs/SETUP_PI_ZERO.md`](docs/SETUP_PI_ZERO.md) — dual Pi Zero 2 W, one per camera (the standard build)
+- [`docs/SETUP_PI_HOST.md`](docs/SETUP_PI_HOST.md) — single Pi 5 / Pi 4 / Pi 3 B+ hosting both cameras (alternative)
 
 ## Run locally for UI/UX review
 
