@@ -82,9 +82,12 @@ On your dev machine:
 2. Choose **Raspberry Pi OS Lite (64-bit)** for all three boards. 32-bit is
    not worth saving 100 MB of RAM.
 3. Click the gear icon before flashing to configure:
-   - **Hostname:** `hamster-cam` (singular — the consolidated host owns both
+   - **Hostname:** `hamster-cam-host` (the consolidated host owns both
      streams; the Mac Mini will reference it as one mDNS host with two
-     RTSP paths).
+     RTSP paths). The `-host` suffix keeps it distinct from the dual
+     `hamster-cam-1` / `hamster-cam-2` hostnames used by the Pi Zero
+     path — if you ever revert to dual-Pi or mix architectures, the
+     names don't collide.
    - **Username/password:** `hamster` / strong password.
    - **WiFi SSID and password:** your home network — **prefer the 5 GHz
      SSID** if you're on a separated-SSIDs setup. (Skip WiFi entirely if
@@ -104,7 +107,7 @@ On your dev machine:
 3. **Connect Ethernet** if you're going wired, otherwise just WiFi.
 4. Plug in power.
 5. Wait ~60 seconds for first boot.
-6. From the dev machine: `ssh hamster@hamster-cam.local`.
+6. From the dev machine: `ssh hamster@hamster-cam-host.local`.
 7. If `.local` doesn't resolve, pull the IP from your router / UniFi
    controller DHCP table and SSH to the IP directly.
 
@@ -320,8 +323,8 @@ sudo chmod 644 /etc/go2rtc/go2rtc.yaml
 Frigate on the Mac Mini will pull these as:
 
 ```
-rtsp://hamster:<password>@hamster-cam.local:8554/hamster_cam_1
-rtsp://hamster:<password>@hamster-cam.local:8554/hamster_cam_2
+rtsp://hamster:<password>@hamster-cam-host.local:8554/hamster_cam_1
+rtsp://hamster:<password>@hamster-cam-host.local:8554/hamster_cam_2
 ```
 
 Note the **path** is the stream name, not `/camera` (which is what the
@@ -340,20 +343,20 @@ rather than just `/dev/video0`.
 Copy the units from the dev machine:
 
 ```sh
-scp pi-zero/go2rtc.service hamster@hamster-cam.local:/tmp/
-scp pi-zero/go2rtc-watchdog.sh hamster@hamster-cam.local:/tmp/
-scp pi-zero/go2rtc-watchdog.service hamster@hamster-cam.local:/tmp/
-scp pi-zero/go2rtc-watchdog.timer hamster@hamster-cam.local:/tmp/
-scp pi-zero/wifi-powersave-off.service hamster@hamster-cam.local:/tmp/
-scp pi-zero/ntp-sync.service hamster@hamster-cam.local:/tmp/
-scp pi-zero/timesyncd.conf hamster@hamster-cam.local:/tmp/
+scp pi-zero/go2rtc.service hamster@hamster-cam-host.local:/tmp/
+scp pi-zero/go2rtc-watchdog.sh hamster@hamster-cam-host.local:/tmp/
+scp pi-zero/go2rtc-watchdog.service hamster@hamster-cam-host.local:/tmp/
+scp pi-zero/go2rtc-watchdog.timer hamster@hamster-cam-host.local:/tmp/
+scp pi-zero/wifi-powersave-off.service hamster@hamster-cam-host.local:/tmp/
+scp pi-zero/ntp-sync.service hamster@hamster-cam-host.local:/tmp/
+scp pi-zero/timesyncd.conf hamster@hamster-cam-host.local:/tmp/
 ```
 
 Edit `/tmp/go2rtc.service` on the Pi to add a second `ExecStartPre`
 line so the anti-flicker fix is applied to both cameras:
 
 ```sh
-ssh hamster@hamster-cam.local "sudo sed -i \
+ssh hamster@hamster-cam-host.local "sudo sed -i \
   's|ExecStartPre=-/usr/bin/v4l2-ctl -d /dev/video0 --set-ctrl=power_line_frequency=2|ExecStartPre=-/usr/bin/v4l2-ctl -d /dev/video-cam1 --set-ctrl=power_line_frequency=2\nExecStartPre=-/usr/bin/v4l2-ctl -d /dev/video-cam2 --set-ctrl=power_line_frequency=2|' \
   /tmp/go2rtc.service"
 ```
@@ -361,7 +364,7 @@ ssh hamster@hamster-cam.local "sudo sed -i \
 Then install and enable everything:
 
 ```sh
-ssh hamster@hamster-cam.local '
+ssh hamster@hamster-cam-host.local '
   sudo mv /tmp/go2rtc.service /etc/systemd/system/
   sudo mv /tmp/go2rtc-watchdog.sh /usr/local/sbin/
   sudo mv /tmp/go2rtc-watchdog.service /etc/systemd/system/
@@ -390,7 +393,7 @@ ssh hamster@hamster-cam.local '
 
 ```sh
 # go2rtc web UI — both streams should be listed
-open http://hamster-cam.local:1984
+open http://hamster-cam-host.local:1984
 ```
 
 Click each stream then "stream" — both should play in the browser.
@@ -399,9 +402,9 @@ RTSP smoke test from your dev machine:
 
 ```sh
 ffprobe -v error -show_streams \
-  rtsp://hamster:<password>@hamster-cam.local:8554/hamster_cam_1
+  rtsp://hamster:<password>@hamster-cam-host.local:8554/hamster_cam_1
 ffprobe -v error -show_streams \
-  rtsp://hamster:<password>@hamster-cam.local:8554/hamster_cam_2
+  rtsp://hamster:<password>@hamster-cam-host.local:8554/hamster_cam_2
 ```
 
 Both must report:
@@ -421,14 +424,14 @@ single hostname with their respective stream paths:
 go2rtc:
   streams:
     hamster_cam_1:
-      - rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam.local:8554/hamster_cam_1
+      - rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-host.local:8554/hamster_cam_1
     hamster_cam_2:
-      - rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam.local:8554/hamster_cam_2
+      - rtsp://hamster:{FRIGATE_RTSP_PASSWORD}@hamster-cam-host.local:8554/hamster_cam_2
 ```
 
 Update `mac-mini/docker-compose.yml`'s `extra_hosts` (if you have static
 IP entries for the Pis): replace the two `hamster-cam-N.local` entries
-with one `hamster-cam.local: <Pi's LAN IP>`.
+with one `hamster-cam-host.local: <Pi's LAN IP>`.
 
 Deploy via `./deploy.sh --sync-frigate-config` (or rsync + restart per
 the Mac Mini setup doc).
@@ -438,7 +441,7 @@ the Mac Mini setup doc).
 
 Before moving on, confirm:
 
-- [ ] The Pi is reachable at `hamster-cam.local`
+- [ ] The Pi is reachable at `hamster-cam-host.local`
 - [ ] NTP is active and synchronized (`timedatectl` shows
       `System clock synchronized: yes`)
 - [ ] **Both** `/dev/video-cam1` and `/dev/video-cam2` symlinks exist
@@ -477,7 +480,7 @@ Before moving on, confirm:
   `profile=None` — the exec block is using `-f rtsp {output}` instead
   of `-f mpegts -`. Switch to the pipe form, restart go2rtc, confirm
   via `curl http://127.0.0.1:1984/api/streams`.
-- **`hamster-cam.local` doesn't resolve from the Mac Mini.** mDNS
+- **`hamster-cam-host.local` doesn't resolve from the Mac Mini.** mDNS
   flakes; pin the IP in `mac-mini/docker-compose.yml`'s `extra_hosts`.
 - **Both cameras at low fps under load.** Both are on the same USB 3.0
   controller; check `dmesg | grep -i usb` for bus errors. On Pi 3 B+
