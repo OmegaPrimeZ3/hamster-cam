@@ -29,6 +29,9 @@ function entry(activity: string | null, at: number, durMs = 5_000): DiaryEntryRo
     created_by: null,
     thumbnail_path: null,
     clip_path: null,
+    media_backfill_attempts: 0,
+    media_backfill_last_error: null,
+    media_unavailable: 0,
   };
 }
 

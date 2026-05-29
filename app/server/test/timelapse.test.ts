@@ -911,6 +911,9 @@ describe('tagClipsWithActivityForTest', () => {
       created_by: null,
       thumbnail_path: null,
       clip_path: null,
+      media_backfill_attempts: 0,
+      media_backfill_last_error: null,
+      media_unavailable: 0 as const,
     };
 
     const cameraNameToId = new Map<string, number>([['tag-cam', cam.id]]);
@@ -953,6 +956,9 @@ describe('tagClipsWithActivityForTest', () => {
       created_by: null,
       thumbnail_path: null,
       clip_path: null,
+      media_backfill_attempts: 0,
+      media_backfill_last_error: null,
+      media_unavailable: 0 as const,
     };
 
     const cameraNameToId = new Map<string, number>([['nooverlap-cam', cam.id]]);

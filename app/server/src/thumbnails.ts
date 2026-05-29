@@ -39,6 +39,17 @@ export async function generateThumbnailForEntry(entry: db.DiaryEntryRow): Promis
   }
 }
 
+/**
+ * Same as `generateThumbnailForEntry` but DOES throw on failure.
+ *
+ * Used by the thumbnail-backfill job so it can classify the error (permanent
+ * vs. transient) and update attempt-tracking columns accordingly.
+ * All other callers should continue using the non-throwing variant above.
+ */
+export async function generateThumbnailForEntryUnguarded(entry: db.DiaryEntryRow): Promise<void> {
+  await _generate(entry);
+}
+
 // ---------------------------------------------------------------------------
 // Internal implementation
 // ---------------------------------------------------------------------------

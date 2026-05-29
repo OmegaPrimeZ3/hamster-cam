@@ -8,20 +8,36 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ---------------------------------------------------------------------------
-// Mock generateThumbnailForEntry so tests don't need a real ffmpeg/Frigate.
+// Mock generateThumbnailForEntryUnguarded so tests don't need a real ffmpeg/Frigate.
 // The mock honours a per-test override registered on `thumbnailResults`.
+// thumbnailResults.get(id):
+//   true      → success (writes thumbnail_path to DB)
+//   Error     → throws that error (enables classify-path testing)
+//   undefined → success with no path written (simulates skipped entry)
 // ---------------------------------------------------------------------------
 
-const thumbnailResults = new Map<number, boolean>();
+type ThumbnailOutcome = true | Error | undefined;
+const thumbnailResults = new Map<number, ThumbnailOutcome>();
 
 vi.mock('../src/thumbnails.js', () => ({
   generateThumbnailForEntry: vi.fn(async (entry: { id: number }) => {
-    const succeed = thumbnailResults.get(entry.id) ?? false;
-    if (succeed) {
-      // Persist the thumbnail path on the DB row so the re-fetch check passes.
+    const outcome = thumbnailResults.get(entry.id) ?? undefined;
+    if (outcome === true) {
       const db = await import('../src/db.js');
       db.updateDiaryEntryThumbnailPath(entry.id, join('thumbnails', `entry-${entry.id}-thumb.jpg`));
     }
+    // undefined = return without writing path (silent skip)
+  }),
+  generateThumbnailForEntryUnguarded: vi.fn(async (entry: { id: number }) => {
+    const outcome = thumbnailResults.get(entry.id) ?? undefined;
+    if (outcome instanceof Error) {
+      throw outcome;
+    }
+    if (outcome === true) {
+      const db = await import('../src/db.js');
+      db.updateDiaryEntryThumbnailPath(entry.id, join('thumbnails', `entry-${entry.id}-thumb.jpg`));
+    }
+    // undefined = return without writing path (silent skip)
   }),
 }));
 
@@ -49,6 +65,106 @@ afterEach(async () => {
   resetDbForTests();
   resetConfigForTests();
   rmSync(workdir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Helper: create a camera + diary entry within the retention window
+// ---------------------------------------------------------------------------
+
+async function makeEntry(cameraName: string, overrides?: Partial<{
+  occurred_at: number;
+  kind: string;
+  activity: string;
+  narrative: string;
+}>) {
+  const db = await import('../src/db.js');
+  const camera = db.createCamera({
+    name: cameraName,
+    emoji: '📷',
+    stream_url: 'rtsp://cam',
+    enabled: true,
+  });
+  const entry = db.createDiaryEntry({
+    occurred_at: overrides?.occurred_at ?? Date.now() - 60_000,
+    kind: (overrides?.kind ?? 'narrative') as Parameters<typeof db.createDiaryEntry>[0]['kind'],
+    activity: (overrides?.activity ?? 'wheel') as Parameters<typeof db.createDiaryEntry>[0]['activity'],
+    narrative: overrides?.narrative ?? 'spinning',
+    pet_name: null,
+    camera_id: camera.id,
+    from_camera_id: null,
+    to_camera_id: null,
+    duration_ms: 30_000,
+    snapshot_id: null,
+    media_path: null,
+    details: null,
+  });
+  return { camera, entry };
+}
+
+// ---------------------------------------------------------------------------
+// classifyBackfillError
+// ---------------------------------------------------------------------------
+
+describe('classifyBackfillError', () => {
+  it('classifies HTTP 400 as permanent', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const err = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 400 Bad Request\n');
+    expect(classifyBackfillError(err)).toBe('permanent');
+  });
+
+  it('classifies HTTP 404 as permanent', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const err = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 404 Not Found\n');
+    expect(classifyBackfillError(err)).toBe('permanent');
+  });
+
+  it('classifies HTTP 410 as permanent', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const err = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 410 Gone\n');
+    expect(classifyBackfillError(err)).toBe('permanent');
+  });
+
+  it('classifies HTTP 401 as permanent', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const err = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 401 Unauthorized\n');
+    expect(classifyBackfillError(err)).toBe('permanent');
+  });
+
+  it('classifies ECONNRESET as transient', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const err = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+    expect(classifyBackfillError(err)).toBe('transient');
+  });
+
+  it('classifies ECONNREFUSED as transient', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const err = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    expect(classifyBackfillError(err)).toBe('transient');
+  });
+
+  it('classifies HTTP 429 as transient', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const err = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 429 Too Many Requests\n');
+    expect(classifyBackfillError(err)).toBe('transient');
+  });
+
+  it('classifies HTTP 503 as transient', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const err = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 503 Service Unavailable\n');
+    expect(classifyBackfillError(err)).toBe('transient');
+  });
+
+  it('classifies unknown errors as transient (conservative default)', async () => {
+    const { classifyBackfillError } = await import('../src/jobs/thumbnail-backfill.js');
+    const err = new Error('something completely unknown went wrong');
+    expect(classifyBackfillError(err)).toBe('transient');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -208,6 +324,18 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
     expect(results.some((r) => r.id === no_cam.id)).toBe(false);
   });
 
+  it('excludes entries marked media_unavailable', async () => {
+    const db = await import('../src/db.js');
+
+    const { entry } = await makeEntry('cam-unavailable');
+    db.markDiaryEntryMediaUnavailable(entry.id, 'http_400');
+
+    const cutoff = Date.now() - 10 * 24 * 60 * 60 * 1000;
+    const results = db.listDiaryEntriesMissingThumbnail(cutoff, 50);
+
+    expect(results.some((r) => r.id === entry.id)).toBe(false);
+  });
+
   it('respects limit parameter', async () => {
     const db = await import('../src/db.js');
 
@@ -282,77 +410,43 @@ describe('db.listDiaryEntriesMissingThumbnail', () => {
 });
 
 // ---------------------------------------------------------------------------
-// runThumbnailBackfillJob
+// runThumbnailBackfillJob — basic behaviour
 // ---------------------------------------------------------------------------
 
 describe('runThumbnailBackfillJob', () => {
   it('skips immediately when FRIGATE_URL is not configured', async () => {
     delete process.env['FRIGATE_URL'];
     const { runThumbnailBackfillJob } = await import('../src/jobs/thumbnail-backfill.js');
-    const { generateThumbnailForEntry } = await import('../src/thumbnails.js');
+    const { generateThumbnailForEntryUnguarded } = await import('../src/thumbnails.js');
 
     const result = await runThumbnailBackfillJob();
 
     expect(result).toEqual({ candidates: 0, succeeded: 0, still_missing: 0 });
-    expect(generateThumbnailForEntry).not.toHaveBeenCalled();
+    expect(generateThumbnailForEntryUnguarded).not.toHaveBeenCalled();
   });
 
   it('returns zeros when there are no candidates', async () => {
     process.env['FRIGATE_URL'] = 'http://frigate:5000';
     const { runThumbnailBackfillJob } = await import('../src/jobs/thumbnail-backfill.js');
-    const { generateThumbnailForEntry } = await import('../src/thumbnails.js');
+    const { generateThumbnailForEntryUnguarded } = await import('../src/thumbnails.js');
 
     const result = await runThumbnailBackfillJob();
 
     expect(result.candidates).toBe(0);
     expect(result.succeeded).toBe(0);
-    expect(generateThumbnailForEntry).not.toHaveBeenCalled();
+    expect(generateThumbnailForEntryUnguarded).not.toHaveBeenCalled();
   });
 
-  it('calls generateThumbnailForEntry for each candidate and counts successes', async () => {
+  it('calls generateThumbnailForEntryUnguarded for each candidate and counts successes', async () => {
     process.env['FRIGATE_URL'] = 'http://frigate:5000';
     const db = await import('../src/db.js');
 
-    const camera = db.createCamera({
-      name: 'cam-job',
-      emoji: '📷',
-      stream_url: 'rtsp://cam-job',
-      enabled: true,
-    });
+    const { entry: entry1 } = await makeEntry('cam-job-1');
+    const { entry: entry2 } = await makeEntry('cam-job-2');
 
-    const now = Date.now();
-    const entry1 = db.createDiaryEntry({
-      occurred_at: now - 60_000,
-      kind: 'narrative',
-      activity: 'wheel',
-      narrative: 'spin',
-      pet_name: null,
-      camera_id: camera.id,
-      from_camera_id: null,
-      to_camera_id: null,
-      duration_ms: null,
-      snapshot_id: null,
-      media_path: null,
-      details: null,
-    });
-    const entry2 = db.createDiaryEntry({
-      occurred_at: now - 120_000,
-      kind: 'narrative',
-      activity: 'food',
-      narrative: 'eating',
-      pet_name: null,
-      camera_id: camera.id,
-      from_camera_id: null,
-      to_camera_id: null,
-      duration_ms: null,
-      snapshot_id: null,
-      media_path: null,
-      details: null,
-    });
-
-    // entry1 will succeed; entry2 will not.
+    // entry1 will succeed; entry2 will not (no thumbnail written, no throw).
     thumbnailResults.set(entry1.id, true);
-    thumbnailResults.set(entry2.id, false);
+    // entry2 left as undefined — generator returns without writing path
 
     const { runThumbnailBackfillJob } = await import('../src/jobs/thumbnail-backfill.js');
     const result = await runThumbnailBackfillJob();
@@ -361,8 +455,12 @@ describe('runThumbnailBackfillJob', () => {
     expect(result.succeeded).toBe(1);
     expect(result.still_missing).toBe(1);
 
-    const { generateThumbnailForEntry } = await import('../src/thumbnails.js');
-    expect(generateThumbnailForEntry).toHaveBeenCalledTimes(2);
+    const { generateThumbnailForEntryUnguarded } = await import('../src/thumbnails.js');
+    expect(generateThumbnailForEntryUnguarded).toHaveBeenCalledTimes(2);
+
+    // entry2: no path written and no error → marked unavailable
+    const refreshed2 = db.getDiaryEntryById(entry2.id);
+    expect(refreshed2?.media_unavailable).toBe(1);
   });
 
   it('does not process candidates outside the retention window', async () => {
@@ -396,7 +494,98 @@ describe('runThumbnailBackfillJob', () => {
     const result = await runThumbnailBackfillJob();
 
     expect(result.candidates).toBe(0);
-    const { generateThumbnailForEntry } = await import('../src/thumbnails.js');
-    expect(generateThumbnailForEntry).not.toHaveBeenCalled();
+    const { generateThumbnailForEntryUnguarded } = await import('../src/thumbnails.js');
+    expect(generateThumbnailForEntryUnguarded).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attempt counter — increments only on transient failures
+// ---------------------------------------------------------------------------
+
+describe('runThumbnailBackfillJob — attempt tracking', () => {
+  it('increments media_backfill_attempts on a transient failure', async () => {
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+    const db = await import('../src/db.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+
+    const { entry } = await makeEntry('cam-transient');
+    const transientErr = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 503 Service Unavailable\n');
+    thumbnailResults.set(entry.id, transientErr);
+
+    const { runThumbnailBackfillJob } = await import('../src/jobs/thumbnail-backfill.js');
+    await runThumbnailBackfillJob();
+
+    const refreshed = db.getDiaryEntryById(entry.id);
+    expect(refreshed?.media_backfill_attempts).toBe(1);
+    expect(refreshed?.media_unavailable).toBe(0);
+    expect(refreshed?.media_backfill_last_error).toBe('http_503');
+  });
+
+  it('does NOT increment attempts on a permanent failure (marks unavailable directly)', async () => {
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+    const db = await import('../src/db.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+
+    const { entry } = await makeEntry('cam-perm');
+    const permErr = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 400 Bad Request\n');
+    thumbnailResults.set(entry.id, permErr);
+
+    const { runThumbnailBackfillJob } = await import('../src/jobs/thumbnail-backfill.js');
+    await runThumbnailBackfillJob();
+
+    const refreshed = db.getDiaryEntryById(entry.id);
+    // Attempt counter stays 0 — permanent failures go straight to unavailable.
+    expect(refreshed?.media_backfill_attempts).toBe(0);
+    expect(refreshed?.media_unavailable).toBe(1);
+  });
+
+  it('marks media_unavailable after MAX_TRANSIENT_ATTEMPTS transient failures', async () => {
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+    const db = await import('../src/db.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const { MAX_TRANSIENT_ATTEMPTS } = await import('../src/jobs/thumbnail-backfill.js');
+
+    const { entry } = await makeEntry('cam-maxretry');
+    const transientErr = new FfmpegError('ffmpeg exited with code 1', 1, 'Server returned 503 Service Unavailable\n');
+    thumbnailResults.set(entry.id, transientErr);
+
+    const { runThumbnailBackfillJob } = await import('../src/jobs/thumbnail-backfill.js');
+
+    // Run MAX_TRANSIENT_ATTEMPTS - 1 times — should still be retrying.
+    for (let i = 0; i < MAX_TRANSIENT_ATTEMPTS - 1; i++) {
+      await runThumbnailBackfillJob();
+      // Re-read DB row after each run to update the entry for the next tick.
+      // The job re-queries from DB each tick — no state persists in memory.
+    }
+
+    let refreshed = db.getDiaryEntryById(entry.id);
+    expect(refreshed?.media_backfill_attempts).toBe(MAX_TRANSIENT_ATTEMPTS - 1);
+    expect(refreshed?.media_unavailable).toBe(0);
+
+    // One more run should tip it over the limit.
+    await runThumbnailBackfillJob();
+
+    refreshed = db.getDiaryEntryById(entry.id);
+    expect(refreshed?.media_backfill_attempts).toBe(MAX_TRANSIENT_ATTEMPTS);
+    expect(refreshed?.media_unavailable).toBe(1);
+    expect(refreshed?.media_backfill_last_error).toBe('max_transient_attempts');
+  });
+
+  it('stops picking up a candidate once media_unavailable is set', async () => {
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+    const db = await import('../src/db.js');
+
+    const { entry } = await makeEntry('cam-excluded');
+    db.markDiaryEntryMediaUnavailable(entry.id, 'http_400');
+
+    const { runThumbnailBackfillJob } = await import('../src/jobs/thumbnail-backfill.js');
+    const { generateThumbnailForEntryUnguarded } = await import('../src/thumbnails.js');
+
+    await runThumbnailBackfillJob();
+
+    // generateThumbnailForEntryUnguarded should never have been called for
+    // this entry since it was already excluded from the candidate query.
+    expect(generateThumbnailForEntryUnguarded).not.toHaveBeenCalled();
   });
 });

@@ -120,6 +120,12 @@ export interface DiaryEntryRow {
   thumbnail_path: string | null;
   /** Relative path under STORAGE_PATH to a cached extracted MP4 clip. */
   clip_path: string | null;
+  /** How many times the backfill job has attempted (and failed transiently) to generate media. */
+  media_backfill_attempts: number;
+  /** Last error message from a backfill attempt — null until the first failure. */
+  media_backfill_last_error: string | null;
+  /** 0/1 flag: when 1 the entry is excluded from future backfill runs (permanent give-up). */
+  media_unavailable: 0 | 1;
 }
 
 export interface PushSubscriptionRow {
@@ -282,6 +288,8 @@ interface Statements {
   diaryUpdateThumbnailPath: Database.Statement;
   diaryUpdateClipPath: Database.Statement;
   diaryUpdateDetails: Database.Statement;
+  diaryUpdateBackfillAttempt: Database.Statement;
+  diaryMarkMediaUnavailable: Database.Statement;
   diaryMissingThumbnail: Database.Statement;
   // badges
   badgeInsertDaily: Database.Statement;
@@ -543,14 +551,31 @@ function statements(): Statements {
     diaryUpdateDetails: db.prepare(
       'UPDATE diary_entries SET details = @details WHERE id = @id',
     ),
+    // Backfill attempt tracking: increment the attempt counter and record the
+    // last error message so operators can diagnose without log scraping.
+    diaryUpdateBackfillAttempt: db.prepare(`
+      UPDATE diary_entries
+         SET media_backfill_attempts   = @media_backfill_attempts,
+             media_backfill_last_error = @media_backfill_last_error
+       WHERE id = @id
+    `),
+    // Terminal give-up: once set to 1 this row is excluded from all future
+    // candidate queries. The last_error is also updated so the reason is visible.
+    diaryMarkMediaUnavailable: db.prepare(`
+      UPDATE diary_entries
+         SET media_unavailable         = 1,
+             media_backfill_last_error = @media_backfill_last_error
+       WHERE id = @id
+    `),
     // Backfill query: entries that lack a thumbnail, have a resolvable camera,
-    // and fall within the Frigate recording retention window (passed as a
-    // cutoff epoch-ms via the positional parameter). Excludes 'recap' entries
-    // which never get thumbnails. Newest first so recent races are fixed first.
-    // Uses idx_diary_occurred_at to walk newest-to-oldest efficiently.
+    // fall within the Frigate recording retention window (passed as a cutoff
+    // epoch-ms via the positional parameter), and have NOT been marked as
+    // permanently unavailable. Excludes 'recap' entries which never get
+    // thumbnails. Newest first so recent races are fixed first.
     diaryMissingThumbnail: db.prepare(`
       SELECT * FROM diary_entries
        WHERE thumbnail_path IS NULL
+         AND media_unavailable = 0
          AND kind != 'recap'
          AND occurred_at >= ?
          AND (camera_id IS NOT NULL
@@ -1336,11 +1361,41 @@ export function updateDiaryEntryDetails(id: number, details: Record<string, unkn
 }
 
 /**
+ * Increment the backfill attempt counter and record the last error text.
+ * Called by the backfill job on each transient failure so progress is visible
+ * to operators without requiring log scraping.
+ */
+export function updateDiaryEntryBackfillAttempt(
+  id: number,
+  attempts: number,
+  lastError: string,
+): void {
+  statements().diaryUpdateBackfillAttempt.run({
+    id,
+    media_backfill_attempts: attempts,
+    media_backfill_last_error: lastError,
+  });
+}
+
+/**
+ * Mark a diary entry as permanently media-unavailable so the backfill job
+ * never visits it again. Records the reason in `media_backfill_last_error`
+ * for operator visibility.
+ */
+export function markDiaryEntryMediaUnavailable(id: number, reason: string): void {
+  statements().diaryMarkMediaUnavailable.run({
+    id,
+    media_backfill_last_error: reason,
+  });
+}
+
+/**
  * Return diary entries that are missing a thumbnail and are candidates for
- * backfill: they have a resolvable camera AND fall within the given retention
- * window (i.e. occurred_at >= retentionCutoffMs). Results are ordered
- * newest-first so the most-recently-written race failures are healed first.
- * `limit` caps the batch size per job run to avoid hammering Frigate.
+ * backfill: they have a resolvable camera, fall within the given retention
+ * window (i.e. occurred_at >= retentionCutoffMs), and have NOT been marked
+ * as permanently unavailable. Results are ordered newest-first so the most
+ * recently-written race failures are healed first. `limit` caps the batch
+ * size per job run to avoid hammering Frigate.
  */
 export function listDiaryEntriesMissingThumbnail(
   retentionCutoffMs: number,
