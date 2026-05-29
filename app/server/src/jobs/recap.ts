@@ -34,8 +34,10 @@ const logger = childLogger('recap-job');
  * Thrown by callGemini when the Gemini API returns a non-2xx status.
  * Carries the HTTP status and the raw response body so callers can log
  * actionable diagnostics (e.g. 400 = bad model name, 403 = quota/key).
+ * `attempts` is set by callGeminiWithRetry before re-throwing.
  */
 class GeminiApiError extends Error {
+  attempts = 1;
   constructor(
     message: string,
     readonly httpStatus: number,
@@ -46,10 +48,113 @@ class GeminiApiError extends Error {
   }
 }
 
+/**
+ * Wraps a generic network/abort error after all retry attempts are exhausted.
+ * Carries the total attempt count so the final log line can report it.
+ */
+class GeminiRetryExhaustedError extends Error {
+  constructor(
+    message: string,
+    readonly originalCause: unknown,
+    readonly attempts: number,
+  ) {
+    super(message);
+    this.name = 'GeminiRetryExhaustedError';
+  }
+}
+
 const SKIP_KINDS: ReadonlySet<db.DiaryKind> = new Set(['timelapse', 'recap']);
 const SKIP_ACTIVITIES: ReadonlySet<db.DiaryActivity> = new Set(['snapshot', 'timelapse', 'recap']);
 const MIN_SOURCE_ENTRIES = 3;
-const FETCH_TIMEOUT_MS = 20_000;
+
+/**
+ * Per-call timeout for the Gemini HTTP request. 30 s gives enough headroom for
+ * a slow-but-healthy Gemini (manual trigger measured ~9.5 s; original 20 s
+ * fired prematurely at 06:09 PDT). Bumped from 20 s.
+ */
+const FETCH_TIMEOUT_MS = 30_000;
+
+// ---------------------------------------------------------------------------
+// Retry configuration — tunable constants near the top for easy future change.
+// ---------------------------------------------------------------------------
+
+/** Total call attempts (1 initial + N-1 retries). */
+const GEMINI_MAX_ATTEMPTS = 4;
+
+/**
+ * Base delay in ms for exponential backoff.
+ * Actual delay for attempt i (0-indexed, where 0 = first retry):
+ *   base * 2^i + Math.random() * BACKOFF_JITTER_MS
+ * → ~10 s, ~30 s (capped at 60 s + jitter), ~60 s + jitter
+ */
+const BACKOFF_BASE_MS = 10_000;
+const BACKOFF_MAX_MS  = 60_000;
+const BACKOFF_JITTER_MS = 1_000;
+
+/**
+ * HTTP status codes from Gemini that are considered transient and safe to
+ * retry. 400/401/403/404 are permanent failures (bad config, bad key, bad
+ * model) — we give up immediately on those.
+ */
+const RETRYABLE_HTTP_STATUSES: ReadonlySet<number> = new Set([408, 429, 500, 502, 503, 504]);
+
+/**
+ * Node.js error codes that indicate a transient network condition.
+ */
+const RETRYABLE_NODE_CODES: ReadonlySet<string> = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'FETCH_ERROR',
+]);
+
+/**
+ * Returns true if the thrown error should trigger a retry.
+ * Exported so the unit-test suite can exercise the classifier directly.
+ */
+export function isRetryableGeminiError(err: unknown): boolean {
+  // GeminiApiError: only retry on explicitly transient HTTP statuses.
+  if (err instanceof GeminiApiError) {
+    return RETRYABLE_HTTP_STATUSES.has(err.httpStatus);
+  }
+  // GeminiSafetyError: content policy block — do NOT retry (it'll block again).
+  if (err instanceof GeminiSafetyError) {
+    return false;
+  }
+  if (err instanceof Error) {
+    // AbortController fires with name='AbortError' or message contains the
+    // phrase Node uses: "This operation was aborted" / "The operation was aborted."
+    if (
+      err.name === 'AbortError' ||
+      (err as NodeJS.ErrnoException).code === 'ABORT_ERR' ||
+      err.message.includes('aborted') ||
+      err.message.includes('operation was aborted')
+    ) {
+      return true;
+    }
+    // Network-level errors carry a `.code` property.
+    const code = (err as NodeJS.ErrnoException).code ?? '';
+    if (RETRYABLE_NODE_CODES.has(code.toUpperCase())) {
+      return true;
+    }
+    // FetchError (undici / node-fetch) carries type='system' for network faults.
+    // Treat any unrecognised non-HTTP error as transient (log and retry).
+    return true;
+  }
+  // Unknown throw type: treat as transient.
+  return true;
+}
+
+/**
+ * Compute exponential backoff delay (ms) for the given 0-indexed retry
+ * attempt (0 = first retry, 1 = second, …).
+ */
+function backoffDelayMs(retryIndex: number): number {
+  const base = BACKOFF_BASE_MS * Math.pow(2, retryIndex);
+  const capped = Math.min(base, BACKOFF_MAX_MS);
+  return capped + Math.random() * BACKOFF_JITTER_MS;
+}
 
 /** 9-hour overnight capture window: 21:00 → 06:00. */
 const NIGHT_WINDOW_MS = 9 * 60 * 60 * 1000;
@@ -65,6 +170,8 @@ export interface RecapRunResult {
 export interface RecapDeps {
   now?: () => number;
   fetch?: typeof globalThis.fetch;
+  /** Inject a no-op or fast sleep in tests to avoid real backoff delays. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -80,6 +187,7 @@ export async function runRecapJob(
   const cfg = getConfig();
   const fetchFn = deps.fetch ?? globalThis.fetch;
   const nowFn = deps.now ?? (() => Date.now());
+  const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
   const refDate = ref ?? new Date(nowFn());
 
@@ -163,11 +271,16 @@ export async function runRecapJob(
 
   let recapText: string;
   try {
-    recapText = await callGemini(cfg.GEMINI_API_KEY, geminiModel, prompt, fetchFn);
+    recapText = await callGeminiWithRetry(
+      cfg.GEMINI_API_KEY,
+      geminiModel,
+      prompt,
+      fetchFn,
+      sleepFn,
+      isoDate,
+    );
   } catch (err) {
-    // Log at ERROR level (not warn) so this surfaces clearly in production.
     if (err instanceof GeminiApiError) {
-      // HTTP error: 400 = bad model name, 403 = quota/key issue, 429 = rate limit.
       logger.error(
         {
           job: 'recap',
@@ -175,6 +288,7 @@ export async function runRecapJob(
           model: geminiModel,
           http_status: err.httpStatus,
           response_body: err.responseBody.slice(0, 500),
+          attempts: err.attempts,
           hint: err.httpStatus === 400
             ? 'Check GEMINI_MODEL — gemini-2.0-flash is deprecated; use gemini-2.5-flash'
             : err.httpStatus === 403
@@ -184,7 +298,6 @@ export async function runRecapJob(
         'overnight recap: Gemini API HTTP error — check GEMINI_API_KEY and GEMINI_MODEL',
       );
     } else if (err instanceof GeminiSafetyError) {
-      // Safety block: prompt triggered Gemini's content filters.
       logger.error(
         {
           job: 'recap',
@@ -192,12 +305,19 @@ export async function runRecapJob(
           model: geminiModel,
           finish_reason: err.finishReason,
           block_reason: err.blockReason,
+          attempts: err.attempts,
         },
         'overnight recap: Gemini blocked response (safety/policy filter)',
       );
     } else {
       logger.error(
-        { job: 'recap', night: isoDate, model: geminiModel, err: (err as Error).message },
+        {
+          job: 'recap',
+          night: isoDate,
+          model: geminiModel,
+          err: (err as Error).message,
+          attempts: (err as GeminiRetryExhaustedError).attempts ?? 1,
+        },
         'overnight recap: Gemini API call failed (network/timeout)',
       );
     }
@@ -321,8 +441,10 @@ interface GeminiResponse {
  * Thrown by callGemini when Gemini blocks the response for safety / policy
  * reasons (finishReason SAFETY/RECITATION/OTHER). Distinct from GeminiApiError
  * (HTTP error) so callers can log more useful diagnostics.
+ * `attempts` is set by callGeminiWithRetry before re-throwing.
  */
 class GeminiSafetyError extends Error {
+  attempts = 1;
   constructor(
     message: string,
     readonly finishReason: string,
@@ -331,6 +453,95 @@ class GeminiSafetyError extends Error {
     super(message);
     this.name = 'GeminiSafetyError';
   }
+}
+
+/**
+ * Calls callGemini with exponential-backoff retries for transient failures.
+ *
+ * - Up to GEMINI_MAX_ATTEMPTS total (1 initial + retries).
+ * - On permanent failure (non-retryable error) gives up immediately.
+ * - Logs a warning before each retry; logs success-after-retry at info level.
+ * - Throws the final error (with `attempts` field set) so the caller can log it.
+ * - The diary insert happens AFTER this function returns; there is no risk of a
+ *   double-write from retries.
+ */
+async function callGeminiWithRetry(
+  apiKey: string,
+  model: string,
+  prompt: string,
+  fetchFn: typeof globalThis.fetch,
+  sleepFn: (ms: number) => Promise<void>,
+  nightLabel: string,
+): Promise<string> {
+  const callStart = Date.now();
+  let attempt = 0;
+  let lastErr: unknown;
+
+  while (attempt < GEMINI_MAX_ATTEMPTS) {
+    attempt += 1;
+    try {
+      const text = await callGemini(apiKey, model, prompt, fetchFn);
+      if (attempt > 1) {
+        logger.info(
+          {
+            job: 'recap',
+            night: nightLabel,
+            model,
+            attempt,
+            of: GEMINI_MAX_ATTEMPTS,
+            totalElapsedMs: Date.now() - callStart,
+          },
+          'overnight recap: Gemini call succeeded after retry',
+        );
+      }
+      return text;
+    } catch (err) {
+      lastErr = err;
+
+      // Permanent errors: give up now, don't consume remaining attempts.
+      if (!isRetryableGeminiError(err)) {
+        break;
+      }
+
+      if (attempt < GEMINI_MAX_ATTEMPTS) {
+        const delayMs = backoffDelayMs(attempt - 1); // 0-indexed retry index
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const errCode =
+          err instanceof GeminiApiError
+            ? `HTTP_${err.httpStatus}`
+            : (err instanceof Error
+                ? ((err as NodeJS.ErrnoException).code ?? err.name)
+                : 'UNKNOWN');
+
+        logger.warn(
+          {
+            job: 'recap',
+            night: nightLabel,
+            model,
+            attempt,
+            of: GEMINI_MAX_ATTEMPTS,
+            delayMs: Math.round(delayMs),
+            errCode,
+            err: errMsg,
+          },
+          'overnight recap: Gemini call failed, will retry',
+        );
+        await sleepFn(delayMs);
+      }
+    }
+  }
+
+  // Attach the attempt count to the thrown error so the caller's log includes it.
+  if (lastErr instanceof GeminiApiError || lastErr instanceof GeminiSafetyError) {
+    lastErr.attempts = attempt;
+    throw lastErr;
+  }
+  // Wrap generic network/abort errors so the caller gets a typed object.
+  throw new GeminiRetryExhaustedError(
+    lastErr instanceof Error ? lastErr.message : String(lastErr),
+    lastErr,
+    attempt,
+  );
 }
 
 function buildBulletList(entries: db.DiaryEntryRow[]): string {
