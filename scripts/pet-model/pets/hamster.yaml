@@ -61,11 +61,17 @@ datasets:
 local_sources:
   - path: ~/pet-models/hamster/local/cage_neg
     role: negative
-  # - path: ~/pet-models/hamster/local/cage_pos   # enable after box-review (recall pass)
-  #   role: positive
-local_oversample: 2   # 200 culled negatives ×2 ≈ 400 (~15% of the ~2700 public
-                      # positives) — enough weight to suppress the fluff/house false
-                      # fires without nearing the runbook's ≤40% collapse ceiling.
+  - path: ~/pet-models/hamster/local/cage_pos   # V4: enabled (recall pass)
+    role: positive                              # frames must be HUMAN-reviewed first
+                                                # (V1's autolabels are contaminated
+                                                # with reflection boxes — Aaron-only)
+local_oversample: 4   # V4: was 2. With cage_pos + cage_neg now both in play, the
+                      # local pool is ~723 frames (523 pos + 200 neg). Oversampled
+                      # 4× ≈ 2,892 effective, comparable to the ~2,700 public
+                      # positives. Stops public data from drowning the cage signal
+                      # (the V2 dilution failure mode). Don't go above 4 without
+                      # measuring against Phase J — over-oversampling makes the
+                      # model overfit Remy.
 
 # Phase I domain augmentation — forwarded to Ultralytics model.train() verbatim.
 # Simulates the day↔night/IR brightness range and the camera's ~45° angle.
@@ -80,10 +86,15 @@ augment:
   close_mosaic: 10
 
 base_model: yolov9t.pt
-imgsz: 320
-epochs: 150
-batch: 32
-patience: 50
+imgsz: 480       # V4 Option C: bumped from 320 for small-Remy/occluded recall.
+                 # Per-inference cost rises ~2.25× (~14 → ~31 ms on UHD 630).
+                 # At Frigate 10 fps × 2 cams ≈ 62% detector budget. Acceptable.
+                 # See docs/HAMSTER_MODEL_V4.md §10.5 for the attribution caveat.
+epochs: 200      # V4: was 150 — more cage data + bigger input deserves more epochs
+batch: 24        # V4: was 32 — drop for MPS VRAM at 480²; bump back to 32 if your
+                 # dev Mac has headroom (an `OutOfMemoryError` on first epoch is
+                 # the signal you needed the drop)
+patience: 60     # V4: was 50
 device: mps
 val_split: 0.20
 

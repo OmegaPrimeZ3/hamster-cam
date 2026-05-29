@@ -5,8 +5,11 @@
 runbook the v3 precision pass was built from). This doc is V4-specific — read
 the tuning runbook first if you're new to the pipeline.
 
-> Last updated: 2026-05-28 · Author: Aaron + Claude (planning session)
-> Status: **planning** — no execution yet, awaiting go-order for Phase 0.
+> Last updated: 2026-05-29 · Author: Aaron + Claude (planning session)
+> Status: **executing — Option C selected** (V4 trains at imgsz=480; the
+> imgsz lever is bundled with the cage-data lever in a single deploy,
+> accepting that a successful V4 won't cleanly attribute the win between
+> the two — see §10.5).
 
 ---
 
@@ -327,8 +330,14 @@ local_sources:
     role: positive
 
 local_oversample: 4    # was 2 — cage data is dwarfed by ~2700 public positives
+imgsz: 480              # was 320 — Option C: bigger input tensor for small-Remy + occluded recall.
+                        # Inference cost roughly 2.25× (V3 ~14ms → V4 ~31ms).
+                        # Budget: 10fps × 2 cams × 31ms ≈ 620ms/sec (62% used).
+                        # DO NOT pair with a detect.fps bump in the same deploy.
 epochs: 200             # was 150
 patience: 60            # was 50
+batch: 24               # was 32 — drop to keep MPS VRAM under the 480² ceiling;
+                        # if your dev Mac has headroom, leave at 32
 
 # augment block unchanged from V3 (Phase I knobs already wired)
 # base_model: yolov9t.pt  — only bump to yolov9s if Phase J fails
@@ -357,8 +366,14 @@ export ROBOFLOW_API_KEY=...   # verify .env has a valid 20-char private key
 
 ```sh
 yolo detect val model=models/hamster/v3/best.pt data=cage_test.yaml imgsz=320 split=test
-yolo detect val model=models/hamster/v4/best.pt data=cage_test.yaml imgsz=320 split=test
+yolo detect val model=models/hamster/v4/best.pt data=cage_test.yaml imgsz=480 split=test
 ```
+
+**Honest note on the V3-vs-V4 comparison**: V3 ran at imgsz=320 in
+production and is evaluated at its native size. V4 runs at imgsz=480.
+This is what's live vs what we'd ship. If V4 wins, you do not know how
+much of the lift comes from cage data vs imgsz — Option C explicitly
+accepts that confound. See §10.5.
 
 ### 4.2 Negative eval
 
@@ -375,7 +390,7 @@ reflection box), then compare:
 yolo detect predict model=models/hamster/v3/best.pt source=cage_coocc_test/images \
   imgsz=320 conf=0.25 save_txt=True save_conf=True project=eval name=v3_coocc
 yolo detect predict model=models/hamster/v4/best.pt source=cage_coocc_test/images \
-  imgsz=320 conf=0.25 save_txt=True save_conf=True project=eval name=v4_coocc
+  imgsz=480 conf=0.25 save_txt=True save_conf=True project=eval name=v4_coocc
 ```
 
 Score each frame:
@@ -436,24 +451,34 @@ ssh omegaprime@project-server \
 
 ### 5.2 Edit live Frigate config
 
-Three coordinated edits (Frigate UI or scp):
+**Five** coordinated edits (Frigate UI or scp), all reverted as one
+rollback button (§5.5):
 
 1. `model.path: /config/model_cache/hamster_y9_v4.onnx`
-2. `objects.filters.hamster.threshold: 0.65 → 0.60` (or 0.55 if Phase 4
+2. **`model.width: 320 → 480`** (Option C)
+3. **`model.height: 320 → 480`** (Option C)
+4. `objects.filters.hamster.threshold: 0.65 → 0.60` (or 0.55 if Phase 4
    showed V4 holds precision at conf 0.55).
-3. Resolve per-cam `min_score: 0.5` ambiguity from §10.1 (either delete the
+5. Resolve per-cam `min_score: 0.5` ambiguity from §10.1 (either delete the
    per-cam line, or align to global).
 
 ### 5.3 Restart + verify
 
 ```sh
 ssh omegaprime@project-server "docker compose -f /opt/hamster-cam/docker-compose.yml restart frigate"
-ssh omegaprime@project-server "docker logs --tail=200 hamster-frigate | grep -iE 'model|onnx|error'"
+ssh omegaprime@project-server "docker logs --tail=200 hamster-frigate | grep -iE 'model|onnx|input|shape|width|error'"
 ssh omegaprime@project-server "curl -s http://127.0.0.1:5000/api/stats | jq '.detectors.ov, .cameras'"
 ```
 
-Expect: clean model load, `inference_speed` ~10–25 ms, both cams
-`detection_fps > 0` on motion, no ONNX errors.
+Expect (Option C):
+
+- Clean model load — no shape-mismatch errors in the log
+- `inference_speed` **~28–35 ms** (V3 at 320 was ~14 ms; V4 at 480 is
+  ~2.25× per-inference). If `inference_speed` is still ~14 ms, the
+  model may have failed to load and Frigate fell back to a previous
+  state — check the log for `tensor shape` / `input` errors.
+- Both cams `detection_fps > 0` on motion
+- No ONNX errors
 
 ### 5.4 [HUMAN] sign-off
 
@@ -464,14 +489,23 @@ Expect: clean model load, `inference_speed` ~10–25 ms, both cams
 
 ### 5.5 Rollback (if needed)
 
+Option C requires three coordinated reverts (vs Plan A's one):
+
 ```sh
 ssh omegaprime@project-server \
   "cd /opt/hamster-cam/models && cp hamster_y9_v3.onnx hamster_y9.onnx"
-# revert frigate-config threshold to 0.65
+# Revert frigate-config:
+#   - model.path back to V3 ONNX (above)
+#   - model.width 480 → 320
+#   - model.height 480 → 320
+#   - threshold 0.60 (or 0.55) → 0.65
+# All four edits in one Frigate config write, then:
 ssh omegaprime@project-server "docker compose -f /opt/hamster-cam/docker-compose.yml restart frigate"
 ```
 
-Under 60 seconds.
+Under 60 seconds. **Don't rollback just the .onnx without also reverting
+model.width/height — V3 was trained at 320 and Frigate will refuse to
+load it at width 480.**
 
 ---
 
@@ -498,6 +532,27 @@ recall, bump to `yolov9s.pt` and re-run §7. Re-verify
 - [ ] Conservative: 0.65 → 0.60 (small step, safer).
 - [ ] Aggressive: 0.65 → 0.55 (full Phase K — only if V4 is clean at conf
       0.55 in negative eval).
+
+### 10.5 imgsz 320 vs 480 — RESOLVED (Option C)
+
+**Decision (2026-05-29):** V4 trains AND evaluates AND deploys at
+**imgsz=480**, bundled with the cage-data lever. Trade accepted:
+
+- ✅ **Pro**: small-Remy / partial-occlusion / sleeping-in-tunnel recall
+  improves measurably (more pixels per region in the input tensor)
+- ✅ **Pro**: single deploy, single rollback button, single experiment
+- ⚠️ **Con**: V4 vs V3 cage-test mAP50 win cannot be cleanly attributed
+  between "cage data + co-occurrence labels" and "input resolution".
+  Successful V4 lands without knowing which lever drove it. The plan
+  explicitly accepts this — see §1 Mission.
+- ⚠️ **Inference budget**: V3 ~14 ms → V4 ~31 ms. At 10 fps × 2 cams =
+  62% used. Comfortable but smaller margin than V3. Do **not** bundle
+  a `detect.fps` bump with the V4 deploy.
+
+If V4 ships and a later regression-bisection becomes important
+(e.g. for V5 design), a one-off V4-at-320 build off the same harvest
+can answer the attribution question. Not needed for the V4 ship
+decision.
 
 ### 10.4 `tpicos-2-maurcio/hamster-and-guinea-pig` dataset
 
@@ -526,6 +581,15 @@ gives us the measurement to decide. Defer to a hypothetical V5.
 - **Do not** box the reflection in co-occurrence frames during §1.3 review.
   The label discipline IS the training signal — boxing both teaches the
   model both are hamsters, which is the V3 bug.
+- **Do not** bundle a `detect.fps: 10 → 15` bump with the V4 deploy
+  (Option C). V4 at imgsz=480 lands at ~62% of detector budget at 10 fps;
+  going 15 fps puts it at ~93% — one motion burst and you queue. Ship
+  V4 first, bake for a week with inference_speed under watch, THEN
+  consider the fps bump as a separate change.
+- **Do not** rollback V4's ONNX without ALSO reverting
+  `model.width/height` from 480 → 320 (§5.5). V3 was trained at 320;
+  Frigate will refuse to load it at width 480 and the stack will be
+  down until you re-edit and restart.
 
 ---
 
