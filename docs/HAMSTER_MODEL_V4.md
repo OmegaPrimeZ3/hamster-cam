@@ -464,13 +464,13 @@ rollback button (§5.5):
 
 **Note on `detect.width/height` (intentionally NOT in the list above):**
 The per-camera `detect.width: 1280, detect.height: 720` block is the
-*camera-capture* resolution Frigate downscales **into** `model.W/H`. With
-the current Pi Zero 2 W stack still streaming 720p, leaving detect at
-1280×720 is correct — bumping it above the source would just upscale, no
-information gained. **If/when the Pi 4 + 1080p migration in §10.6
-happens, the detect resolution must move with the stream**, otherwise
-V4 sees a 720p-downscaled-then-upscaled view and the bigger model input
-gets none of the benefit you paid for.
+*camera-capture* resolution Frigate downscales **into** `model.W/H`.
+**V4 stays at 720p detect, regardless of whether Pi 4 / 1080p migration
+happens later.** V4's value is the imgsz bump from 320 → 480 against the
+existing 720p source — that alone delivers ~2.25× more pixels per
+detection (1280×720 downscaled to 480×480 vs 320×320). Bumping detect
+above 720p is a separate optimization tied to a hypothetical 1080p
+source — see §10.6 — and is not in scope for V4.
 
 ### 5.3 Restart + verify
 
@@ -543,44 +543,33 @@ recall, bump to `yolov9s.pt` and re-run §7. Re-verify
 - [ ] Aggressive: 0.65 → 0.55 (full Phase K — only if V4 is clean at conf
       0.55 in negative eval).
 
-### 10.6 detect.width/height — coupled to the source, NOT to V4 directly
+### 10.6 detect.width/height — out of scope for V4
 
-V4's imgsz=480 (`model.W/H: 480`) is independent of `detect.W/H` — they
-control different layers of the pipeline:
+**V4 stays at `detect.width: 1280, detect.height: 720` no matter what.**
+Whether the Pi 4 + 1080p migration ever happens does not change V4's
+deploy or rollback. The plan is fully decoupled.
+
+The two settings sit at different layers and change for different reasons:
 
 | Setting | What it is | When to change |
 |---|---|---|
-| `detect.width / detect.height` | Camera-capture resolution Frigate reads from the stream | **Only when the source stream resolution changes** (Pi 4 + 1080p migration). |
-| `model.width / model.height` | Tensor shape the detector expects | When the model is retrained at a new imgsz. **V4 = 480** (this change). |
+| `detect.width / detect.height` | Camera-capture resolution Frigate reads from the stream | Only when source stream resolution changes. Not now. Not part of V4. |
+| `model.width / model.height` | Tensor shape the detector expects | When the model is retrained at a new imgsz. **V4 = 480**. |
 
-**With the current 720p Pi Zero 2 W stack:** leave
-`detect.width: 1280, detect.height: 720` as-is. Bumping detect above
-the source resolution causes upscaling (no information gained, CPU
-wasted).
+If you ever do the Pi 4 + 1080p migration as a **separate, later
+workstream**, the `detect.W/H` bump from 1280×720 → 1920×1080 is its own
+decision. It is not implied by V4, not blocked on V4, not unblocked by
+V4. The two changes are orthogonal.
 
-**If you do the Pi 4 + 1080p migration (separate workstream from V4
-deploy):** bump BOTH:
+Why this matters operationally:
 
-```yaml
-detect:
-  width: 1920    # was 1280
-  height: 1080   # was 720
-  fps: 10
-```
-
-…on each per-camera block. Without this edit, the 1080p stream would
-be downscaled to 1280×720 inside Frigate before reaching V4's 480×480
-preprocessor — wasting the entire reason for going 1080p.
-
-Don't bundle this with the V4 deploy unless the Pi 4 swap is happening
-the same day. Two reasons:
-1. **Confounds the V4 vs V3 measurement.** Even with the imgsz=480
-   confound accepted (§10.5), adding "source res also doubled" makes
-   regression bisection impossible if something breaks.
-2. **Software decode CPU on the Mini.** 1080p × 10 fps × 2 cams roughly
-   doubles ffmpeg decode cost on top of V4's 2.25× inference cost. May
-   need to drop detect fps to 5-8 to stay within budget — measure with
-   `scripts/cam-health.sh` before committing.
+- V4's deploy diff stays at 5 lines (§5.2). It does not grow.
+- V4's rollback button stays simple (model.path + width + height +
+  threshold + per-cam min_score).
+- If you do migrate to Pi 4 + 1080p someday, the source upgrade plus a
+  detect.W/H bump is its own change with its own risk profile — chiefly
+  software-decode CPU on the Mini. Treat it like any other infra
+  change: measure with `scripts/cam-health.sh` before and after.
 
 ### 10.5 imgsz 320 vs 480 — RESOLVED (Option C)
 
