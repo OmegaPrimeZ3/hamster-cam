@@ -29,6 +29,10 @@ missing, without giving back any of the precision V3 earned.
   held-out set.
 - **0/200 false fires** on the V3 negative eval at the live operating point
   (conf ≥ 0.60).
+- **Reflection-vs-live ranking**: on the held-out co-occurrence set
+  (§2.5 — frames containing **both** Remy and his reflection), the live
+  hamster's box scores **strictly higher** than the reflection's box on
+  ≥ 95% of frames. V3 is currently failing this — see §1.2.5.
 - Frigate threshold relaxed `0.65 → 0.60` (or 0.55 if precision holds at
   conf 0.55 in eval).
 - Verified live across a full day/night cycle.
@@ -210,16 +214,70 @@ yolo detect predict model=models/hamster/v3/best.pt \
 For the existing 523-frame `cage_pos/` set, **re-run V3 auto-label** on top —
 don't trust the v1 labels still in that directory.
 
+### 1.2.5 Known V3 failure mode — reflection beats live hamster
+
+**Symptom (observed in review of V3 event frames, 2026-05-29):** when both
+the live Remy **and his reflection** appear in the same frame (cage glass,
+water bowl glint, dark hide interior), V3 routinely selects the
+**reflection** as its top-scoring detection and **ignores the live
+hamster**. The reflection often scores higher than (or equal to) the
+real animal, so NMS keeps the wrong box. This is not a recall failure
+(V3 *does* see hamster-shaped things) — it's a **ranking failure**.
+
+This is what the V3 negative pass missed. The 200 V3 negatives taught
+the model *"empty reflection ≠ hamster"*. They did NOT teach the model
+*"in a frame with both, pick the live one."* Reflection-only negatives
+suppress phantom fires on empty frames, but when both classes of pixel
+appear together the model still finds the reflection compelling and
+NMS can't disambiguate at the score level.
+
+V4 must address this directly through **co-occurrence training data**
+(§1.4) and a **dedicated eval gate** (§4.2.5). It cannot be papered over
+with Frigate filters — the reflection's bounding box passes every
+size/aspect/score filter the live hamster does.
+
 ### 1.3 [HUMAN] box review (the work that buys accuracy)
 
 - [ ] Push frames + V3 pre-labels to a free Roboflow project (or local
       labelImg / Label Studio).
 - [ ] Tighten loose boxes, add the misses (sleeping/curled/partial Remy is
       the high-value class), delete phantom boxes on reflections.
+- [ ] **Co-occurrence frames (the V3 fix):** for any frame containing
+      both the live Remy AND a reflection, box **only the live Remy**.
+      Do **not** box the reflection. If V3's pre-label put the box on
+      the reflection (likely — that's the bug we're fixing), **delete
+      that box and re-draw on the live animal**. These frames are the
+      single most important training data V4 will see.
+- [ ] Tag the co-occurrence frames during review (e.g. filename prefix
+      `coocc_` or a Roboflow tag). You'll need to find them again in
+      §2.5 to carve out the held-out co-occurrence test set.
 - [ ] Budget 30–60 min. Skipping this step makes V4 a re-skin of V3.
 - [ ] Export reviewed as YOLOv8 to
       `~/pet-models/hamster/local/cage_pos/{images,labels}` —
       **overwrite** the contaminated v1 labels.
+
+### 1.4 Targeted co-occurrence harvest (additive)
+
+The 523 night + new daytime positives will contain *some* co-occurrence
+frames incidentally. We want **more**. From the same recording window
+(`2026-05-25 19:00` onward), pull additional frames specifically chosen
+because both Remy and a clear reflection are visible:
+
+- [ ] On the dev Mac after the §1.1 harvest, eyeball the
+      `~/pet-models/hamster/harvest/{day,night}/` directories — sort by
+      filename / browse a few hundred — and pull out frames with
+      obvious mirror-image pairs (Remy + glass reflection, Remy + water
+      bowl, Remy at the front of the cage near a hide opening).
+- [ ] Target: **40–80 co-occurrence frames**, balanced across day/night
+      and cam1/cam2.
+- [ ] Tag them (`coocc_*.jpg`) and review them as part of §1.3 — the
+      label rule is the same: box the live animal, never the reflection.
+- [ ] These frames join `~/pet-models/hamster/local/cage_pos/` like any
+      other reviewed positive. They are NOT a separate `local_sources`
+      entry — they're just well-chosen positives. The training signal
+      *is* the label discipline (live boxed, reflection unboxed-as-background
+      in the same frame). YOLO treats unboxed regions of a positive image
+      as background, which is exactly the lesson we need.
 
 ---
 
@@ -236,6 +294,22 @@ You can't tune what you can't measure. V3 deployed without this; V4 will not.
 - [ ] **These frames never touch train or val.** Move them out of
       `cage_pos/` before §3 build runs, so the deterministic split can't
       leak them.
+
+### 2.5 Held-out co-occurrence eval set (mandatory for V4)
+
+V3's headline regression is reflection-beats-live (§1.2.5). V4 must
+measurably fix it on data the model never saw during training.
+
+- [ ] From the §1.4 co-occurrence harvest, set aside **20–30 of the
+      tagged `coocc_*` frames** — under
+      `~/pet-models/hamster/cage_coocc_test/{images,labels}`.
+- [ ] Write `cage_coocc_test.yaml` (`split: test`, paths absolute).
+- [ ] **These frames never touch train, val, OR the cage_test set.** They
+      are a dedicated reflection-handling eval set.
+- [ ] Each frame's label file boxes **only the live hamster**. The
+      reflection is intentionally left unboxed (background-in-positive)
+      so the eval scorer compares "did the model put its highest-scoring
+      box on the live animal or on a region that doesn't have a label?"
 
 ---
 
@@ -291,18 +365,49 @@ yolo detect val model=models/hamster/v4/best.pt data=cage_test.yaml imgsz=320 sp
 Re-run the 200-frame negative eval (Phase H artifact) on V4 at conf 0.50,
 0.55, 0.60, 0.65.
 
+### 4.2.5 Co-occurrence eval (reflection-vs-live ranking)
+
+The V3-fix gate. For each frame in `cage_coocc_test`, run V3 AND V4 at
+conf 0.25 (intentionally permissive so both models surface their
+reflection box), then compare:
+
+```sh
+yolo detect predict model=models/hamster/v3/best.pt source=cage_coocc_test/images \
+  imgsz=320 conf=0.25 save_txt=True save_conf=True project=eval name=v3_coocc
+yolo detect predict model=models/hamster/v4/best.pt source=cage_coocc_test/images \
+  imgsz=320 conf=0.25 save_txt=True save_conf=True project=eval name=v4_coocc
+```
+
+Score each frame:
+
+- **Correct** if the model's **highest-confidence box** has IoU ≥ 0.4
+  with the labeled live-hamster box.
+- **Wrong** if the highest-confidence box is anywhere else (i.e. landed
+  on the reflection or a phantom region).
+
+Pass criteria for V4:
+
+- [ ] **V4 correct ≥ 95% of co-occurrence frames**
+- [ ] **V4 correct > V3 correct** by at least 20 percentage points
+      (V3's current failure rate on these frames is the whole reason
+      this eval exists; a marginal lift means the training signal
+      didn't take)
+
 ### 4.3 Decision
 
-V4 **ships only if all four hold**:
+V4 **ships only if all five hold**:
 
 - [ ] Cage-test mAP50 ≥ 0.85
 - [ ] Cage-test mAP50 strictly > V3's score on the same set
 - [ ] 0/200 FPs at the live operating point (whatever §10.1 resolved to)
+- [ ] **Co-occurrence eval ≥ 95% correct AND > V3 by 20 pp** (§4.2.5)
 - [ ] Gate C (no embedded NMS, shape `[1,3,320,320]`) passes
 
 If any fail: **do not deploy.** Diagnose. Usually = need more cage data
 (append-only re-harvest), or oversample tweak, or backbone bump to
-yolov9s. Public mAP is not a tiebreaker.
+yolov9s. If §4.2.5 specifically fails, the box review of co-occurrence
+frames probably let some reflection-box labels through — re-do §1.3 on
+the `coocc_*` frames before re-training. Public mAP is not a tiebreaker.
 
 ---
 
@@ -414,6 +519,13 @@ gives us the measurement to decide. Defer to a hypothetical V5.
   policy.
 - **Do not** suggest adding zones to cam2 that it can't physically see (bed,
   hide, food, water, tunnel). See [`project_camera_fov`](../) memory.
+- **Do not** ship V4 if the co-occurrence eval (§4.2.5) doesn't fix the
+  reflection-wins-over-live failure mode. A V4 that matches V3 on cage
+  mAP50 but still picks the reflection in mirror-image frames is a lateral
+  move, not a recall pass — the same diary noise will keep showing up.
+- **Do not** box the reflection in co-occurrence frames during §1.3 review.
+  The label discipline IS the training signal — boxing both teaches the
+  model both are hamsters, which is the V3 bug.
 
 ---
 
@@ -425,7 +537,8 @@ gives us the measurement to decide. Defer to a hypothetical V5.
 3. **[HUMAN]** Confirm `ROBOFLOW_API_KEY` in `.env` is still the 20-char
    private key.
 4. **[HUMAN]** §1.3 box review of harvested cage frames — **the work that
-   actually buys accuracy**.
+   actually buys accuracy**. Pay special attention to co-occurrence frames
+   (§1.4): box ONLY the live hamster, never the reflection.
 5. **[HUMAN]** §5.4 live debug-view sign-off across a day/night cycle.
 
 ---
