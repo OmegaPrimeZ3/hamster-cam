@@ -19,6 +19,7 @@ import { initTRPC, TRPCError } from '@trpc/server';
 import type { CreateFastifyContextOptions } from '@trpc/server/adapters/fastify';
 import { z } from 'zod';
 
+import { classifyBackfillError, describeBackfillError } from './backfill-errors.js';
 import { ensureClip } from './clips.js';
 import { deleteFileBestEffort } from './fs-utils.js';
 import { FfmpegError } from './frigate.js';
@@ -1762,20 +1763,48 @@ const clipRouter = router({
       if (!entry) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'diary entry not found' });
       }
+
+      // Short-circuit: footage is permanently gone — no point invoking ffmpeg again.
+      if (entry.media_unavailable === 1) {
+        throw new TRPCError({
+          code: 'PRECONDITION_FAILED',
+          message: "This clip isn't available anymore.",
+        });
+      }
+
       try {
         const { relPath } = await ensureClip(entry);
         return { url: `/${relPath}`, duration_ms: entry.duration_ms ?? null };
       } catch (err) {
         if (err instanceof TRPCError) throw err;
 
-        // ffmpeg failure: footage may have aged out of Frigate's 3-day
-        // continuous-recording retention, or the clip endpoint returned 404.
-        // Log the stderr for diagnostics but surface a friendly message.
+        // ffmpeg failure: footage may have aged out of Frigate's retention window,
+        // or the clip endpoint returned 404/400. Classify the error so permanent
+        // failures are persisted — future calls short-circuit above rather than
+        // re-hitting ffmpeg and Frigate.
         if (err instanceof FfmpegError) {
+          const classification = classifyBackfillError(err);
+          const errorDesc = describeBackfillError(err);
+
           clipLog.warn(
-            { diary_entry_id: input.diary_entry_id, ffmpegCode: err.code, stderr: err.stderr },
+            {
+              diary_entry_id: input.diary_entry_id,
+              ffmpegCode: err.code,
+              stderr: err.stderr,
+              classification,
+            },
             'clip extraction failed — footage likely outside Frigate retention window',
           );
+
+          if (classification === 'permanent') {
+            // Persist the permanent-failure marker so the next call short-circuits.
+            // Do NOT touch media_backfill_attempts — that counter belongs to the
+            // cron backfill job; racing with it from the on-demand path is harmful.
+            db.markDiaryEntryMediaUnavailable(input.diary_entry_id, errorDesc);
+          }
+          // Transient failures are left unmarked — the cron job will count + give up
+          // after MAX_TRANSIENT_ATTEMPTS.
+
           throw new TRPCError({
             code: 'PRECONDITION_FAILED',
             message: "This clip isn't available anymore.",

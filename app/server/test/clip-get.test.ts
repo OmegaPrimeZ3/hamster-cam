@@ -178,6 +178,171 @@ describe('clip.get — FfmpegError handling', () => {
 });
 
 // ---------------------------------------------------------------------------
+// clip.get — media_unavailable short-circuit and permanent-failure marking
+// ---------------------------------------------------------------------------
+
+describe('clip.get — media_unavailable tracking', () => {
+  it('short-circuits with PRECONDITION_FAILED and never invokes ensureClip when media_unavailable=1', async () => {
+    const db = await import('../src/db.js');
+    const clipsModule = await import('../src/clips.js');
+    const { appRouter } = await import('../src/trpc.js');
+
+    const camera = db.createCamera({
+      name: 'dead-cam',
+      emoji: '🐹',
+      stream_url: 'rtsp://dead-cam',
+      live_src: 'dead-cam',
+      enabled: true,
+    });
+    const entry = db.createDiaryEntry({
+      occurred_at: Date.now(),
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'old run',
+      pet_name: null,
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 5000,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+
+    // Mark the entry as permanently unavailable (as the backfill cron would).
+    db.markDiaryEntryMediaUnavailable(entry.id, 'http_400');
+
+    const ctx = await makeAdminCtx();
+    const caller = appRouter.createCaller(ctx);
+
+    let caught: TRPCError | null = null;
+    try {
+      await caller.clip.get({ diary_entry_id: entry.id });
+    } catch (err) {
+      if (err instanceof TRPCError) caught = err;
+      else throw err;
+    }
+
+    expect(caught?.code).toBe('PRECONDITION_FAILED');
+    // ensureClip must never have been called — no ffmpeg spawn, no Frigate hit.
+    expect(vi.mocked(clipsModule.ensureClip)).not.toHaveBeenCalled();
+  });
+
+  it('marks media_unavailable=1 when ffmpeg returns a permanent HTTP 400 error', async () => {
+    const db = await import('../src/db.js');
+    const clipsModule = await import('../src/clips.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const { appRouter } = await import('../src/trpc.js');
+
+    const camera = db.createCamera({
+      name: 'aging-cam',
+      emoji: '🐹',
+      stream_url: 'rtsp://aging-cam',
+      live_src: 'aging-cam',
+      enabled: true,
+    });
+    const entry = db.createDiaryEntry({
+      occurred_at: Date.now(),
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'aged out run',
+      pet_name: null,
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 5000,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+
+    // Simulate Frigate returning 400 (footage outside retention window).
+    vi.mocked(clipsModule.ensureClip).mockRejectedValueOnce(
+      new FfmpegError(
+        'ffmpeg exited with code 1',
+        1,
+        'http://frigate:5000/api/hamster_cam_1/start/100/end/110/clip.mp4: Server returned 400 Bad Request\n',
+      ),
+    );
+
+    const ctx = await makeAdminCtx();
+    const caller = appRouter.createCaller(ctx);
+
+    let caught: TRPCError | null = null;
+    try {
+      await caller.clip.get({ diary_entry_id: entry.id });
+    } catch (err) {
+      if (err instanceof TRPCError) caught = err;
+      else throw err;
+    }
+
+    expect(caught?.code).toBe('PRECONDITION_FAILED');
+
+    // The DB row must now be marked permanently unavailable.
+    const refreshed = db.getDiaryEntryById(entry.id);
+    expect(refreshed?.media_unavailable).toBe(1);
+    expect(refreshed?.media_backfill_last_error).toBe('http_400');
+  });
+
+  it('does NOT mark media_unavailable when ffmpeg fails with a transient network error', async () => {
+    const db = await import('../src/db.js');
+    const clipsModule = await import('../src/clips.js');
+    const { FfmpegError } = await import('../src/frigate.js');
+    const { appRouter } = await import('../src/trpc.js');
+
+    const camera = db.createCamera({
+      name: 'flaky-cam',
+      emoji: '🐹',
+      stream_url: 'rtsp://flaky-cam',
+      live_src: 'flaky-cam',
+      enabled: true,
+    });
+    const entry = db.createDiaryEntry({
+      occurred_at: Date.now(),
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'run during outage',
+      pet_name: null,
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 5000,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+
+    // Simulate a transient 503 from Frigate (e.g. it's restarting).
+    vi.mocked(clipsModule.ensureClip).mockRejectedValueOnce(
+      new FfmpegError(
+        'ffmpeg exited with code 1',
+        1,
+        'http://frigate:5000/api/hamster_cam_1/start/200/end/210/clip.mp4: Server returned 503 Service Unavailable\n',
+      ),
+    );
+
+    const ctx = await makeAdminCtx();
+    const caller = appRouter.createCaller(ctx);
+
+    let caught: TRPCError | null = null;
+    try {
+      await caller.clip.get({ diary_entry_id: entry.id });
+    } catch (err) {
+      if (err instanceof TRPCError) caught = err;
+      else throw err;
+    }
+
+    expect(caught?.code).toBe('PRECONDITION_FAILED');
+
+    // The row must NOT be marked unavailable — the cron job owns that decision.
+    const refreshed = db.getDiaryEntryById(entry.id);
+    expect(refreshed?.media_unavailable).toBe(0);
+    // And the attempts counter must not have been touched from the on-demand path.
+    expect(refreshed?.media_backfill_attempts).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // clip_available — retention window gate
 // We test via activity.list so we exercise diaryToDTO in production.
 // ---------------------------------------------------------------------------

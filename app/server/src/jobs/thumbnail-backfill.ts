@@ -27,9 +27,17 @@
 
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
-import { FfmpegError } from '../frigate.js';
 import { childLogger } from '../logger.js';
 import { generateThumbnailForEntryUnguarded } from '../thumbnails.js';
+import {
+  classifyBackfillError,
+  describeBackfillError,
+  getErrorText,
+} from '../backfill-errors.js';
+
+// Re-export so existing callers (e.g. tests) that import from this module keep working.
+export { classifyBackfillError, describeBackfillError } from '../backfill-errors.js';
+export type { BackfillErrorClass } from '../backfill-errors.js';
 
 const logger = childLogger('thumbnail-backfill-job');
 
@@ -48,78 +56,6 @@ const BATCH_SIZE = 20;
 // 5 attempts × 3-minute tick ≈ 15 minutes. After that, transient errors are
 // indistinguishable from permanent ones from a practical standpoint.
 export const MAX_TRANSIENT_ATTEMPTS = 5;
-
-// ---------------------------------------------------------------------------
-// Error classification
-// ---------------------------------------------------------------------------
-
-export type BackfillErrorClass = 'permanent' | 'transient';
-
-/**
- * Classify a thumbnail-generation error as permanent (give up immediately) or
- * transient (increment counter, retry up to MAX_TRANSIENT_ATTEMPTS).
- *
- * Permanent errors:
- *   - HTTP 400 Bad Request  — footage outside Frigate's retention / event not found
- *   - HTTP 401 Unauthorized — auth problem (won't self-heal)
- *   - HTTP 404 Not Found    — event or recording genuinely gone
- *   - HTTP 410 Gone         — explicitly deleted
- *
- * Transient errors (everything else):
- *   - Network errors: ECONNRESET, ECONNREFUSED, ETIMEDOUT, EAI_AGAIN, ENOTFOUND
- *   - HTTP 408, 429, 500, 502, 503, 504
- *   - Any unknown error (conservative: assume it might resolve)
- */
-export function classifyBackfillError(err: unknown): BackfillErrorClass {
-  // Extract a combined string covering both the error message and ffmpeg stderr
-  // (FfmpegError carries the HTTP status line in its stderr field).
-  const msg = getErrorText(err);
-
-  // Permanent HTTP statuses: 400, 401, 404, 410.
-  // ffmpeg formats these as "Server returned 4XX <reason>" in its stderr.
-  if (/\b(400|401|404|410)\b/.test(msg)) return 'permanent';
-
-  // Network errors that won't self-heal by retrying.
-  // Note: ENOTFOUND (DNS failure) can be transient, but we include it as
-  // transient so the attempt counter handles it via MAX_TRANSIENT_ATTEMPTS.
-
-  // Transient network error codes that appear in error messages.
-  if (/ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND/.test(msg)) return 'transient';
-
-  // Transient HTTP statuses: 408, 429, 500, 502, 503, 504.
-  if (/\b(408|429|500|502|503|504)\b/.test(msg)) return 'transient';
-
-  // Connection-level text from ffmpeg stderr (when TCP fails before HTTP).
-  if (/connection (refused|reset|timed out)|broken pipe/i.test(msg)) return 'transient';
-
-  // Conservative default: unknown errors are treated as transient so we don't
-  // silently discard footage that might still be available.
-  return 'transient';
-}
-
-/** Returns a combined error text string from message + stderr (for FfmpegError). */
-function getErrorText(err: unknown): string {
-  if (err instanceof FfmpegError) {
-    return `${err.message} ${err.stderr}`;
-  }
-  if (err instanceof Error) {
-    // Node network errors carry a `code` property.
-    const code = (err as NodeJS.ErrnoException).code ?? '';
-    return `${err.message} ${code}`;
-  }
-  return String(err);
-}
-
-/** Human-readable reason string for a classified error — used in last_error column. */
-export function describeBackfillError(err: unknown): string {
-  const msg = getErrorText(err);
-  // Extract the first recognisable HTTP status for cleaner DB values.
-  const httpMatch = msg.match(/\b(400|401|404|408|410|429|500|502|503|504)\b/);
-  if (httpMatch) return `http_${httpMatch[1]}`;
-  const errCodeMatch = msg.match(/ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND/);
-  if (errCodeMatch) return errCodeMatch[0].toLowerCase();
-  return err instanceof Error ? err.message.slice(0, 120) : 'unknown_error';
-}
 
 // ---------------------------------------------------------------------------
 // Job result
