@@ -370,6 +370,11 @@ const FRIGATE_RECORDING_RETENTION_MS = 10 * 24 * 60 * 60 * 1000; // 10 days
 
 export function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
   // clip_available resolution order (mirrors ensureClip):
+  //   0. media_unavailable = 1 → permanent override, button suppressed regardless
+  //      of the rules below. The backfill cron job (jobs/thumbnail-backfill.ts) or
+  //      the clip.get tRPC route sets this when ffmpeg has confirmed the footage
+  //      is gone (HTTP 400/401/404/410 from Frigate). Without this short-circuit
+  //      the UI would keep showing a tap-to-play button that always errors.
   //   1. Already extracted and cached on disk → always available regardless of age.
   //   2. Timelapse mp4 via media_path → always available regardless of age.
   //   3. camera_id set AND entry is recent enough for Frigate to still have footage.
@@ -381,7 +386,9 @@ export function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
   const withinRetentionWindow =
     row.camera_id != null &&
     Date.now() - row.occurred_at <= FRIGATE_RECORDING_RETENTION_MS;
-  const clip_available = hasExtractedClip || hasTimelapseMedia || withinRetentionWindow;
+  const clip_available =
+    row.media_unavailable !== 1 &&
+    (hasExtractedClip || hasTimelapseMedia || withinRetentionWindow);
 
   return {
     id: row.id,

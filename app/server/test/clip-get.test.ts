@@ -460,6 +460,45 @@ describe('clip_available — retention window in activity.list', () => {
     expect(dto?.clip_available).toBe(true);
   });
 
+  it('is false when media_unavailable=1 even within the retention window', async () => {
+    const db = await import('../src/db.js');
+    const { appRouter } = await import('../src/trpc.js');
+
+    const camera = db.createCamera({
+      name: 'dead-footage-cam',
+      emoji: '💀',
+      stream_url: 'rtsp://dead-footage-cam',
+      live_src: 'dead-footage-cam',
+      enabled: true,
+    });
+
+    // Inside retention window — without media_unavailable this WOULD be true.
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    const entry = db.createDiaryEntry({
+      occurred_at: oneHourAgo,
+      kind: 'narrative',
+      activity: 'exploring',
+      narrative: 'cam offline at this time',
+      pet_name: 'Remy',
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: null,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+    db.markDiaryEntryMediaUnavailable(entry.id, 'frigate_http_400');
+
+    const ctx = await makeAdminCtx();
+    const caller = appRouter.createCaller(ctx);
+    const result = await caller.activity.range({ from: oneHourAgo - 1000, to: oneHourAgo + 1000 });
+
+    const dto = result[0];
+    expect(dto?.camera_id).toBe(camera.id);
+    expect(dto?.clip_available).toBe(false);
+  });
+
   it('is true for a timelapse mp4 entry regardless of age', async () => {
     const db = await import('../src/db.js');
     const { appRouter } = await import('../src/trpc.js');
