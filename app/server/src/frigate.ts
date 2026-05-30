@@ -677,18 +677,26 @@ export async function extractFrame(input: {
     cfg.FRIGATE_URL,
   ).toString();
 
-  // Seek to the target moment inside the window so the extracted frame lands
-  // on `atMs`, not at the very start. When startSec was clamped to 0 the
-  // effective offset is smaller; clamp to [0, 2*halfWindowSec - 1] to stay
-  // inside the window.
-  const seekOffset = Math.min(centerSec - startSec, halfWindowSec * 2 - 1);
+  // No -ss seek. With record.continuous.days: 0 Frigate's clip endpoint
+  // stitches the motion-driven segments from the requested window into a
+  // clip that is only as long as the actual motion content — observed on
+  // the live host (2026-05-29): a 180-second wall-clock window resolved to
+  // a 1.0-second stitched clip because only ~1 second of motion was
+  // captured around `centerSec`. With `-ss 90` (the old half-window seek),
+  // ffmpeg seeks past the end of the 1-second clip and writes nothing,
+  // producing the "Output file is empty" silent failure that left every
+  // narrative entry stuck without a thumbnail.
+  //
+  // Without -ss we take the first frame Frigate returns. Since Frigate
+  // only includes motion content in the stitched output, that first frame
+  // IS the relevant moment — exactly what we want for a diary thumbnail.
 
   try {
     await runFfmpeg([
       '-y',
-      '-ss', String(seekOffset),
       '-i', sourceUrl,
       '-frames:v', '1',
+      '-update', '1',
       '-vf', `scale=${width}:-1`,
       absPath,
     ]);

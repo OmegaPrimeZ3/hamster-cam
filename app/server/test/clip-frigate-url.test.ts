@@ -146,15 +146,19 @@ describe('extractFrame — Frigate 0.17.x URL', () => {
     expect(inputUrl).toBe('http://frigate.local:5000/api/remy-cam/start/0/end/135/clip.mp4');
   });
 
-  it('includes a -ss seek offset so the extracted frame lands near atMs', async () => {
+  it('does NOT use -ss seek (Frigate stitches motion-only clips shorter than the wall-clock window)', async () => {
     const { extractFrame } = await import('../src/frigate.js');
 
-    // atMs = 5_000_500 → centerSec=5000, startSec=4910, seekOffset = min(5000-4910, 179) = 90
+    // No -ss because Frigate's clip endpoint returns a clip whose length
+    // is the actual motion content, not the requested wall-clock window.
+    // With record.continuous.days: 0, a 180s window can resolve to a 1s
+    // stitched clip, and -ss past 1s writes nothing. Taking the first frame
+    // gets us the motion content directly.
     await extractFrame({ cameraName: 'remy-cam', atMs: 5_000_500 });
 
-    const ssIdx = capturedFfmpegArgs.indexOf('-ss');
-    expect(ssIdx).toBeGreaterThan(-1);
-    expect(capturedFfmpegArgs[ssIdx + 1]).toBe('90');
+    expect(capturedFfmpegArgs.indexOf('-ss')).toBe(-1);
+    // But -update 1 must be present (required when -frames:v 1 writes a single image to a file path)
+    expect(capturedFfmpegArgs.indexOf('-update')).toBeGreaterThan(-1);
   });
 
   it('does not throw when FRIGATE_URL is absent — returns captured:false', async () => {
