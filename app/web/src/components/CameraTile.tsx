@@ -20,6 +20,7 @@ import { Maximize2, AlertCircle } from 'lucide-react';
 import type { RouterOutputs } from '../trpc';
 import { Mascot } from './Mascot';
 import { LiveStream } from './LiveStream';
+import { useNow } from '../hooks/useNow';
 import { relativeTime } from '../lib/time';
 
 export type CameraTileState = 'loading' | 'live' | 'napping' | 'offline' | 'error';
@@ -62,7 +63,10 @@ export function CameraTile({
   // on visibility-restored. Stored in a ref to avoid triggering extra renders.
   const wasHiddenRef = useRef(document.visibilityState === 'hidden');
 
-  const effectiveNow = now ?? Date.now();
+  // Tick every 60 s so relative "last seen" timestamps stay fresh.
+  // When the `now` prop is supplied (test seam), skip the ticker.
+  const clockNow = useNow(60_000);
+  const effectiveNow = now ?? clockNow;
   let state: CameraTileState = tileStateFor(camera.last_frame_at, effectiveNow);
   if (streamError) state = 'error';
 

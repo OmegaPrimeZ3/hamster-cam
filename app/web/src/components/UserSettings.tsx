@@ -6,6 +6,7 @@ import { useState } from 'react';
 import { Trash2, KeyRound, Plus } from 'lucide-react';
 import { trpc, RouterOutputs } from '../trpc';
 import { useAuth } from '../hooks/useAuth';
+import { useNow } from '../hooks/useNow';
 import { AddUserForm } from './AddUserForm';
 import { relativeTime } from '../lib/time';
 
@@ -14,6 +15,7 @@ type UserRow = RouterOutputs['users']['list'][number];
 export function UserSettings(): JSX.Element {
   const { user: me } = useAuth();
   const utils = trpc.useUtils();
+  const now = useNow(60_000);
   const users = trpc.users.list.useQuery();
   const deleteMut = trpc.users.delete.useMutation({
     onSuccess: async () => {
@@ -60,7 +62,7 @@ export function UserSettings(): JSX.Element {
                   </div>
                   <small style={{ color: 'var(--text-muted)' }}>{u.email}</small>
                   <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                    Last seen {relativeTime(u.last_seen_at)}
+                    Last seen {relativeTime(u.last_seen_at, now)}
                   </div>
                 </div>
                 <select

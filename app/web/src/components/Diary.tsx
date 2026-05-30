@@ -18,6 +18,7 @@ import { DiaryEntry } from './DiaryEntry';
 import { DiaryRangePicker } from './DiaryRangePicker';
 import { useDiaryStream } from '../hooks/useDiaryStream';
 import { useTTSEnabled } from '../hooks/useTTSEnabled';
+import { useNow } from '../hooks/useNow';
 import { speak } from '../lib/tts';
 import { getDistanceUnit } from '../lib/trpc-extensions';
 import {
@@ -30,20 +31,6 @@ import {
 export interface DiaryProps {
   readAloud: boolean;
   petName: string;
-}
-
-/**
- * Returns the current epoch ms, re-computed every `intervalMs` milliseconds.
- * This drives relative-timestamp re-renders ("5 minutes ago" → "6 minutes ago")
- * without requiring the consumer to manage its own interval.
- */
-function useNow(intervalMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(id);
-  }, [intervalMs]);
-  return now;
 }
 
 type Entry = RouterOutputs['activity']['today'][number];

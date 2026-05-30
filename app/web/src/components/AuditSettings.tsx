@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Download, Filter } from 'lucide-react';
 import { trpc, RouterOutputs } from '../trpc';
+import { useNow } from '../hooks/useNow';
 import { relativeTime } from '../lib/time';
 
 type AuditRow = RouterOutputs['audit']['list']['items'][number];
@@ -26,6 +27,7 @@ function startOfDay(): number {
 
 export function AuditSettings(): JSX.Element {
   const users = trpc.users.list.useQuery();
+  const now = useNow(60_000);
   const [windowId, setWindowId] = useState<'today' | '7d' | '30d' | 'all'>('7d');
   const [actorId, setActorId] = useState<number | null>(null);
   const [actionPrefix, setActionPrefix] = useState<string>('');
@@ -162,7 +164,7 @@ export function AuditSettings(): JSX.Element {
                   color: 'inherit',
                 }}
               >
-                <small style={{ color: 'var(--text-muted)', width: 110 }}>{relativeTime(row.at)}</small>
+                <small style={{ color: 'var(--text-muted)', width: 110 }}>{relativeTime(row.at, now)}</small>
                 <strong>{actor?.display_name ?? (row.actor_user_id == null ? 'system' : `#${row.actor_user_id}`)}</strong>
                 <code style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>{row.action}</code>
                 {row.target_type && (
