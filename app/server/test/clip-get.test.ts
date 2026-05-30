@@ -228,6 +228,60 @@ describe('clip.get — media_unavailable tracking', () => {
     expect(vi.mocked(clipsModule.ensureClip)).not.toHaveBeenCalled();
   });
 
+  it('serves cached clip_path even when media_unavailable=1 (cached bytes win)', async () => {
+    // Regression test for the Bug A pattern: a Frigate refetch failed later and
+    // set media_unavailable=1, but the clip was already on disk from an earlier
+    // successful extraction. The procedure must not let the flag override working
+    // cached bytes — the same ordering fix applied to diaryToDTO in 491b847.
+    const db = await import('../src/db.js');
+    const clipsModule = await import('../src/clips.js');
+    const { appRouter } = await import('../src/trpc.js');
+
+    const camera = db.createCamera({
+      name: 'cached-and-dead',
+      emoji: '🐹',
+      stream_url: 'rtsp://cached-and-dead',
+      live_src: 'cached-and-dead',
+      enabled: true,
+    });
+    const entry = db.createDiaryEntry({
+      occurred_at: Date.now(),
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'run with cached clip',
+      pet_name: null,
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 5000,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+
+    // Simulate: clip was extracted and cached previously.
+    const cachedRel = join('clips', 'cached-and-dead-100-130.mp4');
+    const cachedAbs = join(workdir, cachedRel);
+    writeFileSync(cachedAbs, Buffer.alloc(64));
+    db.updateDiaryEntryClipPath(entry.id, cachedRel);
+
+    // Then the backfill cron later marked it unavailable (e.g. a re-fetch 400'd).
+    db.markDiaryEntryMediaUnavailable(entry.id, 'http_400');
+
+    // ensureClip should serve the cached file and return its relative path.
+    vi.mocked(clipsModule.ensureClip).mockResolvedValueOnce({ relPath: cachedRel });
+
+    const ctx = await makeAdminCtx();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.clip.get({ diary_entry_id: entry.id });
+
+    // Must succeed — cached bytes win over the unavailable flag.
+    expect(result.url).toBe(`/${cachedRel}`);
+    // ensureClip was invoked (not short-circuited).
+    expect(vi.mocked(clipsModule.ensureClip)).toHaveBeenCalledOnce();
+  });
+
   it('marks media_unavailable=1 when ffmpeg returns a permanent HTTP 400 error', async () => {
     const db = await import('../src/db.js');
     const clipsModule = await import('../src/clips.js');

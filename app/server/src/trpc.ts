@@ -1779,7 +1779,18 @@ const clipRouter = router({
       }
 
       // Short-circuit: footage is permanently gone — no point invoking ffmpeg again.
-      if (entry.media_unavailable === 1) {
+      // IMPORTANT: cached bytes on disk win over the unavailable flag. An entry
+      // can have media_unavailable=1 (set when Frigate 400'd a *re*-fetch) while
+      // still having a valid clip_path written during an earlier successful fetch.
+      // Checking the flag before clip_path would silently drop working clips —
+      // the same regression that bit diaryToDTO in 61cfebb / 491b847. So we only
+      // skip to ensureClip when neither short-circuit applies; ensureClip itself
+      // serves from clip_path (cache hit) before ever calling Frigate.
+      const hasExtractedClip = entry.clip_path != null;
+      const hasTimelapseMedia =
+        entry.media_path != null && entry.media_path.toLowerCase().endsWith('.mp4');
+
+      if (!hasExtractedClip && !hasTimelapseMedia && entry.media_unavailable === 1) {
         throw new TRPCError({
           code: 'PRECONDITION_FAILED',
           message: "This clip isn't available anymore.",
