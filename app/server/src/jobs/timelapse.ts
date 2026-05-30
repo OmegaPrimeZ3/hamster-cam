@@ -52,6 +52,7 @@ import { existsSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 
 import { getConfig } from '../config.js';
 import * as db from '../db.js';
@@ -67,6 +68,31 @@ const logger = childLogger('timelapse-job');
  * Return the last N lines of ffmpeg stderr so error log entries are readable
  * without being enormous. Trims leading/trailing whitespace.
  */
+/**
+ * Run `ffprobe -show_entries format=duration` and return the file's duration
+ * in seconds.  Returns 0 on ANY failure (file missing, malformed, ffprobe not
+ * on PATH).  The caller is expected to treat 0 as "unknown" and fall back to
+ * a default.
+ */
+function probeMp4DurationSeconds(absPath: string): Promise<number> {
+  return new Promise((resolve) => {
+    const child = spawn('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'csv=p=0',
+      absPath,
+    ]);
+    let stdout = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.on('close', (code) => {
+      if (code !== 0) return resolve(0);
+      const v = parseFloat(stdout.trim());
+      resolve(Number.isFinite(v) && v > 0 ? v : 0);
+    });
+    child.on('error', () => resolve(0));
+  });
+}
+
 function stderrSummary(stderr: string, lines = 20): string {
   return stderr
     .trim()
@@ -124,6 +150,23 @@ const MAX_CLIP_DURATION_S = 60;
 
 /** Minimum clip window to request from Frigate — must be ≥ 30 s. */
 const MIN_CLIP_DURATION_S = 30;
+
+/**
+ * Maximum clip PLAYBACK duration in the final reel. The window we REQUEST
+ * from Frigate is 30–60 s (to clear Frigate 0.17.x's sub-segment HTTP 400
+ * floor), but each clip's playback in the reel is capped here so:
+ *   1. Clip-content total stays comfortably under TARGET_SECONDS=90 s,
+ *      leaving room for still-frame slots — otherwise the timeline
+ *      collapses to clip-only and `segments < MIN_FRAMES` skips the whole
+ *      reel. f401ac8 introduced exactly this collapse on the night of
+ *      2026-05-29: 5 clips × 60 s = 300 s > TARGET_SECONDS → 0 stills →
+ *      5 segments < MIN_FRAMES = 8 → skip.
+ *   2. Each clip is a snappy snippet, not a 60 s monologue.
+ *
+ * Enforced via ffmpeg `-t` during normalisation; recorded
+ * ClipSegment.durationS is the actual normalised file length.
+ */
+const CLIP_PLAYBACK_MAX_S = 8;
 
 /**
  * Maximum number of video clips to mix in. Keeps the job from hammering
@@ -669,8 +712,11 @@ async function fetchAndNormaliseClips(
         `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2`,
         `fps=${OUTPUT_FPS}`,
       ].join(',');
+      // -t caps PLAYBACK duration (see CLIP_PLAYBACK_MAX_S). Position before
+      // -i so ffmpeg only decodes the prefix, not the whole stitched clip.
       await runFfmpeg([
         '-y',
+        '-t', String(CLIP_PLAYBACK_MAX_S),
         '-i', rawPath,
         '-vf', vfNorm,
         '-c:v', 'libx264',
@@ -687,15 +733,24 @@ async function fetchAndNormaliseClips(
         continue;
       }
 
+      // Use the normalised file's actual duration. Frigate's clip endpoint
+      // returns a stitched motion-only clip whose length is often much
+      // shorter than the requested window (e.g. 30 s requested, 1 s of
+      // actual motion → 1 s stitched). We then cap PLAYBACK at
+      // CLIP_PLAYBACK_MAX_S via -t. The recorded duration is the
+      // min(actualClipDuration, CLIP_PLAYBACK_MAX_S).
+      const actualDurS = await probeMp4DurationSeconds(normPath).catch(() => CLIP_PLAYBACK_MAX_S);
+      const recordedDurS = Math.min(actualDurS, CLIP_PLAYBACK_MAX_S);
+
       segments.push({
         absPath: normPath,
-        durationS: clampedDur,
+        durationS: recordedDurS,
         midMs: Math.round(centerSec * 1000),
         camera: event.camera,
       });
 
       logger.debug(
-        { event: event.id, camera: event.camera, durationS: clampedDur },
+        { event: event.id, camera: event.camera, durationS: recordedDurS },
         'timelapse: clip normalised',
       );
     } catch (err) {
