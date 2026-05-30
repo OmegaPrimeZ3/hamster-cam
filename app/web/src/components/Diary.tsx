@@ -85,9 +85,7 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
   }, []);
 
   const settings = trpc.settings.get.useQuery();
-  const distanceUnit = getDistanceUnit(
-    settings.data as Record<string, unknown> | undefined,
-  );
+  const distanceUnit = getDistanceUnit(settings.data);
 
   // Recompute window on every render so rolling windows stay fresh even if the
   // component mounts and the user leaves it open for hours — the query key
