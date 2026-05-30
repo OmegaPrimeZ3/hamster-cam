@@ -142,16 +142,14 @@ export function PetSettings(): JSX.Element {
       <Field label="Distance unit">
         <div role="radiogroup" aria-label="Distance unit" style={{ display: 'flex', gap: 8 }}>
           {(['mi', 'km'] as DistanceUnit[]).map((u) => {
-            const current = getDistanceUnit(s as Record<string, unknown>);
+            const current = getDistanceUnit(s);
             return (
               <button
                 key={u}
                 type="button"
                 role="radio"
                 aria-checked={current === u}
-                onClick={() =>
-                  (update.mutate as (input: unknown) => void)({ distance_unit: u })
-                }
+                onClick={() => update.mutate({ distance_unit: u })}
                 className="hc-btn"
                 style={{
                   background: current === u ? 'var(--accent)' : 'var(--surface)',
