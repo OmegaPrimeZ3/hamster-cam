@@ -49,6 +49,17 @@ export function UserSettings(): JSX.Element {
 
       {users.isLoading && <p>Loading…</p>}
 
+      {!users.isLoading && users.data?.length === 0 && (
+        <div
+          className="hc-card"
+          style={{ padding: 20, textAlign: 'center', color: 'var(--text-muted)' }}
+        >
+          <p style={{ margin: 0 }}>
+            No accounts yet — tap <strong>Add account</strong> to invite someone.
+          </p>
+        </div>
+      )}
+
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
         {(users.data ?? []).map((u) => {
           const isMe = me?.id === u.id;
