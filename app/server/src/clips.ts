@@ -70,10 +70,18 @@ export async function ensureClip(entry: db.DiaryEntryRow): Promise<EnsureClipRes
   const centerMs = entry.occurred_at - Math.floor(dur / 2);
 
   // Adaptive window: cover the full activity + 4 s of headroom, clamped to
-  // [8 s, 20 s].  A 6 s food visit → 10 s clip; an 8-min wheel run → 20 s
-  // clip centred mid-run.  The 10 s default in extractClip is kept for callers
-  // (e.g. future share-clip paths) that skip this layer.
-  const clampedDurationMs = Math.max(8_000, Math.min(20_000, dur + 4_000));
+  // [30 s, 60 s].  Frigate 0.17.x returns HTTP 400 for clip windows under
+  // ~30 s (sub-segment-aligned requests).  The same threshold was empirically
+  // identified when fixing extractFrame in 6f72dd6 — clips use the same
+  // Frigate endpoint (/api/<cam>/start/<s>/end/<e>/clip.mp4) and are subject
+  // to the same rejection floor.
+  //
+  // Floor raised from 8 s → 30 s.  Ceiling raised from 20 s → 60 s so that
+  // the floor can always be reached (and to match extractFrame's 60 s window).
+  // Wider doesn't cost much — Frigate streams and the browser seek to the
+  // midpoint anyway.  A 6 s food visit → 30 s window centred on midpoint;
+  // an 8-min wheel run → 60 s window centred mid-run.
+  const clampedDurationMs = Math.max(30_000, Math.min(60_000, dur + 4_000));
 
   const extracted = await extractClip({
     cameraName: camera.live_src ?? camera.name,
