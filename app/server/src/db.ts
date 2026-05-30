@@ -124,7 +124,23 @@ export interface DiaryEntryRow {
   media_backfill_attempts: number;
   /** Last error message from a backfill attempt — null until the first failure. */
   media_backfill_last_error: string | null;
-  /** 0/1 flag: when 1 the entry is excluded from future backfill runs (permanent give-up). */
+  /**
+   * 0/1 flag: when 1 the entry is excluded from future backfill runs (permanent give-up).
+   *
+   * Semantic note (A.2 audit finding): this single flag covers BOTH thumbnail
+   * and clip unavailability. Both failure modes share the same root cause —
+   * the Frigate recording window has expired — so a single flag is sufficient.
+   * The flag is set by:
+   *   - thumbnail-backfill.ts (on permanent Frigate failure during thumbnail
+   *     generation, or after MAX_TRANSIENT_ATTEMPTS consecutive transient failures).
+   *   - clip.get tRPC handler (on permanent Frigate failure during on-demand
+   *     clip extraction: HTTP 400/404/410).
+   *
+   * IMPORTANT: cached bytes on disk win over this flag. An entry with
+   * media_unavailable=1 may still have a valid clip_path or thumbnail_path
+   * from a previous successful extraction. Always check those first before
+   * consulting this flag. See diaryToDTO() and clip.get for the resolution order.
+   */
   media_unavailable: 0 | 1;
 }
 
