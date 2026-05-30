@@ -39,6 +39,7 @@ import * as frigate from './frigate.js';
 import { triggerForgotPassword, registerAccount, ZyphrEmailTaken } from './zyphr.js';
 import { saveManualSnapshot, getRecentEvents, getPetStatus, refreshNarratorTunings } from './narrator.js';
 import { startShareJob } from './share.js';
+import { getMqttErrorStats } from './mqtt.js';
 
 // ---------------------------------------------------------------------------
 // Context
@@ -1647,6 +1648,23 @@ const adminRouter = router({
       alerted: z.boolean(),
     }))
     .mutation(() => runDiskWatchJob()),
+
+  /**
+   * In-memory rolling-window MQTT error stats. Counts parse failures
+   * (malformed Frigate payloads) and narrator processing errors.
+   * Resets on process restart. No DB writes; ephemeral only.
+   */
+  mqttHealth: adminProcedure
+    .meta({ audit: false })
+    .input(z.void())
+    .output(z.object({
+      total_errors_lifetime: z.number().int().nonnegative(),
+      errors_last_5m: z.number().int().nonnegative(),
+      errors_last_1h: z.number().int().nonnegative(),
+      last_error_at: z.number().int().nullable(),
+      last_error_message: z.string().nullable(),
+    }))
+    .query(() => getMqttErrorStats()),
 });
 
 // ---------------------------------------------------------------------------

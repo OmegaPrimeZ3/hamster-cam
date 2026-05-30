@@ -27,8 +27,98 @@ export function getCameraHeartbeat(cameraName: string): number | null {
   return cameraHeartbeats.get(cameraName) ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// Rolling-window error counter — tracks bad payloads (parse failures) and
+// narrator processing errors. In-memory only; resets on process restart.
+// ---------------------------------------------------------------------------
+
+const FIVE_MIN_MS = 5 * 60 * 1000;
+const ONE_HOUR_MS = 60 * 60 * 1000;
+/** Fire the "error storm" fatal log at most once per minute. */
+const STORM_THROTTLE_MS = 60 * 1000;
+/** Threshold: ≥10 errors in the last 5 min triggers the storm alarm. */
+const STORM_THRESHOLD = 10;
+
+interface ErrorTick {
+  at: number;
+  message: string;
+}
+
+const errorTicks: ErrorTick[] = [];
+let totalErrorsLifetime = 0;
+let lastStormLogAt = 0;
+
+function recordMqttError(message: string, nowMs: number = Date.now()): void {
+  totalErrorsLifetime += 1;
+  errorTicks.push({ at: nowMs, message: message.slice(0, 200) });
+  pruneErrorTicks(nowMs);
+
+  const recent5m = countTicksSince(nowMs - FIVE_MIN_MS, nowMs);
+  if (recent5m >= STORM_THRESHOLD && nowMs - lastStormLogAt >= STORM_THROTTLE_MS) {
+    lastStormLogAt = nowMs;
+    logger.fatal(
+      { errors_last_5m: recent5m, total_errors_lifetime: totalErrorsLifetime },
+      'MQTT error storm: ≥10 bad payloads in the last 5 minutes — check Frigate schema',
+    );
+  }
+}
+
+/** Drop ticks older than 1 hour — the longest window we ever query. */
+function pruneErrorTicks(nowMs: number): void {
+  const cutoff = nowMs - ONE_HOUR_MS;
+  let i = 0;
+  while (i < errorTicks.length && (errorTicks[i]?.at ?? 0) < cutoff) i++;
+  if (i > 0) errorTicks.splice(0, i);
+}
+
+function countTicksSince(fromMs: number, nowMs: number): number {
+  let count = 0;
+  for (let i = errorTicks.length - 1; i >= 0; i--) {
+    const tick = errorTicks[i];
+    if (!tick || tick.at < fromMs) break;
+    if (tick.at <= nowMs) count++;
+  }
+  return count;
+}
+
+export interface MqttErrorStats {
+  total_errors_lifetime: number;
+  errors_last_5m: number;
+  errors_last_1h: number;
+  last_error_at: number | null;
+  last_error_message: string | null;
+}
+
+/**
+ * Record a bad-payload or narrator-processing error. Exported so tests can
+ * drive the counter directly without spinning up a real MQTT client.
+ */
+export function recordMqttErrorForTests(message: string, nowMs?: number): void {
+  recordMqttError(message, nowMs);
+}
+
+/** Returns the timestamp (ms) when the storm alarm last fired, or 0 if never. Test-only. */
+export function getLastStormLogAtForTests(): number {
+  return lastStormLogAt;
+}
+
+export function getMqttErrorStats(nowMs: number = Date.now()): MqttErrorStats {
+  pruneErrorTicks(nowMs);
+  const lastTick = errorTicks.length > 0 ? errorTicks[errorTicks.length - 1] : null;
+  return {
+    total_errors_lifetime: totalErrorsLifetime,
+    errors_last_5m: countTicksSince(nowMs - FIVE_MIN_MS, nowMs),
+    errors_last_1h: countTicksSince(nowMs - ONE_HOUR_MS, nowMs),
+    last_error_at: lastTick?.at ?? null,
+    last_error_message: lastTick?.message ?? null,
+  };
+}
+
 export function resetMqttStateForTests(): void {
   cameraHeartbeats.clear();
+  errorTicks.splice(0);
+  totalErrorsLifetime = 0;
+  lastStormLogAt = 0;
 }
 
 /** Inject a heartbeat timestamp for a specific camera. Test-only. */
@@ -70,6 +160,8 @@ export function startMqttSubscriber(options: StartOptions = {}): MqttSubscriber 
     try {
       await handleFrigateEvent(e);
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      recordMqttError(msg);
       logger.error({ err }, 'narrator failed to process event');
     }
   });
@@ -123,6 +215,7 @@ export function startMqttSubscriber(options: StartOptions = {}): MqttSubscriber 
     if (topic === EVENTS_TOPIC) {
       const parsed = safeParseEvent(payload);
       if (!parsed) {
+        recordMqttError(`malformed payload on ${topic} (${payload.length} bytes)`);
         logger.warn({ topic, size: payload.length }, 'dropping malformed frigate event');
         return;
       }
