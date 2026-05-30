@@ -25,7 +25,13 @@ export function ShareDialog({ entry, open, onOpenChange }: ShareDialogProps): JS
     { id: pendingId ?? 0 },
     {
       enabled: pendingId != null,
-      refetchInterval: 1500,
+      // Stop polling once a terminal state is reached (sent or failed).
+      // While still queued, poll at 1500ms. The refetchInterval callback
+      // receives the last data, returning false stops the interval.
+      refetchInterval: (data) => {
+        if (data?.status === 'sent' || data?.status === 'failed') return false;
+        return 1500;
+      },
     },
   );
 
