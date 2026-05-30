@@ -11,7 +11,7 @@
 // loaded for the new range are marked as seen immediately so the backlog is
 // not narrated.
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { trpc } from '../trpc';
 import type { RouterOutputs } from '../trpc';
 import { DiaryEntry } from './DiaryEntry';
@@ -30,6 +30,20 @@ import {
 export interface DiaryProps {
   readAloud: boolean;
   petName: string;
+}
+
+/**
+ * Returns the current epoch ms, re-computed every `intervalMs` milliseconds.
+ * This drives relative-timestamp re-renders ("5 minutes ago" → "6 minutes ago")
+ * without requiring the consumer to manage its own interval.
+ */
+function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
+    return () => window.clearInterval(id);
+  }, [intervalMs]);
+  return now;
 }
 
 type Entry = RouterOutputs['activity']['today'][number];
@@ -55,6 +69,10 @@ function sortEntries(entries: Entry[]): Entry[] {
 export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
   const { ttsEnabled } = useTTSEnabled();
 
+  // Tick every 60 s so relative timestamps ("5 minutes ago") stay fresh
+  // without a full React Query refetch cycle.
+  const clockNow = useNow(60_000);
+
   // Range state — default loaded from sessionStorage (or last-24h).
   const [rangeState, setRangeStateRaw] = useState<DiaryRangeState>(
     () => loadPersistedRange(),
@@ -77,7 +95,7 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
   // We floor to the nearest 30s to avoid creating a brand-new query key every
   // ms (which would break the cache). This means the effective window may lag
   // up to 30s at the edges, which is acceptable.
-  const now = Math.floor(Date.now() / 30_000) * 30_000;
+  const now = useMemo(() => Math.floor(clockNow / 30_000) * 30_000, [clockNow]);
   const resolvedRange =
     rangeState.preset === 'custom' && rangeState.custom !== null
       ? rangeState.custom
@@ -185,6 +203,7 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
           <DiaryEntry
             key={entry.id}
             entry={entry}
+            now={clockNow}
             ttsEnabled={ttsEnabled}
             distanceUnit={distanceUnit}
           />
