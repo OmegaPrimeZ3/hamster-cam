@@ -41,19 +41,27 @@ export function relativeTime(at: number, now: number = Date.now()): string {
  *   "Tue, May 27, 3:14 PM"     (within the current year)
  *   "May 27, 2024, 3:14 PM"    (a prior year — weekday dropped, year added)
  *
+ * Pinned to en-US locale and America/Los_Angeles timezone so the output is
+ * consistent regardless of the browser's system locale or timezone (e.g. a
+ * Japanese-locale iPad would otherwise show Japanese strings).
+ *
+ * TODO: source the timezone from a settings.timezone field once the backend
+ * exposes one; for now hardcoded to match TZ=America/Los_Angeles in docker-compose.
+ *
  * `now` is injectable for tests; defaults to wall-clock so the year-drop
  * heuristic uses the real current year.
  */
 export function absoluteTime(at: number, now: number = Date.now()): string {
   const d = new Date(at);
   const sameYear = d.getFullYear() === new Date(now).getFullYear();
-  return d.toLocaleString(undefined, {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
     ...(sameYear ? { weekday: 'short' } : { year: 'numeric' }),
     month: 'short',
     day: 'numeric',
     hour: 'numeric',
     minute: '2-digit',
-  });
+  }).format(d);
 }
 
 export function formatDuration(ms: number): string {
