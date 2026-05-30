@@ -108,11 +108,22 @@ const HAMSTER_MATCH_WINDOW_MS = 90_000;
  */
 const MIN_CLIP_EVENT_S = 3;
 
-/** Clips are clamped to at most this many seconds. */
-const MAX_CLIP_DURATION_S = 5;
+/**
+ * Frigate 0.17.x rejects clip-window requests shorter than ~30 s with HTTP
+ * 400 (sub-segment-aligned floor). The floor was identified empirically when
+ * fixing extractFrame in 6f72dd6 — the same /api/<cam>/start/<s>/end/<e>/clip.mp4
+ * endpoint is used here and is subject to the same rejection threshold.
+ *
+ * Clips are clamped to [30 s, 60 s].  The wider window increases raw footage
+ * per clip slot in the nightly reel, which is acceptable since we're building
+ * a highlight reel rather than a frame-exact excerpt.  ffmpeg normalisation
+ * in fetchAndNormaliseClips trims the clip to the physical recording available
+ * in that window; in practice the hamster is visible for the interesting part.
+ */
+const MAX_CLIP_DURATION_S = 60;
 
-/** Minimum clip duration to request from Frigate. */
-const MIN_CLIP_DURATION_S = 3;
+/** Minimum clip window to request from Frigate — must be ≥ 30 s. */
+const MIN_CLIP_DURATION_S = 30;
 
 /**
  * Maximum number of video clips to mix in. Keeps the job from hammering
