@@ -25,7 +25,7 @@ import { deleteFileBestEffort } from './fs-utils.js';
 import { FfmpegError } from './frigate.js';
 import { runDiskWatchJob } from './jobs/disk-watch.js';
 import { runRetentionJob } from './jobs/retention.js';
-import { runTimelapseJob } from './jobs/timelapse.js';
+import { runTimelapseForDate } from './jobs/timelapse.js';
 import { childLogger } from './logger.js';
 import {
   getVapidPublicKey,
@@ -1605,7 +1605,12 @@ const adminRouter = router({
       media_path: z.string().nullable(),
       diary_entry_id: z.number().int().nullable(),
     }))
-    .mutation(({ input }) => runTimelapseJob(new Date(`${input.date}T12:00:00`))),
+    // Use runTimelapseForDate(isoDate) directly: the admin supplies the night's
+    // START date (e.g. "2026-05-24" = the night of May 24 22:00 → May 25 06:00).
+    // The previous runTimelapseJob(new Date(`${date}T12:00:00`)) computed
+    // localSixAM(May 24 12:00) = May 24 06:00 as nightEnd, which yielded
+    // nightStart = May 23 22:00 — one night too early.
+    .mutation(({ input }) => runTimelapseForDate(input.date)),
 
   runRetention: adminProcedure
     .meta({

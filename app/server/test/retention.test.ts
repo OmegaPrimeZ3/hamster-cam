@@ -95,7 +95,7 @@ describe('retention.runRetentionJob — thumbnail_path cleanup (A.1)', () => {
     const entry = await seedDiaryEntry(cam.id, twentyDaysAgo, thumbRel);
     expect(entry.thumbnail_path).toBe(thumbRel);
 
-    const { runRetentionJob } = await import('../src/jobs/retention.ts');
+    const { runRetentionJob } = await import('../src/jobs/retention.js');
     const result = await runRetentionJob();
 
     // File should be deleted by pruneMediaDir.
@@ -130,7 +130,7 @@ describe('retention.runRetentionJob — thumbnail_path cleanup (A.1)', () => {
     const beforeCandidates = db.listDiaryEntriesMissingThumbnail(0, 100);
     expect(beforeCandidates.some((e) => e.id === entry.id)).toBe(false);
 
-    const { runRetentionJob } = await import('../src/jobs/retention.ts');
+    const { runRetentionJob } = await import('../src/jobs/retention.js');
     await runRetentionJob();
 
     // After retention: thumbnail_path is NULL → entry IS in backfill candidate list.
@@ -159,7 +159,7 @@ describe('retention.runRetentionJob — thumbnail_path cleanup (A.1)', () => {
     const entry = await seedDiaryEntry(cam.id, threeDaysAgo, thumbRel);
     expect(entry.thumbnail_path).toBe(thumbRel);
 
-    const { runRetentionJob } = await import('../src/jobs/retention.ts');
+    const { runRetentionJob } = await import('../src/jobs/retention.js');
     await runRetentionJob();
 
     // Both the file and the column should still be intact.
