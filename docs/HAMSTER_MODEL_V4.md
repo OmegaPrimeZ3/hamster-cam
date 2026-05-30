@@ -217,6 +217,44 @@ yolo detect predict model=models/hamster/v3/best.pt \
 For the existing 523-frame `cage_pos/` set, **re-run V3 auto-label** on top —
 don't trust the v1 labels still in that directory.
 
+### 1.2.6 Known V3 failure mode — wheel-on, especially at night (IR)
+
+**Symptom (observed in Frigate debug-view, 2026-05-29 evening):** V3 does
+not consistently recognize Remy when he is **on the wheel**, and the
+failure is most severe in **night/IR mode**. This is a pure recall
+failure — V3 fires zero (or very low confidence) on frames where the
+operator can clearly see the hamster in the debug-view's raw stream.
+
+Why this case is hard:
+
+- **Motion blur**: wheel spinning at moderate-to-fast pace, exposure
+  time produces a smeared silhouette
+- **Posture distortion**: leaning forward at a running angle, paws in
+  unusual positions, body elongated rather than the V3-trained
+  "compact hamster" shape
+- **Partial wheel occlusion**: the wheel's spokes/rim cross the
+  hamster's silhouette from cam1's ~45° angle
+- **Night/IR specifically adds**: grayscale (no color signal),
+  reduced contrast against the wheel, IR illumination from a single
+  direction that flattens depth cues
+
+**This is the recall debt that explains the diary's "missing wheel
+time" gap.** V3 detects Remy entering and leaving the wheel zone
+(brief boundary crossings) but loses the long mid-run window — the
+wheel-odometer can't even attempt to count rotations on frames where
+the model hasn't fired.
+
+V4 must address this directly via **targeted wheel-on-night harvest**
+(§1.5) and a **dedicated eval gate** (§4.2.6). Like reflection-vs-live,
+this cannot be papered over with Frigate filters — it's a recall
+problem at the model.
+
+> ⚠️ **Harvest bias warning**: the existing 671-frame harvest (Phase
+> 1.1) was pulled via `has_snapshot=1`, which **excludes events V3
+> failed to detect entirely**. The frames where V3 missed Remy
+> mid-wheel-run are NOT in that corpus. §1.5 fixes this by pulling
+> from a wider net.
+
 ### 1.2.5 Known V3 failure mode — reflection beats live hamster
 
 **Symptom (observed in review of V3 event frames, 2026-05-29):** when both
@@ -259,6 +297,60 @@ size/aspect/score filter the live hamster does.
       `~/pet-models/hamster/local/cage_pos/{images,labels}` —
       **overwrite** the contaminated v1 labels.
 
+### 1.5 Targeted wheel-on-night harvest (the V3-blind-spot fix)
+
+The §1.1 harvest used `has_snapshot=1`, which only returns events V3
+actually fired on. Wheel-on-night frames where V3 missed entirely are
+absent — and **those are exactly the training data V4 needs most**.
+
+Three complementary pull strategies, run on the live host
+(`omegaprime@project-server`):
+
+1. **Zone-driven, not detection-driven**: pull events tagged with the
+   `wheel` zone regardless of whether V3 fired on them mid-event.
+   Frigate stores zone-entry/exit even when the detector loses the
+   object inside the zone. This catches the "entered wheel, V3 lost
+   it, exited wheel" pattern that's invisible to a detection-driven
+   query.
+
+   ```sh
+   # Pull cam1 events that entered the wheel zone since 2026-05-26 19:00 PDT.
+   # No has_snapshot filter — we want events V3 missed too.
+   curl -s "http://127.0.0.1:5000/api/events?cameras=hamster_cam_1&zones=wheel&after=${AFTER}&limit=2000"
+   ```
+
+2. **Recording-segment sampling during wheel-active windows**: query
+   the app's diary or wheel-odometer rows for time ranges when the
+   wheel zone was active, then extract frames at 1-second intervals
+   directly from Frigate's recording endpoint
+   `/api/<cam>/recordings/<ts>/snapshot.jpg`. This captures the
+   middle of long runs that the event-snapshot grabs miss.
+
+3. **Operator debug-view captures** (Aaron-side): when you're watching
+   the debug-view and see V3 missing Remy on the wheel, **screenshot
+   the raw frame** (right-click → save image in Frigate's debug view,
+   or browser screenshot). Drop them into
+   `~/pet-models/hamster/harvest_v4/wheel_capture/`. Even 10–20
+   captures here are extremely high-signal since each one is a
+   confirmed V3-failure case.
+
+**Targets:**
+
+- ≥80 wheel-on-night frames (cam1 wheel-zone + IR-mode)
+- ≥40 wheel-on-day frames (cam1 wheel-zone + daylight)
+- Tag with `wheelon_night_` / `wheelon_day_` filename prefix during
+  §1.3 review for §2.6 carve-out
+
+**Box-review discipline (same as §1.3 but extra-strict):**
+
+- Box the live Remy even in heavy motion-blur frames — these are
+  the ground truth V4 needs to learn from
+- For frames where Remy is partially occluded by the wheel rim or
+  a spoke, box the visible portion (don't include the wheel itself)
+- For frames where Remy is genuinely not visible (he's exited or
+  inside the hide), delete the frame from the harvest — don't try
+  to box something that isn't there
+
 ### 1.4 Targeted co-occurrence harvest (additive)
 
 The 523 night + new daytime positives will contain *some* co-occurrence
@@ -297,6 +389,24 @@ You can't tune what you can't measure. V3 deployed without this; V4 will not.
 - [ ] **These frames never touch train or val.** Move them out of
       `cage_pos/` before §3 build runs, so the deterministic split can't
       leak them.
+
+### 2.6 Held-out wheel-on-night eval set (mandatory for V4)
+
+V3's wheel-on-night recall gap is the headline reason diary wheel
+time is undercounting (per §1.2.6). V4 must measurably fix it on data
+the model never saw during training.
+
+- [ ] From the §1.5 wheel-on harvest, set aside **20–30 of the tagged
+      `wheelon_night_*` frames** under
+      `~/pet-models/hamster/cage_wheelon_night_test/{images,labels}`.
+- [ ] Optionally also carve **10–15 `wheelon_day_*` frames** under
+      `cage_wheelon_day_test/` for a smaller daylight sanity check.
+- [ ] Write `cage_wheelon_night_test.yaml` (`split: test`, paths absolute).
+- [ ] **These frames never touch train, val, the cage_test set, OR
+      the co-occurrence test set.** They are a dedicated wheel-on
+      eval set.
+- [ ] Each frame's label file boxes the live Remy (no boxes on the
+      wheel itself, no boxes on motion-blur artifacts).
 
 ### 2.5 Held-out co-occurrence eval set (mandatory for V4)
 
@@ -408,14 +518,39 @@ Pass criteria for V4:
       this eval exists; a marginal lift means the training signal
       didn't take)
 
+### 4.2.6 Wheel-on-night eval (the V3-blind-spot fix gate)
+
+Pure recall gate. Run V3 AND V4 against `cage_wheelon_night_test` at
+conf 0.25 (permissive — we want to see what each model surfaces):
+
+```sh
+yolo detect val model=models/hamster/v3/best.pt data=cage_wheelon_night_test.yaml imgsz=320 split=test
+yolo detect val model=models/hamster/v4/best.pt data=cage_wheelon_night_test.yaml imgsz=480 split=test
+```
+
+Score: standard mAP50 + recall.
+
+Pass criteria for V4:
+
+- [ ] **V4 mAP50 ≥ 0.80** on the wheel-on-night set
+- [ ] **V4 recall ≥ 0.85** at conf 0.50 (the operating threshold the
+      live Frigate will pull from after Phase K relaxes 0.65 → 0.60).
+      Recall is the metric that matters here — false positives in the
+      wheel zone are caught by §4.2 negative eval; what matters is
+      "does the model see Remy when he's on the wheel."
+- [ ] **V4 mAP50 strictly > V3** by **≥ 20 percentage points** on the
+      same set. If V4 only marginally beats V3 on this set, the cage
+      data lever didn't take for the dominant failure mode.
+
 ### 4.3 Decision
 
-V4 **ships only if all five hold**:
+V4 **ships only if all six hold**:
 
 - [ ] Cage-test mAP50 ≥ 0.85
 - [ ] Cage-test mAP50 strictly > V3's score on the same set
 - [ ] 0/200 FPs at the live operating point (whatever §10.1 resolved to)
 - [ ] **Co-occurrence eval ≥ 95% correct AND > V3 by 20 pp** (§4.2.5)
+- [ ] **Wheel-on-night mAP50 ≥ 0.80 AND recall ≥ 0.85 AND > V3 by 20 pp** (§4.2.6)
 - [ ] Gate C (no embedded NMS, shape `[1,3,320,320]`) passes
 
 If any fail: **do not deploy.** Diagnose. Usually = need more cage data
@@ -612,6 +747,10 @@ gives us the measurement to decide. Defer to a hypothetical V5.
   policy.
 - **Do not** suggest adding zones to cam2 that it can't physically see (bed,
   hide, food, water, tunnel). See [`project_camera_fov`](../) memory.
+- **Do not** ship V4 if the wheel-on-night eval (§4.2.6) doesn't show
+  a measurable recall lift over V3. The diary's "missing wheel time"
+  gap is the most user-visible V3 failure; a V4 that doesn't move this
+  needle ships the same complaint Aaron's daughter will keep noticing.
 - **Do not** ship V4 if the co-occurrence eval (§4.2.5) doesn't fix the
   reflection-wins-over-live failure mode. A V4 that matches V3 on cage
   mAP50 but still picks the reflection in mirror-image frames is a lateral
