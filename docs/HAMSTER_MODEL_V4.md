@@ -162,6 +162,39 @@ behaviour here is the operating point we need to reproduce in eval.
 **Owner: Claude (auto) + Aaron (box review) · Time: ~90 min auto + 30–60 min
 HUMAN.**
 
+> 🕒 **Harvest schedule decision (2026-05-29 evening, Aaron):**
+> Phase 1.1 already harvested 671 frames using the existing 3-day
+> window (2026-05-26 19:00 PDT onward), but the stack was unstable for
+> the first 2 of those 3 days (cam2 URB crash storm, Pi swap, midstream
+> hwaccel fix, fps bump, the whole reliability train). Only the
+> 2026-05-29 day was on the post-everything steady state.
+>
+> **Defer the §1.5 night/IR harvest until after a full clean
+> night-day-night cycle accumulates** — earliest fire 2026-05-31
+> ~06:30 PDT. At that point Phase 1.1 should ALSO re-run with the
+> wider window:
+>
+> - Phase 1.1 re-run: pull events from 2026-05-29 19:00 PDT onward,
+>   replacing (not augmenting) the existing 671-frame harvest. The
+>   pre-stable-stack frames are corpus-poisoning candidates for the
+>   reasons in §1.2.6 (V3 detected the easy daytime cases, hardly
+>   anything else).
+> - §1.5 night/IR harvest: fire all four strategies fresh against the
+>   clean 48h window.
+> - The 671 frames already on the dev Mac at
+>   `~/pet-models/hamster/harvest_v4/` can be kept for cross-reference
+>   but should be moved out of the active review/ staging area so
+>   they don't get re-labeled accidentally.
+>
+> While waiting (2026-05-29 evening → 2026-05-31 morning), useful
+> human-gated work that doesn't depend on the harvest:
+> - §0.1 mask audit visual review (HTML still pending at
+>   `scripts/mask-audit/out/index.html`)
+> - §0.3 per-cam `min_score` empirical answer
+> - Opportunistic debug-view screen-captures of confirmed V3-failure
+>   cases at night (drop into a `night_capture/` staging dir for
+>   later import — Strategy 4 in §1.5).
+
 ### 1.1 Pull daytime + recent night events
 
 Per `HAMSTER_MODEL_TUNING.md` §G.1 — but with **two changes vs V3**:
