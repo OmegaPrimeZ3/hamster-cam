@@ -297,6 +297,51 @@ describe('Diary — empty state', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Diary — TTS with empty initial range (regression: size===0 false positive)
+// ---------------------------------------------------------------------------
+
+describe('Diary — TTS after empty initial load', () => {
+  it('speaks a new entry that arrives after an initially-empty range', async () => {
+    // Use real timers so waitFor polling and React Query internals work normally.
+    vi.useRealTimers();
+
+    const speakSpy = vi.spyOn(window.speechSynthesis, 'speak');
+    const now = Date.now();
+    const floored = Math.floor(now / 30_000) * 30_000;
+    const from24h = floored - 24 * 60 * 60 * 1000;
+
+    const { Wrapper, queryClient } = makeWrapper({});
+    // Seed with EMPTY array → initialLoad fires, marks nothing seen, sets initialLoadDoneRef=true.
+    queryClient.setQueryData(rangeQueryKey(from24h, floored), []);
+
+    render(<Diary readAloud={true} petName="Remy" />, { wrapper: Wrapper });
+
+    // Empty state renders — nothing to speak.
+    await waitFor(() => {
+      expect(screen.getByText(/nothing happened during this time/i)).toBeInTheDocument();
+    });
+    expect(speakSpy).not.toHaveBeenCalled();
+
+    // Simulate a new entry arriving (e.g. via SSE pushing into the cache).
+    const newEntry = makeEntry({
+      id: 99,
+      occurred_at: now - 60_000,
+      narrative: 'Remy just arrived on the wheel!',
+    });
+    act(() => {
+      queryClient.setQueryData(rangeQueryKey(from24h, floored), [newEntry]);
+    });
+
+    // The entry should now render and TTS should fire because initialLoadDoneRef
+    // is already true (empty initial load was processed) and the entry is unseen.
+    await waitFor(() => {
+      expect(screen.getByText(/remy just arrived on the wheel/i)).toBeInTheDocument();
+    });
+    expect(speakSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // DiaryRangePicker standalone tests
 // ---------------------------------------------------------------------------
 

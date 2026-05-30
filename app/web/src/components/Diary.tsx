@@ -115,6 +115,11 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
   // changes we need to mark the entire newly-loaded set as seen so we don't
   // narrate the historical backlog.
   const seenIdsRef = useRef<Set<number>>(new Set());
+  // initialLoadDoneRef flips to true after the first successful data arrival for
+  // the current range. Using a boolean instead of checking seenIdsRef.size avoids
+  // a false "first load" branch on subsequent polls when the range legitimately
+  // has zero entries (e.g. a quiet overnight period with no activity).
+  const initialLoadDoneRef = useRef<boolean>(false);
 
   // Track the previous range key so we can detect a range change.
   const prevRangeKeyRef = useRef<string>(`${resolvedRange.from}:${resolvedRange.to}`);
@@ -129,12 +134,14 @@ export function Diary({ readAloud, petName }: DiaryProps): JSX.Element {
     if (rangeChanged) {
       // Range changed — treat as a fresh load. Mark everything seen, no TTS.
       seenIdsRef.current = new Set<number>(rangeQuery.data.map((e) => e.id));
+      initialLoadDoneRef.current = true;
       return;
     }
 
-    // First render after data arrives: mark as seen, no TTS.
-    if (seenIdsRef.current.size === 0) {
+    // First render after data arrives for this range: mark all as seen, no TTS.
+    if (!initialLoadDoneRef.current) {
       for (const e of rangeQuery.data) seenIdsRef.current.add(e.id);
+      initialLoadDoneRef.current = true;
       return;
     }
 
