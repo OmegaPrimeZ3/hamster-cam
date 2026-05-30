@@ -1622,6 +1622,7 @@ const adminRouter = router({
       audit_rows_deleted: z.number().int().nonnegative(),
       clips_deleted: z.number().int().nonnegative(),
       thumbnails_deleted: z.number().int().nonnegative(),
+      thumbnail_paths_cleared: z.number().int().nonnegative(),
     }))
     .mutation(() => runRetentionJob()),
 

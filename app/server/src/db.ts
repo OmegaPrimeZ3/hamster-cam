@@ -290,6 +290,7 @@ interface Statements {
   diaryUpdateDetails: Database.Statement;
   diaryUpdateBackfillAttempt: Database.Statement;
   diaryMarkMediaUnavailable: Database.Statement;
+  diaryClearThumbnailOlderThan: Database.Statement;
   diaryMissingThumbnail: Database.Statement;
   // badges
   badgeInsertDaily: Database.Statement;
@@ -566,6 +567,19 @@ function statements(): Statements {
          SET media_unavailable         = 1,
              media_backfill_last_error = @media_backfill_last_error
        WHERE id = @id
+    `),
+    // Retention helper: when the thumbnails directory is pruned the DB column
+    // must be nulled out so the backfill job can regenerate those thumbnails
+    // the next time the entry comes within the Frigate retention window.
+    // Only clears entries that still have a thumbnail_path set — entries
+    // that never had one, or that were already cleared, are unaffected.
+    // Does NOT touch media_unavailable: a permanent Frigate failure that was
+    // independently set on the same entry should remain respected.
+    diaryClearThumbnailOlderThan: db.prepare(`
+      UPDATE diary_entries
+         SET thumbnail_path = NULL
+       WHERE thumbnail_path IS NOT NULL
+         AND occurred_at < ?
     `),
     // Backfill query: entries that lack a thumbnail, have a resolvable camera,
     // fall within the Frigate recording retention window (passed as a cutoff
@@ -1339,6 +1353,20 @@ export function deleteOldSnapshotDiaryEntries(cutoffMs: number): number {
 
 export function clearOldTimelapseMedia(cutoffMs: number): number {
   const info = statements().diaryClearMediaOlderThan.run(cutoffMs);
+  return info.changes;
+}
+
+/**
+ * Null out `thumbnail_path` for all diary entries older than `cutoffMs`.
+ * Called by the retention job after it prunes the thumbnails directory so
+ * the thumbnail-backfill job can regenerate those thumbnails once the entries
+ * come back within the Frigate recording retention window.
+ *
+ * Does NOT touch `media_unavailable` — that flag may have been set by a
+ * permanent Frigate clip failure on the same entry and must remain respected.
+ */
+export function clearOldThumbnailPaths(cutoffMs: number): number {
+  const info = statements().diaryClearThumbnailOlderThan.run(cutoffMs);
   return info.changes;
 }
 

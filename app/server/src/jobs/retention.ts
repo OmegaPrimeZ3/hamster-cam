@@ -20,6 +20,8 @@ export interface RetentionRunResult {
   audit_rows_deleted: number;
   clips_deleted: number;
   thumbnails_deleted: number;
+  /** Diary rows whose thumbnail_path was nulled out because the file was pruned. */
+  thumbnail_paths_cleared: number;
 }
 
 function days(n: number): number {
@@ -70,6 +72,13 @@ export async function runRetentionJob(): Promise<RetentionRunResult> {
   // Prune on the same window as clips; stale thumbnails re-generate lazily.
   const thumbnailsDeleted = await pruneMediaDir('thumbnails', now - clipWindow);
 
+  // After pruning thumbnail files, null out the thumbnail_path column for
+  // any diary entry whose thumbnail was just removed. Without this the
+  // backfill query (thumbnail_path IS NULL) never sees those rows again,
+  // so thumbnails that fell off the retention window are permanently dark.
+  // We use the same cutoff so the cleared set exactly matches what was pruned.
+  const thumbnailPathsCleared = db.clearOldThumbnailPaths(now - clipWindow);
+
   // Also opportunistically purge expired sessions — cheap and keeps the
   // table from growing forever in a long-lived install.
   db.purgeExpiredSessions(now);
@@ -82,6 +91,7 @@ export async function runRetentionJob(): Promise<RetentionRunResult> {
       auditRowsDeleted,
       clipsDeleted,
       thumbnailsDeleted,
+      thumbnailPathsCleared,
     },
     'retention sweep complete',
   );
@@ -91,6 +101,7 @@ export async function runRetentionJob(): Promise<RetentionRunResult> {
     audit_rows_deleted: auditRowsDeleted,
     clips_deleted: clipsDeleted,
     thumbnails_deleted: thumbnailsDeleted,
+    thumbnail_paths_cleared: thumbnailPathsCleared,
   };
 }
 
