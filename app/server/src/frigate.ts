@@ -656,10 +656,16 @@ export async function extractFrame(input: {
 
   const width = input.widthPx ?? 480;
   const centerSec = Math.floor(input.atMs / 1000);
-  // 4-second window: start 2s before the target moment; clamp to 0 so we
-  // never request a negative timestamp from Frigate.
-  const startSec = Math.max(0, centerSec - 2);
-  const endSec = centerSec + 2;
+  // 60-second window centered on the target moment. Frigate 0.17.x rejects
+  // sub-segment-aligned clip windows with HTTP 400 — empirically anything
+  // under ~30s for this stack's record.detections retention pattern. 60s is
+  // wide enough to span at least one full recording segment in every case
+  // observed in production. Wider doesn't cost us — ffmpeg seeks before
+  // decoding so only one frame is materialized regardless of clip length.
+  // See thumbnail-backfill.ts / project_frigate_clip_endpoint memory.
+  const halfWindowSec = 30;
+  const startSec = Math.max(0, centerSec - halfWindowSec);
+  const endSec = centerSec + halfWindowSec;
   // Frigate 0.17.x recording-clip endpoint (same route as extractClip):
   //   /api/<camera_name>/start/<sec>/end/<endSec>/clip.mp4
   const sourceUrl = new URL(
@@ -667,11 +673,11 @@ export async function extractFrame(input: {
     cfg.FRIGATE_URL,
   ).toString();
 
-  // Seek offset within the 4-second window so the extracted frame lands near
-  // `atMs` rather than at the very start of the window. When startSec was
-  // clamped to 0 the effective offset is smaller; clamp to [0, 3] to stay
+  // Seek to the target moment inside the window so the extracted frame lands
+  // on `atMs`, not at the very start. When startSec was clamped to 0 the
+  // effective offset is smaller; clamp to [0, 2*halfWindowSec - 1] to stay
   // inside the window.
-  const seekOffset = Math.min(centerSec - startSec, 3);
+  const seekOffset = Math.min(centerSec - startSec, halfWindowSec * 2 - 1);
 
   try {
     await runFfmpeg([
