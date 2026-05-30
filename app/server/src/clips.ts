@@ -70,18 +70,23 @@ export async function ensureClip(entry: db.DiaryEntryRow): Promise<EnsureClipRes
   const centerMs = entry.occurred_at - Math.floor(dur / 2);
 
   // Adaptive window: cover the full activity + 4 s of headroom, clamped to
-  // [30 s, 60 s].  Frigate 0.17.x returns HTTP 400 for clip windows under
-  // ~30 s (sub-segment-aligned requests).  The same threshold was empirically
-  // identified when fixing extractFrame in 6f72dd6 — clips use the same
-  // Frigate endpoint (/api/<cam>/start/<s>/end/<e>/clip.mp4) and are subject
-  // to the same rejection floor.
+  // [60 s, 240 s].  Frigate 0.17.x returns HTTP 400 not just for sub-segment-
+  // aligned requests but also for windows that fall in a *gap* between
+  // motion-driven recording segments — a real issue when
+  // `record.continuous.days: 0` is in force (our case): Frigate only stores
+  // segments while motion is active, and the gaps between bursts can be
+  // 30-120 seconds wide.  Empirical (2026-05-29 23:30 PDT on cam1):
   //
-  // Floor raised from 8 s → 30 s.  Ceiling raised from 20 s → 60 s so that
-  // the floor can always be reached (and to match extractFrame's 60 s window).
-  // Wider doesn't cost much — Frigate streams and the browser seek to the
-  // midpoint anyway.  A 6 s food visit → 30 s window centred on midpoint;
-  // an 8-min wheel run → 60 s window centred mid-run.
-  const clampedDurationMs = Math.max(30_000, Math.min(60_000, dur + 4_000));
+  //   05:10:26 ─┬─ ~110 s gap ─┬─ 05:12:16
+  //             └ 60s window centred at 05:11:30 → 400
+  //             └ 120s window centred at 05:11:30 → 200 (stitches segments)
+  //
+  // Floor raised 30 s → 60 s.  Ceiling raised 60 s → 240 s.  A 60 s floor
+  // covers the typical sub-minute motion gap; the 240 s ceiling lets long
+  // activities (8-min wheel runs) include a full 4-min snippet without
+  // truncation.  Wider doesn't cost much — Frigate streams and the browser
+  // seeks to the midpoint anyway.
+  const clampedDurationMs = Math.max(60_000, Math.min(240_000, dur + 4_000));
 
   const extracted = await extractClip({
     cameraName: camera.live_src ?? camera.name,

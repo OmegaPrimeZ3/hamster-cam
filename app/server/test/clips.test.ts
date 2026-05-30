@@ -161,7 +161,7 @@ describe('ensureClip', () => {
     expect(extractClip).toHaveBeenCalledOnce();
     const callArg = extractClip.mock.calls[0]![0] as { centerMs: number; durationMs: number };
     expect(callArg.centerMs).toBe(7_000);    // midpoint = occurred_at − dur/2
-    expect(callArg.durationMs).toBe(30_000); // clamp(6000+4000, 30000, 60000) = 30000
+    expect(callArg.durationMs).toBe(60_000); // clamp(6000+4000, 60000, 240000) = 60000
     expect(result.relPath).toContain('clips');
 
     // Check it was persisted in the DB.
@@ -169,7 +169,7 @@ describe('ensureClip', () => {
     expect(refreshed?.clip_path).toBe(result.relPath);
   });
 
-  it('uses occurred_at as centerMs and 8000 ms window when duration_ms is null', async () => {
+  it('uses occurred_at as centerMs and 60000 ms window when duration_ms is null', async () => {
     const db = await import('../src/db.js');
     const { ensureClip } = await import('../src/clips.js');
     const frigateModule = await import('../src/frigate.js');
@@ -204,12 +204,12 @@ describe('ensureClip', () => {
     await ensureClip(entry);
 
     const callArg = extractClip.mock.calls[0]![0] as { centerMs: number; durationMs: number };
-    // dur=0, so centerMs = occurred_at − 0 = 50000; durationMs = clamp(0+4000,30000,60000)=30000
+    // dur=0, so centerMs = occurred_at − 0 = 50000; durationMs = clamp(0+4000,60000,240000)=60000
     expect(callArg.centerMs).toBe(50_000);
-    expect(callArg.durationMs).toBe(30_000);
+    expect(callArg.durationMs).toBe(60_000);
   });
 
-  it('clamps durationMs to 60000 for very long activities', async () => {
+  it('clamps durationMs to 240000 for very long activities', async () => {
     const db = await import('../src/db.js');
     const { ensureClip } = await import('../src/clips.js');
     const frigateModule = await import('../src/frigate.js');
@@ -222,7 +222,7 @@ describe('ensureClip', () => {
       live_src: 'longrun',
       enabled: true,
     });
-    // 8-minute (480000 ms) wheel run — clamp should cap durationMs at 60000.
+    // 8-minute (480000 ms) wheel run — clamp should cap durationMs at 240000.
     // centerMs = 600000 − floor(480000/2) = 600000 − 240000 = 360000
     const entry = db.createDiaryEntry({
       occurred_at: 600_000,
@@ -241,13 +241,13 @@ describe('ensureClip', () => {
 
     const extractedAbs = join(workdir, 'clips', 'longrun-350-370.mp4');
     writeFileSync(extractedAbs, Buffer.alloc(16));
-    extractClip.mockResolvedValueOnce({ path: extractedAbs, duration_ms: 60_000 });
+    extractClip.mockResolvedValueOnce({ path: extractedAbs, duration_ms: 240_000 });
 
     await ensureClip(entry);
 
     const callArg = extractClip.mock.calls[0]![0] as { centerMs: number; durationMs: number };
     expect(callArg.centerMs).toBe(360_000); // mid-run
-    expect(callArg.durationMs).toBe(60_000); // capped at new 60s ceiling
+    expect(callArg.durationMs).toBe(240_000); // capped at new 240s ceiling
   });
 
   it('re-extracts when cached file is missing from disk', async () => {

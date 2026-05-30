@@ -114,47 +114,47 @@ describe('extractClip — Frigate 0.17.x URL', () => {
 // ---------------------------------------------------------------------------
 
 describe('extractFrame — Frigate 0.17.x URL', () => {
-  it('passes a 60-second window centered on atMs to ffmpeg (start=center-30, end=center+30)', async () => {
+  it('passes a 180-second window centered on atMs to ffmpeg (start=center-90, end=center+90)', async () => {
     const { extractFrame } = await import('../src/frigate.js');
 
     // atMs = 5_000_500 → centerSec = floor(5_000_500 / 1000) = 5000
-    // startSec = max(0, 5000 - 30) = 4970; endSec = 5000 + 30 = 5030
-    // Wide enough to span a full Frigate segment so the endpoint stops
-    // returning HTTP 400 on sub-segment-aligned requests.
+    // startSec = max(0, 5000 - 90) = 4910; endSec = 5000 + 90 = 5090
+    // Wide enough to span Frigate motion-segment gaps (record.continuous: 0
+    // means clips don't exist between motion bursts; gaps can be 60-120s).
     const result = await extractFrame({ cameraName: 'remy-cam', atMs: 5_000_500 });
 
     const iIdx = capturedFfmpegArgs.indexOf('-i');
     expect(iIdx).toBeGreaterThan(-1);
     const inputUrl = capturedFfmpegArgs[iIdx + 1];
 
-    expect(inputUrl).toBe('http://frigate.local:5000/api/remy-cam/start/4970/end/5030/clip.mp4');
+    expect(inputUrl).toBe('http://frigate.local:5000/api/remy-cam/start/4910/end/5090/clip.mp4');
     expect(inputUrl).not.toContain('/recordings/');
-    expect(inputUrl).not.toContain('/start/4998/end/5002/'); // old 4s form must be gone
+    expect(inputUrl).not.toContain('/start/4970/end/5030/'); // old 60s form must be gone
 
     // Either outcome is acceptable here — we only care about the URL.
     expect(result.path).toContain('thumbnails');
   });
 
-  it('clamps startSec to 0 when atMs is within the first 30 seconds', async () => {
+  it('clamps startSec to 0 when atMs is within the first 90 seconds', async () => {
     const { extractFrame } = await import('../src/frigate.js');
 
-    // atMs = 15_000 → centerSec = 15; startSec = max(0, 15-30) = 0; endSec = 45
-    await extractFrame({ cameraName: 'remy-cam', atMs: 15_000 });
+    // atMs = 45_000 → centerSec = 45; startSec = max(0, 45-90) = 0; endSec = 135
+    await extractFrame({ cameraName: 'remy-cam', atMs: 45_000 });
 
     const iIdx = capturedFfmpegArgs.indexOf('-i');
     const inputUrl = capturedFfmpegArgs[iIdx + 1];
-    expect(inputUrl).toBe('http://frigate.local:5000/api/remy-cam/start/0/end/45/clip.mp4');
+    expect(inputUrl).toBe('http://frigate.local:5000/api/remy-cam/start/0/end/135/clip.mp4');
   });
 
   it('includes a -ss seek offset so the extracted frame lands near atMs', async () => {
     const { extractFrame } = await import('../src/frigate.js');
 
-    // atMs = 5_000_500 → centerSec=5000, startSec=4970, seekOffset = min(5000-4970, 59) = 30
+    // atMs = 5_000_500 → centerSec=5000, startSec=4910, seekOffset = min(5000-4910, 179) = 90
     await extractFrame({ cameraName: 'remy-cam', atMs: 5_000_500 });
 
     const ssIdx = capturedFfmpegArgs.indexOf('-ss');
     expect(ssIdx).toBeGreaterThan(-1);
-    expect(capturedFfmpegArgs[ssIdx + 1]).toBe('30');
+    expect(capturedFfmpegArgs[ssIdx + 1]).toBe('90');
   });
 
   it('does not throw when FRIGATE_URL is absent — returns captured:false', async () => {

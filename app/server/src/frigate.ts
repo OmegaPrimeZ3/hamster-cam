@@ -656,14 +656,18 @@ export async function extractFrame(input: {
 
   const width = input.widthPx ?? 480;
   const centerSec = Math.floor(input.atMs / 1000);
-  // 60-second window centered on the target moment. Frigate 0.17.x rejects
-  // sub-segment-aligned clip windows with HTTP 400 — empirically anything
-  // under ~30s for this stack's record.detections retention pattern. 60s is
-  // wide enough to span at least one full recording segment in every case
-  // observed in production. Wider doesn't cost us — ffmpeg seeks before
-  // decoding so only one frame is materialized regardless of clip length.
+  // 180-second window centered on the target moment. Frigate's clip endpoint
+  // returns HTTP 400 not just for sub-segment-aligned windows but ALSO for
+  // windows that fall in a gap between motion-driven recording segments —
+  // which can happen any time `record.continuous.days: 0` is set (our case).
+  // Empirical data on the live host (2026-05-29 23:30 PDT): cam1 had
+  // segments at 5:10:26 and 5:12:16 with ~110s of dead air between them; a
+  // 60s window centered at 5:11:30 fell entirely in the gap and got 400,
+  // while a 120s window stitched the surrounding segments and got 200.
+  // 180s = 90s on each side: spans nearly any realistic gap between bursts
+  // of motion while keeping ffmpeg's seek-before-decode cost negligible.
   // See thumbnail-backfill.ts / project_frigate_clip_endpoint memory.
-  const halfWindowSec = 30;
+  const halfWindowSec = 90;
   const startSec = Math.max(0, centerSec - halfWindowSec);
   const endSec = centerSec + halfWindowSec;
   // Frigate 0.17.x recording-clip endpoint (same route as extractClip):
