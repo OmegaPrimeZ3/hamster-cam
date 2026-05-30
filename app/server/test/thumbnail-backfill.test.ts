@@ -458,9 +458,73 @@ describe('runThumbnailBackfillJob', () => {
     const { generateThumbnailForEntryUnguarded } = await import('../src/thumbnails.js');
     expect(generateThumbnailForEntryUnguarded).toHaveBeenCalledTimes(2);
 
-    // entry2: no path written and no error → marked unavailable
+    // entry2: narrative+camera_id with no-path-written is treated as TRANSIENT
+    // (likely Frigate temporarily can't extract). Attempts bumped, NOT marked
+    // unavailable yet. See isStructurallyUngeneratable in thumbnail-backfill.ts.
     const refreshed2 = db.getDiaryEntryById(entry2.id);
-    expect(refreshed2?.media_unavailable).toBe(1);
+    expect(refreshed2?.media_unavailable).toBe(0);
+    expect(refreshed2?.media_backfill_attempts).toBe(1);
+    expect(refreshed2?.media_backfill_last_error).toBe('no_path_written');
+  });
+
+  it('marks structurally-ungeneratable transition entries (null camera_id) unavailable immediately', async () => {
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+    const db = await import('../src/db.js');
+
+    // Transition entry: from_camera_id set so the query picks it up, but
+    // camera_id is null, so thumbnailFromFrigateFrame returns null without
+    // even trying — there's no resolvable camera to extract from.
+    const fromCam = db.createCamera({
+      name: 'transition-from',
+      emoji: '📷',
+      stream_url: 'rtsp://from',
+      enabled: true,
+    });
+    const transition = db.createDiaryEntry({
+      occurred_at: Date.now() - 60_000,
+      kind: 'narrative',
+      activity: 'transition',
+      narrative: 'moved A → B',
+      pet_name: null,
+      camera_id: null,
+      from_camera_id: fromCam.id,
+      to_camera_id: null,
+      duration_ms: null,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+
+    const { runThumbnailBackfillJob } = await import('../src/jobs/thumbnail-backfill.js');
+    await runThumbnailBackfillJob();
+
+    const refreshed = db.getDiaryEntryById(transition.id);
+    expect(refreshed?.media_unavailable).toBe(1);
+    expect(refreshed?.media_backfill_last_error).toBe('no_path_written');
+    // attempts NOT incremented — this is a structural skip, not a transient retry
+    expect(refreshed?.media_backfill_attempts).toBe(0);
+  });
+
+  it('after MAX_TRANSIENT_ATTEMPTS no-path-written misses, marks unavailable', async () => {
+    process.env['FRIGATE_URL'] = 'http://frigate:5000';
+    const db = await import('../src/db.js');
+
+    const { entry } = await makeEntry('cam-attempt-cap');
+    // Generator always returns null (no path written, no throw) — simulates a
+    // narrative entry where Frigate is persistently unable to extract.
+
+    const { runThumbnailBackfillJob, MAX_TRANSIENT_ATTEMPTS } = await import(
+      '../src/jobs/thumbnail-backfill.js'
+    );
+
+    for (let i = 0; i < MAX_TRANSIENT_ATTEMPTS; i++) {
+      await runThumbnailBackfillJob();
+    }
+
+    const refreshed = db.getDiaryEntryById(entry.id);
+    expect(refreshed?.media_unavailable).toBe(1);
+    expect(refreshed?.media_backfill_attempts).toBe(MAX_TRANSIENT_ATTEMPTS);
+    expect(refreshed?.media_backfill_last_error).toBe('max_transient_attempts');
   });
 
   it('does not process candidates outside the retention window', async () => {

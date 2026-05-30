@@ -99,16 +99,43 @@ export async function runThumbnailBackfillJob(): Promise<ThumbnailBackfillResult
       if (refreshed?.thumbnail_path) {
         succeeded += 1;
         // attempts counter is left as-is for debugging — don't reset it.
-      } else {
-        // Generator returned without throwing but also without writing a path.
-        // This happens for recap entries (skipped inside _generate) or entries
-        // with no resolvable camera — treat as a permanent skip, not a transient
-        // failure, so we don't loop forever on structurally-ungeneratable rows.
+      } else if (isStructurallyUngeneratable(entry)) {
+        // Truly ungeneratable: kind=recap (no representative frame by design)
+        // or no resolvable camera. Mark permanent so we don't loop forever.
         logger.debug(
-          { diary_entry_id: entry.id },
-          'thumbnail backfill: generator returned without writing path — marking unavailable',
+          { diary_entry_id: entry.id, kind: entry.kind, camera_id: entry.camera_id },
+          'thumbnail backfill: structurally ungeneratable — marking unavailable',
         );
         db.markDiaryEntryMediaUnavailable(entry.id, 'no_path_written');
+      } else {
+        // Generator returned null without throwing — most commonly because
+        // thumbnailFromFrigateFrame swallowed a transient Frigate failure
+        // (extractFrame writes a zero-byte placeholder on failure and returns
+        // captured:false). Treat as transient: bump the attempts counter,
+        // give up only after MAX_TRANSIENT_ATTEMPTS like any other transient.
+        const newAttempts = entry.media_backfill_attempts + 1;
+        if (newAttempts >= MAX_TRANSIENT_ATTEMPTS) {
+          logger.info(
+            {
+              diary_entry_id: entry.id,
+              reason: 'max_transient_attempts',
+              attempts: newAttempts,
+            },
+            'thumbnail backfill: marking unavailable',
+          );
+          db.updateDiaryEntryBackfillAttempt(entry.id, newAttempts, 'no_path_written');
+          db.markDiaryEntryMediaUnavailable(entry.id, 'max_transient_attempts');
+        } else {
+          logger.debug(
+            {
+              diary_entry_id: entry.id,
+              attempt: newAttempts,
+              of: MAX_TRANSIENT_ATTEMPTS,
+            },
+            'thumbnail backfill: transient null-return, will retry',
+          );
+          db.updateDiaryEntryBackfillAttempt(entry.id, newAttempts, 'no_path_written');
+        }
       }
     } catch (err) {
       const classification = classifyBackfillError(err);
@@ -165,4 +192,18 @@ export async function runThumbnailBackfillJob(): Promise<ThumbnailBackfillResult
     'thumbnail backfill complete',
   );
   return { candidates: candidates.length, succeeded, still_missing: stillMissing };
+}
+
+/**
+ * True when the entry can NEVER produce a thumbnail regardless of how many
+ * times the generator runs — kind=recap (skipped inside _generate by design),
+ * or no camera_id to extract a frame against. Anything else (narrative with a
+ * camera_id) is potentially generatable; a null return from the generator on
+ * that class is almost always a transient Frigate extract failure that
+ * deserves retries, not an immediate permanent mark.
+ */
+function isStructurallyUngeneratable(entry: db.DiaryEntryRow): boolean {
+  if (entry.kind === 'recap') return true;
+  if (entry.kind === 'narrative' && entry.camera_id == null) return true;
+  return false;
 }
