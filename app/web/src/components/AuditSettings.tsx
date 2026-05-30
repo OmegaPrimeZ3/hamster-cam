@@ -55,7 +55,7 @@ export function AuditSettings(): JSX.Element {
       // append, avoiding duplicates by id
       const seen = new Set(prev.map((r) => r.id));
       const next = prev.slice();
-      for (const r of list.data!.items) {
+      for (const r of list.data.items) {
         if (!seen.has(r.id)) next.push(r);
       }
       return next;
@@ -192,7 +192,7 @@ export function AuditSettings(): JSX.Element {
         <button
           type="button"
           className="hc-btn"
-          onClick={() => setCursor(list.data!.next_cursor)}
+          onClick={() => list.data && setCursor(list.data.next_cursor)}
           disabled={list.isFetching}
         >
           {list.isFetching ? 'Loading…' : 'Load more'}
