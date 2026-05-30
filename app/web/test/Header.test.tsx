@@ -15,9 +15,9 @@
 // before rendering. The tRPC key for settings.get with no input is
 // [['settings', 'get'], { type: 'query' }] per getArrayQueryKey internals.
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 import { ReactNode } from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import { http, HttpResponse, server } from './msw/server';
@@ -61,6 +61,9 @@ const LIVE_SETTINGS = {
 
 describe('Header — cached-brand fallback', () => {
   beforeEach(() => {
+    localStorage.clear();
+  });
+  afterEach(() => {
     localStorage.clear();
   });
 
@@ -163,5 +166,42 @@ describe('Header — cached-brand fallback', () => {
     // on the Mascot's wrapper, which uses the emoji in its title.
     // Simplest reliable assertion: heading shows the cached name.
     expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Nibbles Cam!');
+  });
+});
+
+describe('Header — status popover', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    server.use(
+      http.get('/auth/me', () => HttpResponse.json(AUTHED_USER_RESPONSE, { status: 200 })),
+    );
+    mockQuery('cameras.list', () => []);
+    mockQuery('activity.today', () => []);
+  });
+
+  it('opens status popover when the connection button is clicked', () => {
+    renderWithProviders(<Header onOpenSettings={() => undefined} onOpenChangePassword={() => undefined} />);
+    const btn = screen.getByRole('button', { name: /connection status/i });
+    fireEvent.click(btn);
+    expect(screen.getByRole('listbox', { name: /camera status/i })).toBeInTheDocument();
+  });
+
+  it('closes the status popover when Escape is pressed', () => {
+    renderWithProviders(<Header onOpenSettings={() => undefined} onOpenChangePassword={() => undefined} />);
+    const btn = screen.getByRole('button', { name: /connection status/i });
+    fireEvent.click(btn);
+    expect(screen.getByRole('listbox', { name: /camera status/i })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('listbox', { name: /camera status/i })).toBeNull();
+  });
+
+  it('closes the status popover when clicking outside', () => {
+    renderWithProviders(<Header onOpenSettings={() => undefined} onOpenChangePassword={() => undefined} />);
+    const btn = screen.getByRole('button', { name: /connection status/i });
+    fireEvent.click(btn);
+    expect(screen.getByRole('listbox', { name: /camera status/i })).toBeInTheDocument();
+    // Click somewhere outside the popover container.
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('listbox', { name: /camera status/i })).toBeNull();
   });
 });

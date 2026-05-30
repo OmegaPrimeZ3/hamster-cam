@@ -7,7 +7,7 @@
 // indicator. Tap it → opens a small panel listing each camera's state. The
 // gear icon is rendered only when the signed-in user is an admin.
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Settings } from 'lucide-react';
 import { trpc, RouterOutputs } from '../trpc';
 import { Mascot, MascotPose } from './Mascot';
@@ -41,6 +41,29 @@ export function Header({ onOpenSettings, onOpenChangePassword, activityHint }: H
     refetchInterval: 60_000,
   });
   const [statusOpen, setStatusOpen] = useState(false);
+  const statusContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // Close status popover on Escape or click outside.
+  useEffect(() => {
+    if (!statusOpen) return;
+    function handleKey(e: KeyboardEvent): void {
+      if (e.key === 'Escape') setStatusOpen(false);
+    }
+    function handlePointerDown(e: PointerEvent): void {
+      if (
+        statusContainerRef.current &&
+        !statusContainerRef.current.contains(e.target as Node)
+      ) {
+        setStatusOpen(false);
+      }
+    }
+    document.addEventListener('keydown', handleKey);
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      document.removeEventListener('keydown', handleKey);
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [statusOpen]);
 
   const cached = useMemo(() => readCachedBrand(), []);
   const petName = settings.data?.pet_name?.trim() || cached.petName;
@@ -95,13 +118,13 @@ export function Header({ onOpenSettings, onOpenChangePassword, activityHint }: H
 
         <div style={{ flex: 1 }} />
 
-        <div style={{ position: 'relative' }}>
+        <div ref={statusContainerRef} style={{ position: 'relative' }}>
           <button
             type="button"
             className="hc-btn"
             onClick={() => setStatusOpen((v) => !v)}
             aria-expanded={statusOpen}
-            aria-haspopup="dialog"
+            aria-haspopup="listbox"
             aria-label={`Connection status: ${describe(aggregate)}`}
             style={{ minHeight: 48, padding: '0 12px' }}
           >
@@ -110,7 +133,7 @@ export function Header({ onOpenSettings, onOpenChangePassword, activityHint }: H
           </button>
           {statusOpen && (
             <div
-              role="dialog"
+              role="listbox"
               aria-label="Camera status"
               style={{
                 position: 'absolute',
