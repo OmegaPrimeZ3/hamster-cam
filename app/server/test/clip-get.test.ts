@@ -460,6 +460,51 @@ describe('clip_available — retention window in activity.list', () => {
     expect(dto?.clip_available).toBe(true);
   });
 
+  it('is true when clip_path is set even if media_unavailable=1 (cached bytes win)', async () => {
+    const db = await import('../src/db.js');
+    const { appRouter } = await import('../src/trpc.js');
+
+    // Cached clip on disk
+    const cachedRel = join('clips', 'remy-200-210.mp4');
+    const cachedAbs = join(workdir, cachedRel);
+    writeFileSync(cachedAbs, Buffer.alloc(16));
+
+    const camera = db.createCamera({
+      name: 'cached-cam',
+      emoji: '💾',
+      stream_url: 'rtsp://cached',
+      live_src: 'cached-cam',
+      enabled: true,
+    });
+
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    const entry = db.createDiaryEntry({
+      occurred_at: oneHourAgo,
+      kind: 'narrative',
+      activity: 'wheel',
+      narrative: 'cached run',
+      pet_name: 'Remy',
+      camera_id: camera.id,
+      from_camera_id: null,
+      to_camera_id: null,
+      duration_ms: 10_000,
+      snapshot_id: null,
+      media_path: null,
+      details: null,
+    });
+    db.updateDiaryEntryClipPath(entry.id, cachedRel);
+    // Then mark unavailable — Frigate refetch failed but we still have the bytes.
+    db.markDiaryEntryMediaUnavailable(entry.id, 'frigate_http_400');
+
+    const ctx = await makeAdminCtx();
+    const caller = appRouter.createCaller(ctx);
+    const result = await caller.activity.range({ from: oneHourAgo - 1000, to: oneHourAgo + 1000 });
+
+    const dto = result[0];
+    // Cached clip wins over the unavailable flag — UI gets its tap-to-play button.
+    expect(dto?.clip_available).toBe(true);
+  });
+
   it('is false when media_unavailable=1 even within the retention window', async () => {
     const db = await import('../src/db.js');
     const { appRouter } = await import('../src/trpc.js');

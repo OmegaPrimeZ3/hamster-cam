@@ -370,16 +370,22 @@ const FRIGATE_RECORDING_RETENTION_MS = 10 * 24 * 60 * 60 * 1000; // 10 days
 
 export function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
   // clip_available resolution order (mirrors ensureClip):
-  //   0. media_unavailable = 1 → permanent override, button suppressed regardless
-  //      of the rules below. The backfill cron job (jobs/thumbnail-backfill.ts) or
-  //      the clip.get tRPC route sets this when ffmpeg has confirmed the footage
-  //      is gone (HTTP 400/401/404/410 from Frigate). Without this short-circuit
-  //      the UI would keep showing a tap-to-play button that always errors.
-  //   1. Already extracted and cached on disk → always available regardless of age.
-  //   2. Timelapse mp4 via media_path → always available regardless of age.
-  //   3. camera_id set AND entry is recent enough for Frigate to still have footage.
-  //      Entries older than FRIGATE_RECORDING_RETENTION_MS will 404 on Frigate
-  //      and produce a doomed ffmpeg exit-1; suppress the button proactively.
+  //   1. Already extracted and cached on disk → always available regardless of
+  //      age OR media_unavailable. We have the bytes; we can serve them.
+  //   2. Timelapse mp4 via media_path → same: we have the bytes.
+  //   3. Otherwise, the entry must be both NOT marked media_unavailable AND
+  //      have camera_id set AND be within the Frigate recording retention
+  //      window. media_unavailable=1 is the proactive "Frigate has confirmed
+  //      it can't extract this anymore" signal (set by the cron backfill or
+  //      clip.get on HTTP 400/401/404/410); it does NOT override existing
+  //      on-disk cache, because the cached file is independent of Frigate's
+  //      ability to re-serve the source.
+  //
+  // The hasExtracted/hasTimelapse short-circuits must come BEFORE the
+  // unavailable check — earlier code put the check first, which meant any
+  // entry whose Frigate clip refetch had ever 400'd lost its cached clip
+  // button too. That regression masked working clips and hid the
+  // tap-to-play UI across the entire feed.
   const hasExtractedClip = row.clip_path != null;
   const hasTimelapseMedia =
     row.media_path != null && row.media_path.toLowerCase().endsWith('.mp4');
@@ -387,8 +393,9 @@ export function diaryToDTO(row: db.DiaryEntryRow): DiaryEntryDTO {
     row.camera_id != null &&
     Date.now() - row.occurred_at <= FRIGATE_RECORDING_RETENTION_MS;
   const clip_available =
-    row.media_unavailable !== 1 &&
-    (hasExtractedClip || hasTimelapseMedia || withinRetentionWindow);
+    hasExtractedClip ||
+    hasTimelapseMedia ||
+    (row.media_unavailable !== 1 && withinRetentionWindow);
 
   return {
     id: row.id,
