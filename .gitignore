@@ -69,3 +69,6 @@ __pycache__/
 # This overrides the *.onnx / *.pt ignore above for this directory only.
 !/models/
 !/models/**
+
+# Mask audit run artifacts — regenerated on demand, not source of truth
+scripts/mask-audit/out/
