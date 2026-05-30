@@ -84,6 +84,7 @@ export function MaximizedCamera({
       setSnapMessage('Saved!');
       window.setTimeout(() => setSnapMessage(null), 1800);
       await utils.activity.today.invalidate();
+      await utils.activity.range.invalidate();
     },
     onError: (err) => {
       setSnapKind('error');
