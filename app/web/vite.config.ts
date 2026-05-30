@@ -136,5 +136,10 @@ export default defineConfig({
     coverage: {
       reporter: ['text', 'json'],
     },
+    alias: {
+      // vite-plugin-pwa's virtual module doesn't exist in vitest's jsdom env.
+      // Stub it so components that import `virtual:pwa-register/react` resolve.
+      'virtual:pwa-register/react': path.resolve(__dirname, 'test/__mocks__/virtual-pwa-register-react.ts'),
+    },
   },
 });

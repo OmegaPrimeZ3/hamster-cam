@@ -28,6 +28,7 @@ import { OnboardingWizard } from './components/OnboardingWizard';
 import { ChangePasswordForm } from './components/ChangePasswordForm';
 import { Mascot } from './components/Mascot';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { SwUpdateBanner } from './components/SwUpdateBanner';
 import { trpc } from './trpc';
 import { useAuth } from './hooks/useAuth';
 import { useWakeLock } from './hooks/useWakeLock';
@@ -49,17 +50,20 @@ const SETTINGS_SPLASH_TIMEOUT_MS = 8_000;
 
 export function App(): JSX.Element {
   return (
-    <Routes>
-      <Route path="/login" element={<ErrorBoundary fallbackVariant="admin" label="Login"><Login /></ErrorBoundary>} />
-      <Route
-        path="*"
-        element={
-          <AuthGate>
-            <AppShell />
-          </AuthGate>
-        }
-      />
-    </Routes>
+    <>
+      <SwUpdateBanner />
+      <Routes>
+        <Route path="/login" element={<ErrorBoundary fallbackVariant="admin" label="Login"><Login /></ErrorBoundary>} />
+        <Route
+          path="*"
+          element={
+            <AuthGate>
+              <AppShell />
+            </AuthGate>
+          }
+        />
+      </Routes>
+    </>
   );
 }
 
