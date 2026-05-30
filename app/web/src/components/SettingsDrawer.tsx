@@ -15,6 +15,7 @@ import { AuditSettings } from './AuditSettings';
 import { ShareSettings } from './ShareSettings';
 import { NotificationSettings } from './NotificationSettings';
 import { RecapSettings } from './RecapSettings';
+import { ErrorBoundary } from './ErrorBoundary';
 
 export interface SettingsDrawerProps {
   open: boolean;
@@ -118,13 +119,13 @@ export function SettingsDrawer({ open, onOpenChange, initialTab = 'pet' }: Setti
             </Tabs.List>
 
             <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
-              <Tabs.Content value="pet"><PetSettings /></Tabs.Content>
-              <Tabs.Content value="recap"><RecapSettings /></Tabs.Content>
-              <Tabs.Content value="cameras"><CameraSettings /></Tabs.Content>
-              <Tabs.Content value="users"><UserSettings /></Tabs.Content>
-              <Tabs.Content value="audit"><AuditSettings /></Tabs.Content>
-              <Tabs.Content value="sharing"><ShareSettings /></Tabs.Content>
-              <Tabs.Content value="notifications"><NotificationSettings /></Tabs.Content>
+              <Tabs.Content value="pet"><ErrorBoundary fallbackVariant="admin" label="Pet settings"><PetSettings /></ErrorBoundary></Tabs.Content>
+              <Tabs.Content value="recap"><ErrorBoundary fallbackVariant="admin" label="Recap settings"><RecapSettings /></ErrorBoundary></Tabs.Content>
+              <Tabs.Content value="cameras"><ErrorBoundary fallbackVariant="admin" label="Camera settings"><CameraSettings /></ErrorBoundary></Tabs.Content>
+              <Tabs.Content value="users"><ErrorBoundary fallbackVariant="admin" label="User settings"><UserSettings /></ErrorBoundary></Tabs.Content>
+              <Tabs.Content value="audit"><ErrorBoundary fallbackVariant="admin" label="Audit log"><AuditSettings /></ErrorBoundary></Tabs.Content>
+              <Tabs.Content value="sharing"><ErrorBoundary fallbackVariant="admin" label="Sharing settings"><ShareSettings /></ErrorBoundary></Tabs.Content>
+              <Tabs.Content value="notifications"><ErrorBoundary fallbackVariant="admin" label="Notification settings"><NotificationSettings /></ErrorBoundary></Tabs.Content>
             </div>
           </Tabs.Root>
         </Dialog.Content>

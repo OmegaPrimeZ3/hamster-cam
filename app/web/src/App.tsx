@@ -27,6 +27,7 @@ import { SettingsDrawer, SettingsTabId } from './components/SettingsDrawer';
 import { OnboardingWizard } from './components/OnboardingWizard';
 import { ChangePasswordForm } from './components/ChangePasswordForm';
 import { Mascot } from './components/Mascot';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { trpc } from './trpc';
 import { useAuth } from './hooks/useAuth';
 import { useWakeLock } from './hooks/useWakeLock';
@@ -49,7 +50,7 @@ const SETTINGS_SPLASH_TIMEOUT_MS = 8_000;
 export function App(): JSX.Element {
   return (
     <Routes>
-      <Route path="/login" element={<Login />} />
+      <Route path="/login" element={<ErrorBoundary fallbackVariant="admin" label="Login"><Login /></ErrorBoundary>} />
       <Route
         path="*"
         element={
@@ -146,7 +147,11 @@ export function AppShell(): JSX.Element {
 
   // Run onboarding only for admins who haven't completed it yet.
   if (settings.data && isAdmin && !settings.data.onboarding_complete) {
-    return <OnboardingWizard />;
+    return (
+      <ErrorBoundary fallbackVariant="admin" label="Onboarding wizard">
+        <OnboardingWizard />
+      </ErrorBoundary>
+    );
   }
 
   return (
@@ -163,17 +168,21 @@ export function AppShell(): JSX.Element {
         <LiveStatus petName={settings.data?.pet_name?.trim() || cachedBrand.petName} />
         <StatsStrip />
         <WheelRecordsCard />
-        <CameraGrid
-          onAdminOpenCameras={isAdmin ? () => {
-            setSettingsTab('cameras');
-            setSettingsOpen(true);
-          } : undefined}
-        />
+        <ErrorBoundary fallbackVariant="kid" label="Camera grid">
+          <CameraGrid
+            onAdminOpenCameras={isAdmin ? () => {
+              setSettingsTab('cameras');
+              setSettingsOpen(true);
+            } : undefined}
+          />
+        </ErrorBoundary>
         <BadgesSection />
-        <Diary
-          readAloud={settings.data?.read_aloud ?? false}
-          petName={settings.data?.pet_name?.trim() || cachedBrand.petName}
-        />
+        <ErrorBoundary fallbackVariant="kid" label="Diary">
+          <Diary
+            readAloud={settings.data?.read_aloud ?? false}
+            petName={settings.data?.pet_name?.trim() || cachedBrand.petName}
+          />
+        </ErrorBoundary>
       </main>
 
       <BadgePopover />
