@@ -63,6 +63,17 @@ const REFRACTORY_MS = 150;
 const MAX_SESSION_MS = 2 * 60 * 60 * 1000;
 
 /**
+ * Grace window after a zone-exit before the wheel session is actually ended.
+ * If Frigate fires a fresh zone-entry within this window, the session continues
+ * (rotation counter and duration carry through); the V4-missed gap is bridged.
+ * If the window expires with no re-entry, the session ends normally.
+ *
+ * Tune this comment if zone-exit-then-re-entry is still fragmenting on the
+ * live host — bump to 15_000 if 10 s is still too tight.
+ */
+const WHEEL_SESSION_COALESCE_MS = 10_000;
+
+/**
  * Build the RTSP URL the odometer reads frames from. Cameras are identified by
  * their go2rtc stream name (`live_src`); Frigate's embedded go2rtc relays each
  * camera's H264 over RTSP on :8554, reachable on the compose network at the
@@ -294,6 +305,124 @@ interface SessionHandle {
 const activeSessions = new Map<number, SessionHandle>();
 
 // ---------------------------------------------------------------------------
+// Coalesce state — per-camera grace windows
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks the coalesce window after a zone-exit. The wheel session (ffmpeg
+ * process + rotation counter) stays alive during this window. If a fresh
+ * zone-entry arrives before the timer fires, `cancelWheelCoalesce` is called
+ * and the session resumes seamlessly. If the timer fires, `onFinalEnd` is
+ * invoked with the accumulated metres.
+ */
+interface CoalesceHandle {
+  /** Camera whose session is coalescing. */
+  cameraId: number;
+  /** Wall-clock ms when the LAST zone-exit fired (not the timer expiry). */
+  zoneExitAt: number;
+  /** Number of zone-exit/re-entry cycles absorbed so far. */
+  coalescedExits: number;
+  timer: NodeJS.Timeout;
+  /**
+   * Callback invoked on final session end (timer expiry or explicit flush).
+   * Receives computed metres. The narrator uses this to write the diary entry.
+   */
+  onFinalEnd: (metres: number, zoneExitAt: number) => void;
+}
+
+const coalescingSessions = new Map<number, CoalesceHandle>();
+
+/**
+ * Begin the coalesce grace window for `cameraId` after a zone-exit.
+ * Keeps the ffmpeg session running; arms a timer for WHEEL_SESSION_COALESCE_MS.
+ * If called while a coalesce is already in flight for the same camera
+ * (back-to-back exits without re-entry), the existing timer is replaced and
+ * `coalescedExits` is incremented.
+ *
+ * `zoneExitAt` is the original zone-exit timestamp — used as the diary entry's
+ * end-timestamp so wheel time is NOT padded by the grace window.
+ * `onFinalEnd(metres, zoneExitAt)` is called on timer expiry (or explicit flush).
+ */
+export function beginWheelCoalesce(
+  cameraId: number,
+  zoneExitAt: number,
+  onFinalEnd: (metres: number, zoneExitAt: number) => void,
+): void {
+  const existing = coalescingSessions.get(cameraId);
+  const coalescedExits = (existing?.coalescedExits ?? 0) + 1;
+
+  if (existing) {
+    clearTimeout(existing.timer);
+  }
+
+  const session = activeSessions.get(cameraId);
+  const sessionAgeMs = session ? Date.now() - session.startedAt : 0;
+  log.info(
+    { cameraId, sessionAgeMs, graceMs: WHEEL_SESSION_COALESCE_MS },
+    'wheel-odometer: zone-exit, entering coalesce window',
+  );
+
+  const timer = setTimeout(() => {
+    coalescingSessions.delete(cameraId);
+    const metres = endWheelSession(cameraId) ?? 0;
+    log.info(
+      { cameraId, coalescedExits, metres },
+      'wheel-odometer: coalesce window expired, ending session',
+    );
+    onFinalEnd(metres, zoneExitAt);
+  }, WHEEL_SESSION_COALESCE_MS);
+  timer.unref?.();
+
+  coalescingSessions.set(cameraId, {
+    cameraId,
+    zoneExitAt,
+    coalescedExits,
+    timer,
+    onFinalEnd,
+  });
+}
+
+/**
+ * Cancel the coalesce timer for `cameraId` (zone re-entry during grace window).
+ * The ffmpeg session was kept alive, so it simply continues sampling.
+ * Returns true if a coalesce was active and cancelled, false otherwise.
+ */
+export function cancelWheelCoalesce(cameraId: number): boolean {
+  const handle = coalescingSessions.get(cameraId);
+  if (!handle) return false;
+  clearTimeout(handle.timer);
+  coalescingSessions.delete(cameraId);
+  log.info(
+    { cameraId, coalescedExits: handle.coalescedExits },
+    'wheel-odometer: zone re-entered during coalesce, continuing session',
+  );
+  return true;
+}
+
+/** Returns true if a coalesce grace window is currently active for `cameraId`. */
+export function isWheelCoalescing(cameraId: number): boolean {
+  return coalescingSessions.has(cameraId);
+}
+
+/**
+ * Immediately flush any active coalesce window for `cameraId` (e.g. camera
+ * goes offline, SIGTERM). Ends the session and fires `onFinalEnd` synchronously
+ * with the accumulated metres. No-op if no coalesce is active.
+ */
+export function flushWheelCoalesce(cameraId: number): void {
+  const handle = coalescingSessions.get(cameraId);
+  if (!handle) return;
+  clearTimeout(handle.timer);
+  coalescingSessions.delete(cameraId);
+  const metres = endWheelSession(cameraId) ?? 0;
+  log.info(
+    { cameraId, coalescedExits: handle.coalescedExits, metres },
+    'wheel-odometer: coalesce flushed (offline/shutdown)',
+  );
+  handle.onFinalEnd(metres, handle.zoneExitAt);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -369,6 +498,9 @@ export function startWheelSession(cameraId: number, startedAt: number): boolean 
 
   proc.on('error', (err) => {
     log.warn({ cameraId, err: err.message }, 'wheel-odometer: ffmpeg spawn error');
+    // Flush any coalesce window — the session is gone, compute metres from
+    // whatever the counter accumulated before the crash.
+    flushWheelCoalesceOnCrash(cameraId);
     cleanupSession(cameraId);
   });
 
@@ -377,6 +509,8 @@ export function startWheelSession(cameraId: number, startedAt: number): boolean 
       // Unexpected exit — log and clean up, but do NOT throw. The partial
       // count is preserved in the counter and endWheelSession will read it.
       log.warn({ cameraId, code }, 'wheel-odometer: ffmpeg exited unexpectedly');
+      // Flush any coalesce window before cleanup removes the session.
+      flushWheelCoalesceOnCrash(cameraId);
       cleanupSession(cameraId);
     }
   });
@@ -739,6 +873,28 @@ export async function testWheelDetection(cameraId: number): Promise<
 // Internals
 // ---------------------------------------------------------------------------
 
+/**
+ * Called when ffmpeg exits unexpectedly while a coalesce window is active.
+ * Grabs metres from the still-live session, fires onFinalEnd, then cancels
+ * the timer so the normal `cleanupSession` can proceed without a dangling timer.
+ * Must be called BEFORE `cleanupSession` so the session is still in `activeSessions`.
+ */
+function flushWheelCoalesceOnCrash(cameraId: number): void {
+  const handle = coalescingSessions.get(cameraId);
+  if (!handle) return;
+  clearTimeout(handle.timer);
+  coalescingSessions.delete(cameraId);
+  const session = activeSessions.get(cameraId);
+  const metres = session
+    ? session.counter.getRotations() * Math.PI * session.diameterMm / 1000
+    : 0;
+  log.warn(
+    { cameraId, coalescedExits: handle.coalescedExits, metres },
+    'wheel-odometer: coalesce flushed due to ffmpeg crash',
+  );
+  handle.onFinalEnd(metres, handle.zoneExitAt);
+}
+
 function cleanupSession(cameraId: number): void {
   const session = activeSessions.get(cameraId);
   if (!session) return;
@@ -783,4 +939,4 @@ function computeDarkPixelRatio(pgmBuf: Buffer, thresholdPct: number): number {
 }
 
 // Exported for tests.
-export { activeSessions as _activeSessions };
+export { activeSessions as _activeSessions, coalescingSessions as _coalescingSessions };
