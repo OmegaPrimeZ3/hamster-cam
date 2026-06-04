@@ -100,13 +100,7 @@ import { evaluateBadges, type BadgeId } from './badges.js';
 import { childLogger } from './logger.js';
 import { pickTemplate, render } from './narratives.js';
 import { evaluatePushForEntry } from './push.js';
-import {
-  startWheelSession,
-  endWheelSession,
-  beginWheelCoalesce,
-  cancelWheelCoalesce,
-  flushWheelCoalesce,
-} from './wheel-odometer.js';
+import { startWheelSession, endWheelSession } from './wheel-odometer.js';
 
 const log = childLogger('narrator');
 
@@ -390,20 +384,6 @@ interface PetState {
 const state = new Map<string, PetState>();
 const recentByPet = new Map<string, RecentEventEntry[]>();
 
-/**
- * Captures the narrator context needed to finalise a wheel diary entry when
- * a coalesce grace window expires. Keyed by camera id (one entry per camera
- * that has an active coalesce window). Cleared when the coalesce fires or is
- * cancelled.
- */
-interface WheelCoalesceContext {
-  petKey: string;
-  visit: ZoneVisit;
-  activity: Activity;
-  cameraName: string;
-}
-const wheelCoalesceCtx = new Map<number, WheelCoalesceContext>();
-
 function getOrInitPetState(pet: string): PetState {
   let s = state.get(pet);
   if (!s) {
@@ -650,13 +630,6 @@ function openZoneVisit(
       const camId = cameraIdByName(cameraName);
       if (camId !== null) {
         try {
-          // If a coalesce grace window is active for this camera, cancel it —
-          // the zone re-entry proves Remy is still on the wheel. The ffmpeg
-          // session was kept alive during the grace window, so cancellation just
-          // discards the pending end-timer and the session continues unchanged.
-          if (cancelWheelCoalesce(camId)) {
-            wheelCoalesceCtx.delete(camId);
-          }
           // startWheelSession returns true only when an ffmpeg session is
           // actually running (wheel enabled, live_src configured, not a
           // duplicate). Only set odomCameraId when there is a live session to
@@ -715,7 +688,6 @@ function prepareCloseVisit(
   activity: Activity,
   cameraName: string,
   closedAt: number,
-  wheelMetresOverride?: number,
 ): DeferredEntry {
   const details: Record<string, unknown> = {
     camera: [...visit.cameras][0] ?? cameraName,
@@ -723,16 +695,10 @@ function prepareCloseVisit(
 
   // Always end the odometer session — never leave ffmpeg running.
   // This MUST happen before any gate check so sessions are always cleaned up.
-  // `wheelMetresOverride` is supplied by the coalesce callback path (the
-  // session was already ended by the coalesce timer; don't call endWheelSession
-  // again).
   if (activity === 'wheel' && visit.odomCameraId !== null) {
     try {
-      const metres =
-        wheelMetresOverride !== undefined
-          ? wheelMetresOverride
-          : endWheelSession(visit.odomCameraId);
-      if (metres !== null && metres > 0) {
+      const metres = endWheelSession(visit.odomCameraId);
+      if (metres !== null) {
         details['wheel_meters'] = metres;
       }
     } catch (err) {
@@ -1023,21 +989,9 @@ export async function handleFrigateEvent(
       openZoneVisit(petState, activity, cameraName, zoneOpenStartedAt, event.after);
     } else if (!existing.cameras.has(cameraName)) {
       // Additional camera joins the existing visit (dedup invariant 2).
-      // This branch also fires on a coalesced wheel re-entry (the camera was
-      // removed from visit.cameras at zone-exit, but the visit was kept alive
-      // in zoneVisits during the grace window).
       existing.cameras.add(cameraName);
       // Refresh gate fields from this camera's perspective.
       updateZoneVisitGateFields(existing, event.after);
-
-      // If this is a wheel re-entry during a coalesce grace window, cancel the
-      // timer so the session continues seamlessly.
-      if (activity === 'wheel' && existing.odomCameraId !== null) {
-        const camId = existing.odomCameraId;
-        if (cancelWheelCoalesce(camId)) {
-          wheelCoalesceCtx.delete(camId);
-        }
-      }
 
       // Edge case: existing visit has no odometer but this camera can provide one.
       if (activity === 'wheel' && existing.odomCameraId === null) {
@@ -1092,29 +1046,6 @@ export async function handleFrigateEvent(
     for (const activity of midTrackToClose) {
       const visit = petState.zoneVisits.get(activity);
       if (!visit) continue;
-
-      // Wheel zone-exit: enter coalesce grace window instead of closing
-      // immediately. The visit stays in zoneVisits; the ffmpeg session keeps
-      // running. If Frigate re-enters the wheel zone before WHEEL_SESSION_COALESCE_MS,
-      // openZoneVisit cancels the timer and the session continues. On timer
-      // expiry the callback commits the diary entry with the accumulated metres.
-      if (activity === 'wheel' && visit.odomCameraId !== null) {
-        const camId = visit.odomCameraId;
-        wheelCoalesceCtx.set(camId, { petKey, visit, activity, cameraName });
-        beginWheelCoalesce(camId, occurredAtMs, (metres, zoneExitAt) => {
-          wheelCoalesceCtx.delete(camId);
-          // The visit may have been taken over by a re-entry by the time the
-          // timer fires; in that case the coalesce would have been cancelled,
-          // so this callback should not fire. But defensively check.
-          const deferred = prepareCloseVisit(visit, activity, cameraName, zoneExitAt, metres);
-          commitDeferred(deferred, defaultDeps).catch((err: unknown) => {
-            log.error({ err, camId }, 'wheel coalesce: commitDeferred failed');
-          });
-        });
-        // Do NOT delete from zoneVisits yet — re-entry check relies on it.
-        continue;
-      }
-
       petState.zoneVisits.delete(activity);
       // Mid-track close: emit immediately (no transition-window needed).
       //
@@ -1166,47 +1097,13 @@ export async function handleFrigateEvent(
         }
       }
     }
-
-    // Separate wheel closes from non-wheel closes. Wheel closes enter the
-    // coalesce grace window (ffmpeg session kept alive). Non-wheel closes
-    // follow the existing immediate / PendingEnd paths below.
-    const wheelToCoalesce = toClose.filter(
-      ({ activity, visit }) => activity === 'wheel' && visit.odomCameraId !== null,
-    );
-    const nonWheelToClose = toClose.filter(
-      ({ activity, visit }) => !(activity === 'wheel' && visit.odomCameraId !== null),
-    );
-
-    for (const { activity, visit } of wheelToCoalesce) {
-      // Keep the visit in zoneVisits for re-entry detection.
-      // (We do NOT delete it from petState.zoneVisits here.)
-      const camId = visit.odomCameraId as number;
-      wheelCoalesceCtx.set(camId, { petKey, visit, activity, cameraName });
-      beginWheelCoalesce(camId, occurredAtMs, (metres, zoneExitAt) => {
-        wheelCoalesceCtx.delete(camId);
-        const deferred = prepareCloseVisit(visit, activity, cameraName, zoneExitAt, metres);
-        commitDeferred(deferred, defaultDeps).catch((err: unknown) => {
-          log.error({ err, camId }, 'wheel coalesce: commitDeferred failed');
-        });
-      });
-    }
-
-    for (const { activity } of nonWheelToClose) {
+    for (const { activity } of toClose) {
       petState.zoneVisits.delete(activity);
     }
 
-    // Sub-case A vs B: are any visits still genuinely alive?
-    // Coalescing wheel visits remain in zoneVisits but have empty camera sets
-    // (all cameras departed). They do not count as "alive" for the purpose of
-    // transition-window deferral — only visits with at least one camera still
-    // reporting count.
-    const anyVisitsAlive = [...petState.zoneVisits.values()].some(
-      (v) => v.cameras.size > 0,
-    );
-
-    if (anyVisitsAlive) {
+    if (petState.zoneVisits.size > 0) {
       // Sub-case A: other visits still alive — emit immediately.
-      for (const { activity, visit } of nonWheelToClose) {
+      for (const { activity, visit } of toClose) {
         const deferred = prepareCloseVisit(visit, activity, cameraName, occurredAtMs);
         const entry = await commitDeferred(deferred, deps);
         if (entry) written.push(entry);
@@ -1224,58 +1121,49 @@ export async function handleFrigateEvent(
         for (const e of flushed) written.push(e);
       }
 
-      // Build PendingEnd only when there are non-wheel deferred entries or when
-      // no visits were handled at all (synthesised-entry case). When every
-      // closed visit was a wheel coalesce, the wheel diary entry will arrive
-      // asynchronously via the coalesce callback — no PendingEnd needed.
-      const hasNonWheelDeferred = nonWheelToClose.length > 0;
-      const noVisitsHandled = toClose.length === 0;
+      const endActivity = classifyActivity(event.after);
+      const trackEndDeferred = toClose.map(({ activity, visit }) =>
+        prepareCloseVisit(visit, activity, cameraName, occurredAtMs),
+      );
 
-      if (hasNonWheelDeferred || noVisitsHandled) {
-        const endActivity = classifyActivity(event.after);
-        const trackEndDeferred = nonWheelToClose.map(({ activity, visit }) =>
-          prepareCloseVisit(visit, activity, cameraName, occurredAtMs),
-        );
+      // If there were no zone visits to close (e.g. Frigate missed the 'new'
+      // and we only see the 'end'), synthesise a deferred entry from the event
+      // so the detection isn't silently dropped.
+      const deferred: DeferredEntry[] =
+        trackEndDeferred.length > 0
+          ? trackEndDeferred
+          : [
+              {
+                activity: endActivity,
+                durationMs: occurredAtMs - startMs,
+                occurredAt: occurredAtMs,
+                cameraId: cameraIdByName(cameraName),
+                details: { camera: cameraName },
+                // Synthesised entry: take gate fields directly from the 'end'
+                // event — no ZoneVisit to snapshot them from.
+                falsePositive: event.after.false_positive,
+                hasSnapshot: event.after.has_snapshot,
+                hasClip: event.after.has_clip,
+              },
+            ];
 
-        // If there were no zone visits to close (e.g. Frigate missed the 'new'
-        // and we only see the 'end'), synthesise a deferred entry from the event
-        // so the detection isn't silently dropped.
-        const deferred: DeferredEntry[] =
-          trackEndDeferred.length > 0
-            ? trackEndDeferred
-            : [
-                {
-                  activity: endActivity,
-                  durationMs: occurredAtMs - startMs,
-                  occurredAt: occurredAtMs,
-                  cameraId: cameraIdByName(cameraName),
-                  details: { camera: cameraName },
-                  // Synthesised entry: take gate fields directly from the 'end'
-                  // event — no ZoneVisit to snapshot them from.
-                  falsePositive: event.after.false_positive,
-                  hasSnapshot: event.after.has_snapshot,
-                  hasClip: event.after.has_clip,
-                },
-              ];
-
-        const pending: PendingEnd = {
-          activity: endActivity,
-          camera: cameraName,
-          at: occurredAtMs,
-          startedAt: startMs,
-          deferred,
-          timer: undefined as unknown as NodeJS.Timeout,
-        };
-        pending.timer = setTimeout(() => {
-          // commitDeferred inside flushPending calls deps.onEntryWritten for each
-          // written entry — no further wiring needed here.
-          flushPending(petKey, pending, deps).catch((err: unknown) => {
-            log.error({ err }, 'flushPending timer failed — diary entry may be lost');
-          });
-        }, tuning.transitionWindowMs);
-        pending.timer.unref?.();
-        petState.pending = pending;
-      }
+      const pending: PendingEnd = {
+        activity: endActivity,
+        camera: cameraName,
+        at: occurredAtMs,
+        startedAt: startMs,
+        deferred,
+        timer: undefined as unknown as NodeJS.Timeout,
+      };
+      pending.timer = setTimeout(() => {
+        // commitDeferred inside flushPending calls deps.onEntryWritten for each
+        // written entry — no further wiring needed here.
+        flushPending(petKey, pending, deps).catch((err: unknown) => {
+          log.error({ err }, 'flushPending timer failed — diary entry may be lost');
+        });
+      }, tuning.transitionWindowMs);
+      pending.timer.unref?.();
+      petState.pending = pending;
     }
   }
 
@@ -1296,17 +1184,10 @@ export async function flushPendingEntries(): Promise<db.DiaryEntryRow[]> {
   const nowMs = deps.now();
   for (const [petKey, s] of state.entries()) {
     // Flush any open zone visits that were never closed (e.g. process killed
-    // mid-track). For wheel visits that are in coalesce state, flush the
-    // coalesce window first so endWheelSession is only called once.
+    // mid-track).
     for (const [activity, visit] of s.zoneVisits) {
       const representativeCamera = [...visit.cameras][0];
       if (!representativeCamera) continue;
-      if (activity === 'wheel' && visit.odomCameraId !== null) {
-        // flushWheelCoalesce ends the session and fires onFinalEnd (writes
-        // diary) — no need to call prepareCloseVisit again here.
-        flushWheelCoalesce(visit.odomCameraId);
-        continue;
-      }
       const deferred = prepareCloseVisit(visit, activity, representativeCamera, nowMs);
       const entry = await commitDeferred(deferred, deps);
       if (entry) out.push(entry);
@@ -1328,7 +1209,6 @@ export function resetNarratorState(): void {
   }
   state.clear();
   recentByPet.clear();
-  wheelCoalesceCtx.clear();
 }
 
 /**

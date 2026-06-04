@@ -817,8 +817,8 @@ describe('narrator multi-camera dedup', () => {
     // cam-b ends — now the activity truly ends.
     await handleFrigateEvent(newEvent({ type: 'end', camera: 'cam-b', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }), deps);
 
-    // Advance past transition window (50ms) + coalesce window (10s) to flush both.
-    await vi.advanceTimersByTimeAsync(11_000);
+    // Advance past transition window to flush.
+    await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
@@ -928,8 +928,7 @@ describe('narrator multi-camera dedup', () => {
     await handleFrigateEvent(newEvent({ type: 'end', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }), deps);
     await handleFrigateEvent(newEvent({ type: 'end', camera: 'cam-b', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }), deps);
 
-    // Advance past coalesce window (10s) so the deferred diary entry is written.
-    await vi.advanceTimersByTimeAsync(11_000);
+    await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
@@ -1203,17 +1202,15 @@ describe('narrator multi-camera dedup', () => {
 
   it('wheel odometer session stays open while wheel visit is live, closes only at wheel track end', async () => {
     // Under zone-visit model: food camera firing does NOT end the wheel odometer.
-    // The wheel odometer closes when the wheel zone visit closes (after the
-    // coalesce grace window expires).
+    // The wheel odometer closes when the wheel zone visit closes.
     const spawnMock = vi.fn(() => makeFakeProc());
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
 
     process.env['FRIGATE_URL'] = 'http://frigate:5000';
-    vi.useFakeTimers();
 
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { _activeSessions, _coalescingSessions } = await import('../src/wheel-odometer.js');
+    const { _activeSessions } = await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000 });
@@ -1256,24 +1253,15 @@ describe('narrator multi-camera dedup', () => {
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-b', zones: ['food'] }), deps);
     expect(_activeSessions.size).toBe(1); // still running — wheel visit is open
 
-    // cam-a ends — wheel visit enters coalesce grace window (session still running).
+    // cam-a ends — wheel visit closes and odometer session ends.
     now = t0 + 8_000;
     await handleFrigateEvent(
       newEvent({ type: 'end', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_008 }),
       deps,
     );
-    // Immediately after zone-exit: session is coalescing (ffmpeg kept alive).
-    expect(_activeSessions.size).toBe(1);
-    expect(_coalescingSessions.size).toBe(1);
-
-    // Advance past the coalesce window → session ends.
-    await vi.advanceTimersByTimeAsync(11_000);
-    await Promise.resolve();
-    expect(_activeSessions.size).toBe(0);
-    expect(_coalescingSessions.size).toBe(0);
+    expect(_activeSessions.size).toBe(0); // odometer ended when wheel visit closed
 
     void db;
-    vi.useRealTimers();
     vi.doUnmock('node:child_process');
   });
 });
@@ -1610,18 +1598,16 @@ describe('wheel odometer — odomCameraId is only set when a session actually st
     expect(_activeSessions.has(cam.id)).toBe(true);
     expect(spawnMock).toHaveBeenCalledTimes(1);
 
-    // Zone closes — enters coalesce grace window.
+    // Zone closes.
     now = t0 + 30_000;
     await handleFrigateEvent(
       newEvent({ type: 'end', camera: 'wheel_cam', zones: ['wheel'], startSec: 1_700_011_000, endSec: 1_700_011_030 }),
       deps,
     );
-    // Session is coalescing immediately after zone-exit.
-    expect(_activeSessions.size).toBe(1);
-
-    // Advance past the coalesce window → session ends.
-    await vi.advanceTimersByTimeAsync(11_000);
+    await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
+
+    // Session ended after zone closed.
     expect(_activeSessions.size).toBe(0);
 
     void cam;
@@ -2476,13 +2462,7 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
       }),
       deps,
     );
-    // Immediately after the false_positive 'end': session enters coalesce window.
-    expect(_activeSessions.size).toBe(1);
-
-    // Advance past the coalesce window → session ends and the callback fires.
-    // The callback calls prepareCloseVisit → commitDeferred which gates out the
-    // entry due to false_positive=true. No diary entry, but session is cleaned up.
-    await vi.advanceTimersByTimeAsync(11_000);
+    await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
     // Odometer session MUST be ended — no dangling process.
@@ -2492,219 +2472,6 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     expect(entries.length).toBe(0);
 
     void cam;
-    vi.useRealTimers();
-    vi.doUnmock('node:child_process');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Wheel coalesce — narrator-level integration tests
-// ---------------------------------------------------------------------------
-
-describe('narrator wheel coalesce', () => {
-  /**
-   * Seed a single wheel camera with odometry enabled, using live_src so that
-   * cameraIdByName resolves it and startWheelSession spawns ffmpeg.
-   *
-   * IMPORTANT: live_src and name must NOT contain zone keywords (wheel, food,
-   * etc.) — classifyZones falls back to matchKeyword(camera_name) when
-   * current_zones is empty, which would prevent zone-exit detection.
-   */
-  async function seedWheelCam() {
-    const db = await import('../src/db.js');
-    const cam = db.createCamera({
-      name: 'cam-alpha',
-      emoji: '🎡',
-      stream_url: 'rtsp://fake/alpha',
-      live_src: 'cam_alpha',
-      enabled: true,
-      zones: ['wheel'],
-      wheel_mark_enabled: true,
-      wheel_diameter_mm: 152.0,
-      wheel_band_y_pct: 50.0,
-      wheel_band_height_pct: 10.0,
-      wheel_threshold_pct: 50.0,
-    });
-    db.setSetting('pet_name', 'Remy');
-    return cam;
-  }
-
-  it('single zone-exit followed by re-entry inside window → one session, single diary write', async () => {
-    const spawnMock = vi.fn(() => makeFakeProc());
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-    process.env['FRIGATE_URL'] = 'http://frigate:5000';
-    vi.useFakeTimers();
-
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
-      await import('../src/narrator.js');
-    const { _activeSessions, _coalescingSessions } = await import('../src/wheel-odometer.js');
-    const db = await import('../src/db.js');
-
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
-    resetNarratorState();
-    const cam = await seedWheelCam();
-
-    const t0 = 1_720_010_000_000;
-    let now = t0;
-    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
-
-    // Zone opens — session starts.
-    await handleFrigateEvent(
-      newEvent({ type: 'new', camera: 'cam_alpha', zones: ['wheel'], startSec: 1_720_010_000 }),
-      deps,
-    );
-    expect(_activeSessions.size).toBe(1);
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-
-    // Zone-exit mid-track — coalesce window opens, session stays alive.
-    now = t0 + 5_000;
-    await handleFrigateEvent(
-      newEvent({ type: 'update', camera: 'cam_alpha', zones: [] }),
-      deps,
-    );
-    expect(_activeSessions.size).toBe(1);
-    expect(_coalescingSessions.size).toBe(1);
-
-    // Re-entry within the coalesce window — timer cancelled, session continues.
-    now = t0 + 7_000;
-    await handleFrigateEvent(
-      newEvent({ type: 'update', camera: 'cam_alpha', zones: ['wheel'] }),
-      deps,
-    );
-    expect(_coalescingSessions.size).toBe(0); // coalesce cancelled
-    expect(_activeSessions.size).toBe(1); // session still running
-    // No new spawn — same session reused.
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-
-    // Track ends — enters coalesce again, then timer fires → single diary entry.
-    now = t0 + 60_000;
-    await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'cam_alpha', zones: ['wheel'], startSec: 1_720_010_000, endSec: 1_720_010_060 }),
-      deps,
-    );
-    expect(_coalescingSessions.size).toBe(1);
-
-    await vi.advanceTimersByTimeAsync(11_000);
-    await Promise.resolve();
-
-    expect(_activeSessions.size).toBe(0);
-    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    const wheelEntries = entries.filter((e) => e.activity === 'wheel');
-    expect(wheelEntries).toHaveLength(1);
-
-    void cam;
-    vi.useRealTimers();
-    vi.doUnmock('node:child_process');
-  });
-
-  it('zone-exit with no re-entry → diary entry end-timestamp matches zone-exit, not timer-expiry', async () => {
-    const spawnMock = vi.fn(() => makeFakeProc());
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-    process.env['FRIGATE_URL'] = 'http://frigate:5000';
-    vi.useFakeTimers();
-
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
-      await import('../src/narrator.js');
-    const db = await import('../src/db.js');
-
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
-    resetNarratorState();
-    const cam = await seedWheelCam();
-
-    const t0 = 1_720_020_000_000;
-    let now = t0;
-    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
-
-    await handleFrigateEvent(
-      newEvent({ type: 'new', camera: 'cam_alpha', zones: ['wheel'], startSec: 1_720_020_000 }),
-      deps,
-    );
-
-    // Zone-exit at t0 + 30s.
-    now = t0 + 30_000;
-    const zoneExitMs = now;
-    await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'cam_alpha', zones: ['wheel'], startSec: 1_720_020_000, endSec: 1_720_020_030 }),
-      deps,
-    );
-
-    // Advance 10s past zone-exit — coalesce timer fires.
-    await vi.advanceTimersByTimeAsync(11_000);
-    await Promise.resolve();
-
-    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    const wheelEntries = entries.filter((e) => e.activity === 'wheel');
-    expect(wheelEntries).toHaveLength(1);
-
-    // occurred_at must equal the zone-exit timestamp, not the coalesce-expiry time.
-    expect(wheelEntries[0]?.occurred_at).toBe(zoneExitMs);
-
-    void cam;
-    vi.useRealTimers();
-    vi.doUnmock('node:child_process');
-  });
-
-  it('multiple exit/re-entry cycles within one run → still one session, coalescedExits reflects fragments merged', async () => {
-    const spawnMock = vi.fn(() => makeFakeProc());
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-    process.env['FRIGATE_URL'] = 'http://frigate:5000';
-    vi.useFakeTimers();
-
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
-      await import('../src/narrator.js');
-    const { _activeSessions, _coalescingSessions } = await import('../src/wheel-odometer.js');
-    const db = await import('../src/db.js');
-
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
-    resetNarratorState();
-    await seedWheelCam();
-
-    const t0 = 1_720_030_000_000;
-    let now = t0;
-    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
-
-    await handleFrigateEvent(
-      newEvent({ type: 'new', camera: 'cam_alpha', zones: ['wheel'], startSec: 1_720_030_000 }),
-      deps,
-    );
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-
-    // Simulate 3 exit/re-entry cycles (Frigate losing and regaining detection).
-    for (let cycle = 0; cycle < 3; cycle += 1) {
-      now += 10_000;
-      // Exit.
-      await handleFrigateEvent(
-        newEvent({ type: 'update', camera: 'cam_alpha', zones: [] }),
-        { ...deps },
-      );
-      expect(_coalescingSessions.size).toBe(1);
-
-      now += 3_000;
-      // Re-entry within coalesce window.
-      await handleFrigateEvent(
-        newEvent({ type: 'update', camera: 'cam_alpha', zones: ['wheel'] }),
-        { ...deps },
-      );
-      expect(_coalescingSessions.size).toBe(0);
-    }
-
-    // Only one ffmpeg process ever spawned.
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-    expect(_activeSessions.size).toBe(1);
-
-    // Final track end → coalesce → one diary write.
-    now += 5_000;
-    await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'cam_alpha', zones: ['wheel'], startSec: 1_720_030_000, endSec: 1_720_030_060 }),
-      deps,
-    );
-    await vi.advanceTimersByTimeAsync(11_000);
-    await Promise.resolve();
-
-    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    const wheelEntries = entries.filter((e) => e.activity === 'wheel');
-    expect(wheelEntries).toHaveLength(1);
-
     vi.useRealTimers();
     vi.doUnmock('node:child_process');
   });
