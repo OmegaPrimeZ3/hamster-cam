@@ -143,6 +143,25 @@ let tuning: NarratorTuning = {
  */
 const COALESCE_WINDOW_MS = 120_000;
 
+/**
+ * Wheel diary-entry dedupe window. When a wheel activity entry is about to be
+ * committed and the most recent prior wheel entry for the SAME camera was
+ * written within this window, the new entry is MERGED into the prior one
+ * (duration extended, wheel_meters/rotations accumulated, merged_sessions
+ * counter incremented) rather than inserting a new row.
+ *
+ * 20 000 ms is larger than Frigate's inertia padding (~7 500 ms for cam2) but
+ * smaller than any realistic inter-session gap — chosen so Frigate re-detect
+ * noise within the same physical wheel run collapses into one entry while
+ * genuinely separate nocturnal sessions remain distinct rows.
+ *
+ * This replaces the previous in-memory WheelCoalesceContext approach that
+ * introduced process-restart sensitivity and duplicate-write bugs. The dedupe
+ * is now DB-keyed and idempotent: if the process restarts mid-session the next
+ * event simply queries the prior row and merges.
+ */
+const WHEEL_DEDUPE_WINDOW_MS = 20_000;
+
 /** Re-read tunables from `settings` (called from index.ts on startup & after settings.update). */
 export function refreshNarratorTunings(): void {
   try {
@@ -695,14 +714,22 @@ function prepareCloseVisit(
 
   // Always end the odometer session — never leave ffmpeg running.
   // This MUST happen before any gate check so sessions are always cleaned up.
-  if (activity === 'wheel' && visit.odomCameraId !== null) {
-    try {
-      const metres = endWheelSession(visit.odomCameraId);
-      if (metres !== null) {
-        details['wheel_meters'] = metres;
+  // wheel_meters and rotations are always written (0/0 when no session ran)
+  // so the UI can distinguish "0 metres measured" from "field missing".
+  if (activity === 'wheel') {
+    // Default: zero — written even when no odometer session was active.
+    details['wheel_meters'] = 0;
+    details['rotations'] = 0;
+    if (visit.odomCameraId !== null) {
+      try {
+        const result = endWheelSession(visit.odomCameraId);
+        if (result !== null) {
+          details['wheel_meters'] = result.metres;
+          details['rotations'] = result.rotations;
+        }
+      } catch (err) {
+        void err;
       }
-    } catch (err) {
-      void err;
     }
   }
 
@@ -805,9 +832,10 @@ async function commitDeferred(
   // the SAME non-wheel activity and the pet returned to it within
   // COALESCE_WINDOW_MS, extend that entry instead of writing a near-duplicate
   // (this is what collapses "Exploring → Exploring" runs into one). Wheel is
-  // excluded so each run keeps its own odometer distance. We do NOT re-fire
-  // onEntryWritten here — the original entry already ran badges/push, and
-  // re-firing would double-notify for a single continuing activity.
+  // excluded from this generic path and handled separately below via the
+  // DB-keyed dedupe. We do NOT re-fire onEntryWritten here — the original entry
+  // already ran badges/push, and re-firing would double-notify for a single
+  // continuing activity.
   if (deferred.activity !== 'wheel') {
     const latest = db.getLatestDiaryEntry();
     if (
@@ -819,6 +847,85 @@ async function commitDeferred(
     ) {
       const startedAt = latest.occurred_at - (latest.duration_ms ?? 0);
       return db.extendDiaryEntry(latest.id, deferred.occurredAt, deferred.occurredAt - startedAt);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Wheel-specific dedupe: check the most recent wheel diary entry for this
+  // camera. If it ended within WHEEL_DEDUPE_WINDOW_MS, merge the new entry
+  // into the prior one rather than inserting a duplicate row.
+  //
+  // This handles the case where Frigate emits two rapid-fire object tracks
+  // for the same physical wheel session (e.g. inertia padding causes a brief
+  // gap between 'end' and the next 'new'). The merge is DB-keyed so it is
+  // idempotent across process restarts — no in-memory map needed.
+  //
+  // Merge semantics:
+  //   occurred_at  → new end time (deferred.occurredAt)
+  //   duration_ms  → (new_end_ts) - (prior start_ts)
+  //                  where prior start_ts = prior.occurred_at - prior.duration_ms
+  //   wheel_meters → prior + new (accumulated)
+  //   rotations    → prior + new (accumulated)
+  //   merged_sessions → prior count + 1
+  //
+  // We do NOT re-fire onEntryWritten for merged rows — the original row
+  // already triggered badges/push/thumbnail. The merge silently extends it.
+  // -------------------------------------------------------------------------
+  if (deferred.activity === 'wheel' && deferred.cameraId !== null) {
+    const prior = db.getRecentWheelEntryForCamera(deferred.cameraId);
+    if (
+      prior !== null &&
+      prior.occurred_at !== null &&
+      deferred.occurredAt - prior.occurred_at <= WHEEL_DEDUPE_WINDOW_MS
+    ) {
+      // Parse existing details; fall back to an empty object on malformed JSON.
+      let priorDetails: Record<string, unknown> = {};
+      if (prior.details) {
+        try {
+          const parsed = JSON.parse(prior.details) as unknown;
+          if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+            priorDetails = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // Ignore malformed details — treat as empty.
+        }
+      }
+
+      // Accumulate distance and rotation fields from the new entry.
+      const priorMeters = typeof priorDetails['wheel_meters'] === 'number'
+        ? priorDetails['wheel_meters']
+        : 0;
+      const priorRotations = typeof priorDetails['rotations'] === 'number'
+        ? priorDetails['rotations']
+        : 0;
+      const newMeters = typeof deferred.details['wheel_meters'] === 'number'
+        ? deferred.details['wheel_meters']
+        : 0;
+      const newRotations = typeof deferred.details['rotations'] === 'number'
+        ? deferred.details['rotations']
+        : 0;
+      const priorMerged = typeof priorDetails['merged_sessions'] === 'number'
+        ? priorDetails['merged_sessions']
+        : 0;
+
+      const mergedDetails: Record<string, unknown> = {
+        ...priorDetails,
+        wheel_meters: priorMeters + newMeters,
+        rotations: priorRotations + newRotations,
+        merged_sessions: priorMerged + 1,
+      };
+
+      // Extend duration from the prior entry's start time to the new end time.
+      const priorDuration = prior.duration_ms ?? 0;
+      const priorStartTs = prior.occurred_at - priorDuration;
+      const newDurationMs = deferred.occurredAt - priorStartTs;
+
+      return db.mergeWheelDiaryEntry({
+        id: prior.id,
+        occurred_at: deferred.occurredAt,
+        duration_ms: newDurationMs,
+        details: mergedDetails,
+      });
     }
   }
 

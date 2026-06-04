@@ -273,7 +273,11 @@ describe('narrator', () => {
     vi.useRealTimers();
   });
 
-  it('never coalesces wheel entries — each run keeps its own odometer span', async () => {
+  it('wheel entries within WHEEL_DEDUPE_WINDOW_MS merge into one row; entries further apart stay distinct', async () => {
+    // Two wheel events 13s apart (within the 20s dedupe window) merge into ONE
+    // row with accumulated distance. This replaces the old "never coalesces"
+    // assertion — wheel entries DO now merge when Frigate rapid-fires two
+    // consecutive tracks within the same physical session.
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -290,6 +294,7 @@ describe('narrator', () => {
     await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
+    // 13s later — within the 20s dedupe window → merged into the first row.
     await handleFrigateEvent(
       newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: 1_700_000_010, endSec: 1_700_000_013 }),
       { now: () => t0 + 13_000, rng: () => 0 },
@@ -298,8 +303,12 @@ describe('narrator', () => {
     await Promise.resolve();
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    expect(entries.length).toBe(2);
-    expect(entries.every((e) => e.activity === 'wheel')).toBe(true);
+    // Within-window → merged: exactly ONE row.
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('wheel');
+    // The merged row has a merged_sessions counter.
+    const details = JSON.parse(entries[0]?.details ?? '{}') as Record<string, unknown>;
+    expect(details['merged_sessions']).toBe(1);
     vi.useRealTimers();
   });
 
@@ -1546,11 +1555,12 @@ describe('wheel odometer — odomCameraId is only set when a session actually st
     expect(entries.length).toBe(1);
     expect(entries[0]?.activity).toBe('wheel');
 
-    // But no wheel_meters in details (session was never started, so no distance).
+    // wheel_meters and rotations are always written — 0 when no session ran.
     const details = entries[0]?.details
       ? (JSON.parse(entries[0].details) as Record<string, unknown>)
       : {};
-    expect(details['wheel_meters']).toBeUndefined();
+    expect(details['wheel_meters']).toBe(0);
+    expect(details['rotations']).toBe(0);
 
     void cam;
     vi.useRealTimers();
@@ -2474,5 +2484,155 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     void cam;
     vi.useRealTimers();
     vi.doUnmock('node:child_process');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wheel diary-entry dedupe (WHEEL_DEDUPE_WINDOW_MS = 20s)
+// ---------------------------------------------------------------------------
+
+describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
+  it("two wheel events on the same camera within 20s merge into one row", async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import("../src/narrator.js");
+    const db = await import("../src/db.js");
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const t0 = 1_730_000_000_000;
+    await handleFrigateEvent(
+      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: 1_730_000_000, endSec: 1_730_000_005 }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    let entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    const firstId = entries[0]!.id;
+
+    const t1 = t0 + 10_000;
+    await handleFrigateEvent(
+      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: 1_730_000_010, endSec: 1_730_000_013 }),
+      { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    expect(entries[0]!.id).toBe(firstId);
+    expect(entries[0]!.occurred_at).toBe(1_730_000_013_000);
+    const details = JSON.parse(entries[0]!.details ?? "{}") as Record<string, unknown>;
+    expect(typeof details["wheel_meters"]).toBe("number");
+    expect(typeof details["rotations"]).toBe("number");
+    expect(details["merged_sessions"]).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("two wheel events on the same camera more than 20s apart produce two distinct rows", async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import("../src/narrator.js");
+    const db = await import("../src/db.js");
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const t0 = 1_730_100_000_000;
+    await handleFrigateEvent(
+      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: 1_730_100_000, endSec: 1_730_100_005 }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const t1 = t0 + 25_000;
+    await handleFrigateEvent(
+      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: 1_730_100_025, endSec: 1_730_100_030 }),
+      { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(2);
+    expect(entries.every((e) => e.activity === "wheel")).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("two wheel events on DIFFERENT cameras within 20s produce two distinct rows", async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import("../src/narrator.js");
+    const db = await import("../src/db.js");
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    db.createCamera({ name: "wheel-a", emoji: "A", stream_url: "rtsp://x/wa", live_src: "wheel_a", enabled: true });
+    db.createCamera({ name: "wheel-b", emoji: "B", stream_url: "rtsp://x/wb", live_src: "wheel_b", enabled: true });
+    db.setSetting("pet_name", "Remy");
+
+    const t0 = 1_730_200_000_000;
+    await handleFrigateEvent(
+      newEvent({ type: "end", camera: "wheel_a", zones: ["wheel"], startSec: 1_730_200_000, endSec: 1_730_200_005 }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const t1 = t0 + 5_000;
+    await handleFrigateEvent(
+      newEvent({ type: "end", camera: "wheel_b", zones: ["wheel"], startSec: 1_730_200_005, endSec: 1_730_200_010 }),
+      { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(2);
+    expect(entries.every((e) => e.activity === "wheel")).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("merged row duration never exceeds new_end_time minus first_start_time", async () => {
+    vi.useFakeTimers();
+    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+      await import("../src/narrator.js");
+    const db = await import("../src/db.js");
+    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
+    resetNarratorState();
+    await seedCameras();
+
+    const frigateStart1 = 1_730_300_000;
+    const frigateEnd1   = 1_730_300_005;
+    const t0 = frigateEnd1 * 1000;
+    await handleFrigateEvent(
+      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: frigateStart1, endSec: frigateEnd1 }),
+      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const frigateStart2 = 1_730_300_010;
+    const frigateEnd2   = 1_730_300_018;
+    const t1 = frigateEnd2 * 1000;
+    await handleFrigateEvent(
+      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: frigateStart2, endSec: frigateEnd2 }),
+      { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    const merged = entries[0]!;
+    expect(merged.occurred_at).toBe(frigateEnd2 * 1000);
+    const firstStartMs = frigateStart1 * 1000;
+    const maxAllowedDuration = merged.occurred_at - firstStartMs;
+    expect(merged.duration_ms).toBeLessThanOrEqual(maxAllowedDuration);
+    expect(merged.duration_ms).toBeGreaterThan(0);
+    vi.useRealTimers();
   });
 });

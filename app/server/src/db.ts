@@ -337,6 +337,10 @@ interface Statements {
   diaryWheelBestSession: Database.Statement;
   diaryWheelDurationAll: Database.Statement;
   diaryWheelDurationBetween: Database.Statement;
+  // wheel dedupe: find the most recent wheel entry for a camera within a window
+  diaryRecentWheelForCamera: Database.Statement;
+  // wheel dedupe: merge new entry into an existing row
+  diaryMergeWheelEntry: Database.Statement;
   // push subscriptions
   pushSubUpsert: Database.Statement;
   pushSubDeleteByEndpointForUser: Database.Statement;
@@ -747,6 +751,29 @@ function statements(): Statements {
        WHERE activity = 'wheel'
          AND duration_ms IS NOT NULL
          AND occurred_at >= ? AND occurred_at < ?
+    `),
+
+    // wheel dedupe --------------------------------------------------
+    // Most recent wheel diary entry for the given camera_id. Used by the
+    // narrator to decide whether to merge a new wheel entry into the prior one.
+    // Orders by occurred_at DESC then id DESC to break ties.
+    diaryRecentWheelForCamera: db.prepare(`
+      SELECT * FROM diary_entries
+       WHERE activity = 'wheel'
+         AND camera_id = ?
+       ORDER BY occurred_at DESC, id DESC
+       LIMIT 1
+    `),
+    // Merge: extend an existing wheel row's span and accumulate the details JSON.
+    // The caller computes the new occurred_at (= new end time) and duration_ms
+    // (= new_end_ts - original_occurred_at + original_duration_ms), and provides
+    // the merged details blob already serialised to JSON.
+    diaryMergeWheelEntry: db.prepare(`
+      UPDATE diary_entries
+         SET occurred_at = @occurred_at,
+             duration_ms = @duration_ms,
+             details     = @details
+       WHERE id = @id
     `),
 
     // push subscriptions -----------------------------------------------
@@ -1320,6 +1347,44 @@ export function extendDiaryEntry(
 
 export function deleteDiaryEntry(id: number): void {
   statements().diaryDelete.run(id);
+}
+
+/**
+ * Return the most recent wheel diary entry for the given camera, or null when
+ * none exists. Used by the narrator's wheel-dedupe logic.
+ */
+export function getRecentWheelEntryForCamera(cameraId: number): DiaryEntryRow | null {
+  return (
+    (statements().diaryRecentWheelForCamera.get(cameraId) as DiaryEntryRow | undefined) ?? null
+  );
+}
+
+export interface MergeWheelEntryInput {
+  id: number;
+  /** New occurred_at = the end-time of the incoming (newer) session. */
+  occurred_at: number;
+  /** New duration_ms = new_end_ts - original start (i.e. prior.occurred_at - prior.duration_ms). */
+  duration_ms: number;
+  /** Merged details JSON blob. */
+  details: Record<string, unknown>;
+}
+
+/**
+ * Merge a new wheel session into an existing diary row: extend the time span
+ * and update the details JSON to accumulate distance and rotation counts.
+ * Returns the updated row.
+ */
+export function mergeWheelDiaryEntry(input: MergeWheelEntryInput): DiaryEntryRow {
+  statements().diaryMergeWheelEntry.run({
+    id: input.id,
+    occurred_at: input.occurred_at,
+    duration_ms: input.duration_ms,
+    details: JSON.stringify(input.details),
+  });
+  const row = statements().diaryById.get(input.id) as DiaryEntryRow | undefined;
+  if (!row) throw new Error(`mergeWheelDiaryEntry: row ${input.id} not found`);
+  emitDiaryEvent({ kind: 'update', row });
+  return row;
 }
 
 export function listDiaryEntriesBetween(fromMs: number, toMs: number): DiaryEntryRow[] {

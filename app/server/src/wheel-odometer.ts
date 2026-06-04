@@ -402,11 +402,11 @@ export function startWheelSession(cameraId: number, startedAt: number): boolean 
 }
 
 /**
- * Stop the wheel session for this camera and return the computed metres.
+ * Stop the wheel session for this camera and return the computed distance.
  * Returns null if no session was active or if odometry is disabled.
  * metres = rotations × π × diameter_mm / 1000
  */
-export function endWheelSession(cameraId: number): number | null {
+export function endWheelSession(cameraId: number): { metres: number; rotations: number } | null {
   const session = activeSessions.get(cameraId);
   if (!session) return null;
 
@@ -415,7 +415,7 @@ export function endWheelSession(cameraId: number): number | null {
 
   const metres = rotations * Math.PI * session.diameterMm / 1000;
   log.info({ cameraId, rotations, metres }, 'wheel session ended');
-  return metres;
+  return { metres, rotations };
 }
 
 // ---------------------------------------------------------------------------

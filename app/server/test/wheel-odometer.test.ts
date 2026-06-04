@@ -435,10 +435,11 @@ describe('wheel session lifecycle', () => {
     session?.proc.stdout.emit('data', Buffer.concat([header, darkPixels]));
     session?.proc.stdout.emit('data', Buffer.concat([header, lightPixels]));
 
-    const metres = endWheelSession(camId);
+    const result = endWheelSession(camId);
     // 1 rotation × π × 152 / 1000
-    expect(metres).not.toBeNull();
-    expect(metres as number).toBeCloseTo(Math.PI * 152 / 1000, 4);
+    expect(result).not.toBeNull();
+    expect(result!.rotations).toBe(1);
+    expect(result!.metres).toBeCloseTo(Math.PI * 152 / 1000, 4);
   });
 
   it('ffmpeg crash mid-session — session removed, subsequent end returns null', async () => {
