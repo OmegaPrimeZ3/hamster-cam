@@ -1,34 +1,50 @@
 // app/server/src/wheel-odometer.ts
-// Optical-mark wheel odometry — Approach B.
+// Optical-mark wheel odometry — Approach B, always-on per-camera model.
 //
-// The operator sticks a piece of black tape on the wheel rim. We spawn an
-// ffmpeg child process that reads the camera RTSP stream at 30 fps (matching
-// the source camera's native frame rate — sampling faster would only duplicate
-// frames and waste CPU), crops the frame to a configurable 2-D ROI box, and
-// emits raw grayscale PGM frames on stdout. A finite-state machine counts
-// rotations using edge detection with a refractory period:
+// The operator sticks a piece of black tape on the wheel rim. On app startup
+// `initWheelOdometers()` spawns one long-lived ffmpeg per camera that has
+// wheel_mark_enabled=1. Each ffmpeg reads the camera's RTSP feed continuously
+// at 30 fps, crops to the configured 2-D ROI box, and emits raw grayscale PGM
+// frames on stdout. A finite-state machine counts rotations using edge
+// detection with a refractory period:
 //
 //   LIGHT → DARK  (falling edge, confirmed by ≥1 dark frame)
 //   DARK  → LIGHT (rising edge) = one rotation counted
 //   then lock out the counter for REFRACTORY_MS to reject flicker /
 //   contact-bounce / a marker parked in the box.
 //
-// At 30 fps a real tape pass lasts ~1–3 frames; the old 3-frame sustained-dark
-// requirement (80 ms at 10 fps, effectively 300 ms at 10 fps) was far too
-// coarse and ate almost every real pass. The refractory period replaces it:
-// hamster wheels realistically top ~4-5 rps, so 150 ms ≈ 4.5 frames at 30 fps
-// reliably rejects sub-100 ms noise while allowing genuinely fast spins.
+// At 30 fps a real tape pass lasts ~1–3 frames; the refractory period of
+// 150 ms ≈ 4.5 frames reliably rejects sub-100 ms noise while allowing up
+// to ~6.7 rps.
 //
-// On session end the rotation count is converted to metres:
-//   metres = rotations × π × diameter_mm / 1000
+// ALWAYS-ON COUNTER SEMANTICS
+// ---------------------------
+// Each camera has a monotonically increasing `rotations` counter that lives
+// for the lifetime of the ffmpeg process. When ffmpeg exits or crashes, the
+// counter resets to 0 and an internal `epoch` integer increments. Callers
+// can detect a mid-visit restart via `computeWheelDelta`:
+//
+//   getRotationSnapshot(cameraId)  → { rotations, epoch, captureMs } | null
+//   computeWheelDelta(start, end)  → { rotations, metres, epochCrossed }
+//
+// The narrator takes an opening snapshot when a wheel zone visit opens, and
+// a closing snapshot when it closes. The delta gives the distance run during
+// that visit — without spawning or tearing down any ffmpeg per-event.
+//
+// RESTART POLICY
+// --------------
+// On ffmpeg exit, the odometer restarts with exponential backoff:
+//   initial 5 s → doubles each restart up to 60 s cap.
+//   If the process was alive for > 5 minutes, backoff resets to 5 s.
 //
 // REUSABLE STATE MACHINE (DRY)
 // ----------------------------
-// PgmParser and RotationCounter are the pure, exported units. The live path
-// (startWheelSession / endWheelSession) feeds them from an RTSP ffmpeg pipe.
-// The backfill path (replayWheelDistance) feeds them from a Frigate recording
-// clip URL using the identical crop filter and sample rate. Neither path
-// duplicates any per-pixel or FSM logic.
+// PgmParser and RotationCounter are the pure, exported units. The always-on
+// path feeds them from an RTSP ffmpeg pipe. The backfill path
+// (replayWheelDistance) feeds them from a Frigate recording clip URL using
+// the identical crop filter and sample rate. The live rotation test
+// (liveWheelRotationTest) also uses them unchanged. Neither path duplicates
+// any per-pixel or FSM logic.
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { Readable } from 'node:stream';
@@ -59,8 +75,25 @@ const SAMPLE_FPS = 30;
  */
 const REFRACTORY_MS = 150;
 
-/** Safety cut-off — auto-kill a session after 2 hours. */
-const MAX_SESSION_MS = 2 * 60 * 60 * 1000;
+/** Initial backoff before the first restart attempt (ms). */
+const BACKOFF_INITIAL_MS = 5_000;
+
+/** Maximum backoff between restart attempts (ms). */
+const BACKOFF_MAX_MS = 60_000;
+
+/**
+ * If the ffmpeg process was alive for at least this long before exiting, the
+ * backoff resets to BACKOFF_INITIAL_MS — the feed was healthy, the exit is
+ * probably a transient network hiccup rather than a persistent config error.
+ */
+const BACKOFF_RESET_UPTIME_MS = 5 * 60 * 1000;
+
+/** Kill-timeout safety net: how long after the expected window we force-kill ffmpeg in the live test. */
+const LIVE_TEST_KILL_GRACE_MS = 5_000;
+
+/** Hard lower/upper bound on the test window passed to `liveWheelRotationTest`. */
+const LIVE_TEST_MIN_S = 5;
+const LIVE_TEST_MAX_S = 30;
 
 /**
  * Build the RTSP URL the odometer reads frames from. Cameras are identified by
@@ -278,47 +311,192 @@ export class RotationCounter {
 }
 
 // ---------------------------------------------------------------------------
-// Session handle
-// ---------------------------------------------------------------------------
-
-interface SessionHandle {
-  cameraId: number;
-  startedAt: number;
-  counter: RotationCounter;
-  parser: PgmParser;
-  proc: ChildProcess & { stdout: Readable; stderr: Readable };
-  safetyTimer: NodeJS.Timeout;
-  diameterMm: number;
-}
-
-const activeSessions = new Map<number, SessionHandle>();
-
-// ---------------------------------------------------------------------------
-// Public API
+// Rotation snapshot — the currency of the always-on API
 // ---------------------------------------------------------------------------
 
 /**
- * Start watching a wheel session for the given camera. Idempotent — if a
- * session is already running for that camera id, this is a no-op. Auto-stops
- * after 2 hours as a safety net. If wheel_mark_enabled = 0 for the camera,
- * this is a no-op.
- *
- * Returns true if a session is active after this call (either newly started or
- * already running), false if the camera is ineligible (disabled, missing
- * live_src, not found). The narrator uses this return value to decide whether
- * to set odomCameraId — it must only be set when a real ffmpeg session is live.
+ * A point-in-time snapshot of a camera's cumulative rotation counter. The
+ * narrator takes one snapshot when a wheel visit opens and another when it
+ * closes; `computeWheelDelta` converts the pair into rotations and metres.
  */
-export function startWheelSession(cameraId: number, startedAt: number): boolean {
-  if (activeSessions.has(cameraId)) return true;
+export interface RotationSnapshot {
+  /** Cumulative rotations counted since the current ffmpeg epoch started. */
+  rotations: number;
+  /**
+   * Monotonically increasing integer that increments every time the ffmpeg
+   * process restarts. Two snapshots with different epochs cannot be directly
+   * subtracted — `computeWheelDelta` handles this case by returning only the
+   * post-restart partial count.
+   */
+  epoch: number;
+  /** Wall-clock ms (Date.now()) when this snapshot was captured. */
+  captureMs: number;
+}
 
-  const camera = db.getCameraById(cameraId);
-  if (!camera) {
-    log.warn({ cameraId }, 'wheel-odometer: camera not found, skipping session start');
-    return false;
+/**
+ * Result of `computeWheelDelta`. When `epochCrossed` is true the odometer
+ * restarted between the two snapshots and only the post-restart partial count
+ * is available — the narrator logs this but still persists the partial count
+ * so a real wheel run is never silently discarded.
+ */
+export interface WheelDelta {
+  rotations: number;
+  metres: number;
+  epochCrossed: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Always-on per-camera odometer handles
+// ---------------------------------------------------------------------------
+
+/** Per-camera always-on state — one entry per wheel-enabled camera. */
+interface OdometerHandle {
+  cameraId: number;
+  counter: RotationCounter;
+  parser: PgmParser;
+  proc: ChildProcess & { stdout: Readable; stderr: Readable };
+  /** Monotonically increasing; increments each time ffmpeg restarts. */
+  epoch: number;
+  /** Wall-clock ms when the current process started. Used for backoff reset logic. */
+  startedAtMs: number;
+  /** Current exponential backoff delay in ms. */
+  backoffMs: number;
+  /** diameterMm from the camera row — constant for the life of the handle. */
+  diameterMm: number;
+  /**
+   * True while a graceful shutdown is in progress. When set, the 'close'
+   * handler does NOT schedule a restart.
+   */
+  shuttingDown: boolean;
+}
+
+/** Map of cameraId → always-on odometer handle. */
+const alwaysOnOdometers = new Map<number, OdometerHandle>();
+
+// ---------------------------------------------------------------------------
+// Public always-on API
+// ---------------------------------------------------------------------------
+
+/**
+ * Spawn one long-lived ffmpeg per wheel-enabled camera and start the always-on
+ * odometers. Called from `index.ts` at app startup (fire-and-forget: this
+ * function returns synchronously; each ffmpeg connects in the background).
+ * Safe to call when no cameras have wheel_mark_enabled=1.
+ *
+ * Guarantees:
+ *   - Does not throw. Any per-camera error is logged and skipped.
+ *   - Does not block startup. ffmpeg connections happen asynchronously.
+ *   - Idempotent: calling a second time is a no-op per camera.
+ */
+export function initWheelOdometers(): void {
+  let cameras: db.CameraRow[];
+  try {
+    cameras = db.listCameras().filter((c) => c.wheel_mark_enabled === 1);
+  } catch (err) {
+    log.warn({ err: (err as Error).message }, 'wheel-odometer: failed to query cameras at init — skipping');
+    return;
   }
-  if (camera.wheel_mark_enabled !== 1) return false;
 
+  for (const camera of cameras) {
+    if (alwaysOnOdometers.has(camera.id)) continue; // Idempotent.
+    spawnOdometerForCamera(camera, BACKOFF_INITIAL_MS, 0);
+  }
+
+  if (cameras.length > 0) {
+    log.info({ count: cameras.length, cameraIds: cameras.map((c) => c.id) }, 'wheel-odometers initialised');
+  }
+}
+
+/**
+ * Gracefully stop all always-on odometer processes. Called from `index.ts`
+ * on SIGTERM/SIGINT. Synchronous kill; the processes die asynchronously but
+ * we set `shuttingDown` first so the 'close' handler does not reschedule.
+ *
+ * Guarantees:
+ *   - Does not throw.
+ *   - After this returns, no new ffmpeg processes will be spawned.
+ */
+export function shutdownWheelOdometers(): void {
+  for (const handle of alwaysOnOdometers.values()) {
+    handle.shuttingDown = true;
+    try {
+      handle.proc.kill('SIGTERM');
+    } catch {
+      // Process may already be dead.
+    }
+  }
+  alwaysOnOdometers.clear();
+  log.info('wheel-odometers shut down');
+}
+
+/**
+ * Returns a point-in-time rotation snapshot for the given camera, or null if
+ * no always-on odometer is running for that camera (wheel disabled, camera not
+ * found, or initWheelOdometers not yet called).
+ *
+ * Guarantees:
+ *   - Never throws.
+ *   - Returns null (not zero) so callers can distinguish "disabled" from
+ *     "running but nothing counted yet".
+ */
+export function getRotationSnapshot(cameraId: number): RotationSnapshot | null {
+  const handle = alwaysOnOdometers.get(cameraId);
+  if (!handle) return null;
+  return {
+    rotations: handle.counter.getRotations(),
+    epoch: handle.epoch,
+    captureMs: Date.now(),
+  };
+}
+
+/**
+ * Compute the wheel delta between an opening and closing snapshot.
+ *
+ * When `start.epoch === end.epoch`, the delta is `end.rotations - start.rotations`
+ * (which may be 0 if the wheel did not move during the visit).
+ *
+ * When epochs differ (the ffmpeg restarted mid-visit), the counter was reset
+ * to 0 at restart. We return `end.rotations` as the post-restart partial count
+ * and set `epochCrossed: true`. The caller may log this to help diagnose an
+ * unstable RTSP feed.
+ *
+ * The metres formula: rotations × π × diameterMm / 1000. diameterMm must be
+ * provided by the caller (from the camera row) because this function is pure.
+ *
+ * Guarantees:
+ *   - Never throws.
+ *   - rotations result is always ≥ 0.
+ */
+export function computeWheelDelta(
+  start: RotationSnapshot,
+  end: RotationSnapshot,
+  diameterMm: number,
+): WheelDelta {
+  const epochCrossed = start.epoch !== end.epoch;
+  const rotations = epochCrossed
+    ? end.rotations                          // post-restart partial count only
+    : Math.max(0, end.rotations - start.rotations);
+  const metres = rotations * Math.PI * diameterMm / 1000;
+  return { rotations, metres, epochCrossed };
+}
+
+// ---------------------------------------------------------------------------
+// Internal: spawn and restart logic
+// ---------------------------------------------------------------------------
+
+/**
+ * Spawn an ffmpeg odometer process for one camera and register its handle.
+ * Automatically restarts with exponential backoff on unexpected exit.
+ *
+ * Not exported — called by `initWheelOdometers` and by the restart scheduler.
+ */
+function spawnOdometerForCamera(
+  camera: db.CameraRow,
+  backoffMs: number,
+  epoch: number,
+): void {
   const {
+    id: cameraId,
     live_src,
     wheel_diameter_mm: diameterMm,
     wheel_band_x_pct: bandX,
@@ -330,8 +508,8 @@ export function startWheelSession(cameraId: number, startedAt: number): boolean 
 
   const rtspUrl = wheelRtspUrl(live_src);
   if (!rtspUrl) {
-    log.warn({ cameraId, live_src }, 'wheel-odometer: no live_src / FRIGATE_URL — cannot start session');
-    return false;
+    log.warn({ cameraId, live_src }, 'wheel-odometer: no live_src / FRIGATE_URL — camera skipped');
+    return;
   }
 
   const counter = new RotationCounter(thresholdPct);
@@ -343,7 +521,7 @@ export function startWheelSession(cameraId: number, startedAt: number): boolean 
   // We use `ih*bandH/100` arithmetic inside the crop filter expression.
   // `-vsync vfr` avoids duplicate frames on slow streams.
   //
-  // We cast the result to our SessionHandle proc type because TypeScript's
+  // We cast the result to our handle proc type because TypeScript's
   // overload resolution for spawn() with stdio-tuple literals produces
   // ChildProcessByStdio<null, Readable, Readable>; the cast is safe since
   // stdout and stderr are Readable instances in all cases.
@@ -357,7 +535,22 @@ export function startWheelSession(cameraId: number, startedAt: number): boolean 
     '-vcodec', 'pgm',
     '-',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
-  const proc = rawProc as SessionHandle['proc'];
+  const proc = rawProc as OdometerHandle['proc'];
+
+  const startedAtMs = Date.now();
+
+  const handle: OdometerHandle = {
+    cameraId,
+    counter,
+    parser,
+    proc,
+    epoch,
+    startedAtMs,
+    backoffMs,
+    diameterMm,
+    shuttingDown: false,
+  };
+  alwaysOnOdometers.set(cameraId, handle);
 
   proc.stdout.on('data', (chunk: Buffer) => {
     parser.feed(chunk);
@@ -369,53 +562,48 @@ export function startWheelSession(cameraId: number, startedAt: number): boolean 
 
   proc.on('error', (err) => {
     log.warn({ cameraId, err: err.message }, 'wheel-odometer: ffmpeg spawn error');
-    cleanupSession(cameraId);
+    scheduleRestart(cameraId, camera, handle);
   });
 
   proc.on('close', (code) => {
-    if (activeSessions.has(cameraId)) {
-      // Unexpected exit — log and clean up, but do NOT throw. The partial
-      // count is preserved in the counter and endWheelSession will read it.
-      log.warn({ cameraId, code }, 'wheel-odometer: ffmpeg exited unexpectedly');
-      cleanupSession(cameraId);
-    }
+    if (handle.shuttingDown) return; // Expected — no restart.
+    log.warn({ cameraId, code }, 'wheel-odometer: ffmpeg exited unexpectedly');
+    scheduleRestart(cameraId, camera, handle);
   });
 
-  const safetyTimer = setTimeout(() => {
-    log.warn({ cameraId }, 'wheel-odometer: safety cut-off after 2 hours');
-    cleanupSession(cameraId);
-  }, MAX_SESSION_MS);
-  safetyTimer.unref?.();
-
-  activeSessions.set(cameraId, {
-    cameraId,
-    startedAt,
-    counter,
-    parser,
-    proc,
-    safetyTimer,
-    diameterMm,
-  });
-
-  log.info({ cameraId, rtspUrl, bandX, bandW, bandY, bandH, thresholdPct }, 'wheel session started');
-  return true;
+  log.info({ cameraId, rtspUrl, bandX, bandW, bandY, bandH, thresholdPct, epoch }, 'wheel-odometer: started');
 }
 
 /**
- * Stop the wheel session for this camera and return the computed distance.
- * Returns null if no session was active or if odometry is disabled.
- * metres = rotations × π × diameter_mm / 1000
+ * Schedule a restart for a camera whose ffmpeg process exited unexpectedly.
+ * Applies exponential backoff; resets backoff if the process had >5 min uptime.
  */
-export function endWheelSession(cameraId: number): { metres: number; rotations: number } | null {
-  const session = activeSessions.get(cameraId);
-  if (!session) return null;
+function scheduleRestart(
+  cameraId: number,
+  camera: db.CameraRow,
+  handle: OdometerHandle,
+): void {
+  if (handle.shuttingDown) return;
+  // Remove the dead handle so getRotationSnapshot returns null during the gap.
+  alwaysOnOdometers.delete(cameraId);
 
-  const rotations = session.counter.getRotations();
-  cleanupSession(cameraId);
+  const uptimeMs = Date.now() - handle.startedAtMs;
+  const nextBackoff = uptimeMs >= BACKOFF_RESET_UPTIME_MS
+    ? BACKOFF_INITIAL_MS
+    : Math.min(handle.backoffMs * 2, BACKOFF_MAX_MS);
 
-  const metres = rotations * Math.PI * session.diameterMm / 1000;
-  log.info({ cameraId, rotations, metres }, 'wheel session ended');
-  return { metres, rotations };
+  log.info({ cameraId, backoffMs: handle.backoffMs, nextBackoff }, 'wheel-odometer: scheduling restart');
+
+  const timer = setTimeout(() => {
+    // Re-read the camera row in case config changed since startup.
+    const freshCamera = db.getCameraById(cameraId);
+    if (!freshCamera || freshCamera.wheel_mark_enabled !== 1) {
+      log.info({ cameraId }, 'wheel-odometer: camera no longer eligible — skipping restart');
+      return;
+    }
+    spawnOdometerForCamera(freshCamera, nextBackoff, handle.epoch + 1);
+  }, handle.backoffMs);
+  timer.unref?.();
 }
 
 // ---------------------------------------------------------------------------
@@ -500,12 +688,6 @@ export async function replayWheelDistance(input: ReplayWheelDistanceInput): Prom
 // Live rotation test — bounded RTSP window
 // ---------------------------------------------------------------------------
 
-/** Hard lower/upper bound on the test window passed to `liveWheelRotationTest`. */
-const LIVE_TEST_MIN_S = 5;
-const LIVE_TEST_MAX_S = 30;
-/** Kill-timeout safety net: how long after the expected window we force-kill ffmpeg. */
-const LIVE_TEST_KILL_GRACE_MS = 5_000;
-
 export interface LiveWheelRotationTestResult {
   rotations: number;
   sampledDurationS: number;
@@ -524,8 +706,8 @@ export interface LiveWheelRotationTestResult {
  * distance metrics.
  *
  * Reuses `PgmParser` and `RotationCounter` unchanged (DRY). Runs independently
- * of the persistent `activeSessions` map; go2rtc fans the RTSP stream out so a
- * second reader does not disturb an active odometer session.
+ * of the persistent `alwaysOnOdometers` map; go2rtc fans the RTSP stream out so a
+ * second reader does not disturb an active odometer.
  *
  * Throws `FfmpegError` when ffmpeg fails to spawn or exits non-zero.
  * Throws `Error` when the camera is ineligible (not found / no live_src /
@@ -739,18 +921,6 @@ export async function testWheelDetection(cameraId: number): Promise<
 // Internals
 // ---------------------------------------------------------------------------
 
-function cleanupSession(cameraId: number): void {
-  const session = activeSessions.get(cameraId);
-  if (!session) return;
-  clearTimeout(session.safetyTimer);
-  try {
-    session.proc.kill('SIGTERM');
-  } catch {
-    // Process may already be dead.
-  }
-  activeSessions.delete(cameraId);
-}
-
 /**
  * Parse the PGM header from a full buffer and compute the ratio of dark pixels.
  * "Dark" = pixel intensity strictly below `255 * (1 − thresholdPct/100)`.
@@ -782,5 +952,25 @@ function computeDarkPixelRatio(pgmBuf: Buffer, thresholdPct: number): number {
   return dark / total;
 }
 
-// Exported for tests.
-export { activeSessions as _activeSessions };
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Direct access to the always-on odometer map for tests that need to inspect
+ * or inject fake handles. Tests should NOT mutate this map directly in
+ * production paths — only via the public API.
+ */
+export { alwaysOnOdometers as _alwaysOnOdometers };
+
+/**
+ * Reset all always-on odometer state. Used by tests to ensure isolation.
+ * Kills any running processes cleanly.
+ */
+export function resetOdometersForTests(): void {
+  for (const handle of alwaysOnOdometers.values()) {
+    handle.shuttingDown = true;
+    try { handle.proc.kill('SIGTERM'); } catch { /* already dead */ }
+  }
+  alwaysOnOdometers.clear();
+}

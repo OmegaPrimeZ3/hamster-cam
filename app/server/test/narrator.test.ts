@@ -787,8 +787,10 @@ describe('narrator multi-camera dedup', () => {
     vi.useRealTimers();
   });
 
-  it('two overlapping cameras on the wheel → exactly one odometer session', async () => {
-    // Mock child_process.spawn so no real ffmpeg runs.
+  it('two overlapping cameras on the wheel → exactly one diary entry (always-on odometer model)', async () => {
+    // With always-on odometers, there is no per-visit session to start/stop.
+    // The narrator takes a snapshot on visit-open and a snapshot on visit-close.
+    // Two cameras arriving for the same wheel zone must produce exactly ONE entry.
     const spawnMock = vi.fn(() => makeFakeProc());
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
 
@@ -796,27 +798,27 @@ describe('narrator multi-camera dedup', () => {
 
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, resetOdometersForTests } = await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
     await seedOverlappingWheelCameras(['cam-a', 'cam-b']);
 
+    // Start always-on odometers for both cameras (2 ffmpeg spawns).
+    initWheelOdometers();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+
     vi.useFakeTimers();
     const t0 = 1_700_000_000_000;
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // cam-a fires first → starts one odometer session.
+    // cam-a fires first — visit opens, opening snapshot taken from cam-a's odometer.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
-    expect(_activeSessions.size).toBe(1);
-    expect(spawnMock).toHaveBeenCalledTimes(1);
 
-    // cam-b fires next for same activity → must NOT start a second session.
+    // cam-b fires next for same activity → visit already open, no second odomCameraId taken.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-b', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
-    expect(_activeSessions.size).toBe(1);
-    expect(spawnMock).toHaveBeenCalledTimes(1); // still only 1 spawn
 
     // cam-a ends — but cam-b is still active, so no flush yet.
     now = t0 + 5_000;
@@ -834,6 +836,7 @@ describe('narrator multi-camera dedup', () => {
     expect(entries.length).toBe(1);
     expect(entries[0]?.activity).toBe('wheel');
 
+    resetOdometersForTests();
     vi.useRealTimers();
     vi.doUnmock('node:child_process');
   });
@@ -901,7 +904,10 @@ describe('narrator multi-camera dedup', () => {
     vi.useRealTimers();
   });
 
-  it('odometer-disabled cam-a + odometer-enabled cam-b → session runs on cam-b', async () => {
+  it('odometer-disabled cam-a + odometer-enabled cam-b → snapshot taken from cam-b', async () => {
+    // With always-on odometers, only cam-b has a running odometer (cam-a disabled).
+    // The visit-open snapshot should be taken from cam-b's odometer.
+    // The resulting diary entry should exist with the distance from cam-b.
     const spawnMock = vi.fn(() => makeFakeProc());
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
 
@@ -909,7 +915,8 @@ describe('narrator multi-camera dedup', () => {
 
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, getRotationSnapshot, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
@@ -917,20 +924,26 @@ describe('narrator multi-camera dedup', () => {
     // cam-a has odometry disabled, cam-b has it enabled.
     const ids = await seedOverlappingWheelCameras(['cam-b']);
 
+    // Start always-on odometers — only cam-b has wheel_mark_enabled, so only 1 spawn.
+    initWheelOdometers();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    // cam-b's odometer is running, cam-a's is not.
+    expect(getRotationSnapshot(ids.camBId)).not.toBeNull();
+    expect(getRotationSnapshot(ids.camAId)).toBeNull();
+
     vi.useFakeTimers();
     const t0 = 1_700_000_000_000;
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // Disabled cam-a fires first — should NOT start an odometer session.
+    // Disabled cam-a fires first — visit opens, but snapshot will be null (no odometer).
+    // The narrator falls back gracefully: cam-a has no running odometer, so when the
+    // second camera (cam-b) fires it fills in the snapshot from cam-b's odometer.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
-    expect(_activeSessions.size).toBe(0); // no session from disabled cam
 
-    // Enabled cam-b fires for same activity — should start exactly one session.
+    // Enabled cam-b fires for same activity — visit already open, fills in odometer from cam-b.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-b', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
-    expect(_activeSessions.size).toBe(1);
-    expect(_activeSessions.has(ids.camBId)).toBe(true);
-    expect(spawnMock).toHaveBeenCalledTimes(1);
 
     // Both cameras end.
     now = t0 + 5_000;
@@ -944,7 +957,7 @@ describe('narrator multi-camera dedup', () => {
     expect(entries.length).toBe(1);
     expect(entries[0]?.activity).toBe('wheel');
 
-    void ids;
+    resetOdometersForTests();
     vi.useRealTimers();
     vi.doUnmock('node:child_process');
   });
@@ -1209,9 +1222,10 @@ describe('narrator multi-camera dedup', () => {
     vi.useRealTimers();
   });
 
-  it('wheel odometer session stays open while wheel visit is live, closes only at wheel track end', async () => {
-    // Under zone-visit model: food camera firing does NOT end the wheel odometer.
-    // The wheel odometer closes when the wheel zone visit closes.
+  it('wheel odometer keeps running when food camera fires — always-on model', async () => {
+    // Under the always-on model, the wheel odometer never stops between visits.
+    // Food camera events do NOT affect the wheel odometer's running state.
+    // The wheel odometer's snapshot is only READ (not stopped) when the visit closes.
     const spawnMock = vi.fn(() => makeFakeProc());
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
 
@@ -1219,7 +1233,8 @@ describe('narrator multi-camera dedup', () => {
 
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, getRotationSnapshot, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 8000, minDwellMs: 2000 });
@@ -1248,28 +1263,35 @@ describe('narrator multi-camera dedup', () => {
     });
     db.setSetting('pet_name', 'Remy');
 
+    // Start always-on odometer for cam-a (cam-b has no wheel_mark_enabled).
+    initWheelOdometers();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
     const t0 = 1_700_000_000_000;
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // cam-a fires 'new' for wheel → odometer session starts.
+    // cam-a fires 'new' for wheel → opening snapshot taken.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
-    expect(_activeSessions.size).toBe(1);
-    expect(_activeSessions.has(camA.id)).toBe(true);
+    // Odometer is always-on — snapshot should be available.
+    expect(getRotationSnapshot(camA.id)).not.toBeNull();
 
-    // 5s later, cam-b fires 'new' for food — odometer keeps running (wheel still open).
+    // 5s later, cam-b fires 'new' for food — wheel odometer is STILL running.
     now = t0 + 5_000;
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-b', zones: ['food'] }), deps);
-    expect(_activeSessions.size).toBe(1); // still running — wheel visit is open
+    // Odometer still running — not stopped by food event.
+    expect(getRotationSnapshot(camA.id)).not.toBeNull();
 
-    // cam-a ends — wheel visit closes and odometer session ends.
+    // cam-a ends — wheel visit closes and diary entry is written.
     now = t0 + 8_000;
     await handleFrigateEvent(
       newEvent({ type: 'end', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_008 }),
       deps,
     );
-    expect(_activeSessions.size).toBe(0); // odometer ended when wheel visit closed
+    // Always-on odometer is still running after the visit closes.
+    expect(getRotationSnapshot(camA.id)).not.toBeNull();
 
+    resetOdometersForTests();
     void db;
     vi.doUnmock('node:child_process');
   });
@@ -1441,9 +1463,9 @@ describe('cameraIdByName — live_src resolution', () => {
     vi.useRealTimers();
   });
 
-  it('wheel session starts when Frigate sends live_src identifier for a wheel-enabled camera', async () => {
-    // Regression test for symptom (2): wheel sessions never started because
-    // cameraIdByName returned null, so startWheelSession was never called.
+  it('wheel snapshot resolves when Frigate sends live_src identifier for a wheel-enabled camera', async () => {
+    // Regression: cameraIdByName must resolve live_src → correct camera row so
+    // the narrator can read the opening rotation snapshot from the always-on odometer.
     const spawnMock = vi.fn(() => makeFakeProc());
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
 
@@ -1452,7 +1474,8 @@ describe('cameraIdByName — live_src resolution', () => {
     const db = await import('../src/db.js');
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, getRotationSnapshot, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
@@ -1472,50 +1495,57 @@ describe('cameraIdByName — live_src resolution', () => {
     });
     db.setSetting('pet_name', 'Remy');
 
+    // Start the always-on odometer for this camera.
+    initWheelOdometers();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    // Camera id resolves correctly via live_src — snapshot is available.
+    expect(getRotationSnapshot(cam.id)).not.toBeNull();
+
     vi.useFakeTimers();
     const t0 = 1_700_003_000_000;
     const deps = { now: () => t0, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // Frigate sends the live_src value as camera name.
+    // Frigate sends the live_src value as camera name — cameraIdByName must resolve it.
     await handleFrigateEvent(
       newEvent({ type: 'new', camera: 'hamster_cam_1', zones: ['wheel'], startSec: 1_700_003_000 }),
       deps,
     );
 
-    // With the fix, the camera resolves → odometer session starts.
-    expect(_activeSessions.size).toBe(1);
-    expect(_activeSessions.has(cam.id)).toBe(true);
+    // Always-on odometer is still running after visit opens.
+    expect(getRotationSnapshot(cam.id)).not.toBeNull();
 
-    void cam;
+    resetOdometersForTests();
     vi.useRealTimers();
     vi.doUnmock('node:child_process');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Bug 1 regression: odomCameraId must only be set when startWheelSession
-// returns true (i.e. an ffmpeg session is actually live). Previously
-// isCameraWheelEnabled was checked instead of the return value of
-// startWheelSession, which meant that a camera with wheel_mark_enabled=1 but
-// no live_src would set odomCameraId even though no session was started,
-// causing prepareCloseVisit to call endWheelSession on a non-existent session
-// and silently produce no distance data.
+// Always-on odometer wiring — narrator correctly takes snapshots and writes
+// wheel_meters / rotations into diary entry details.
+//
+// With the always-on model, the odometer is never started or stopped per-visit.
+// The narrator takes an opening snapshot when a wheel zone opens and a closing
+// snapshot when it closes, then writes the delta into details.
 // ---------------------------------------------------------------------------
 
-describe('wheel odometer — odomCameraId is only set when a session actually started', () => {
-  it('wheel_mark_enabled=1 with no live_src: no session started, no spurious endWheelSession call', async () => {
+describe('wheel odometer — always-on snapshot wiring in narrator', () => {
+  it('wheel_mark_enabled=1 with no live_src: no snapshot available, entry written with 0 distance', async () => {
+    // initWheelOdometers skips cameras with no live_src. The narrator gracefully
+    // falls back to 0 distance when getRotationSnapshot returns null.
     vi.useFakeTimers();
 
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const { getRotationSnapshot } = await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
 
-    // Camera has wheel mark enabled but live_src is not set — startWheelSession
-    // will return false (no RTSP URL to connect to).
+    // Camera has wheel mark enabled but live_src is not set — initWheelOdometers
+    // will skip it and getRotationSnapshot will return null.
     const cam = db.createCamera({
       name: 'wheel-no-src',
       emoji: '🎡',
@@ -1530,16 +1560,18 @@ describe('wheel odometer — odomCameraId is only set when a session actually st
     });
     db.setSetting('pet_name', 'Remy');
 
+    // No initWheelOdometers call — getRotationSnapshot returns null for this camera.
+    expect(getRotationSnapshot(cam.id)).toBeNull();
+
     const t0 = 1_700_010_000_000;
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // Zone opens — session should NOT start (no live_src).
+    // Zone opens — narrator takes opening snapshot: null (no odometer running).
     await handleFrigateEvent(
       newEvent({ type: 'new', camera: 'wheel-no-src', zones: ['wheel'], startSec: 1_700_010_000 }),
       deps,
     );
-    expect(_activeSessions.size).toBe(0); // no session started
 
     // Zone closes after a meaningful dwell.
     now = t0 + 30_000;
@@ -1555,18 +1587,19 @@ describe('wheel odometer — odomCameraId is only set when a session actually st
     expect(entries.length).toBe(1);
     expect(entries[0]?.activity).toBe('wheel');
 
-    // wheel_meters and rotations are always written — 0 when no session ran.
+    // wheel_meters and rotations are always written — 0 when no snapshot was available.
     const details = entries[0]?.details
       ? (JSON.parse(entries[0].details) as Record<string, unknown>)
       : {};
     expect(details['wheel_meters']).toBe(0);
     expect(details['rotations']).toBe(0);
 
-    void cam;
     vi.useRealTimers();
   });
 
-  it('wheel_mark_enabled=1 with live_src set: session starts → odomCameraId set → distance recorded', async () => {
+  it('wheel_mark_enabled=1 with live_src set: always-on odometer running, opening snapshot taken', async () => {
+    // With the always-on model, the odometer is started via initWheelOdometers
+    // at app startup. The narrator reads snapshots at visit open/close time.
     const spawnMock = vi.fn(() => makeFakeProc());
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
     vi.useFakeTimers();
@@ -1575,7 +1608,8 @@ describe('wheel odometer — odomCameraId is only set when a session actually st
 
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, getRotationSnapshot, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
@@ -1595,18 +1629,21 @@ describe('wheel odometer — odomCameraId is only set when a session actually st
     });
     db.setSetting('pet_name', 'Remy');
 
+    // Start always-on odometer.
+    initWheelOdometers();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    // Odometer is running — snapshot available.
+    expect(getRotationSnapshot(cam.id)).not.toBeNull();
+
     const t0 = 1_700_011_000_000;
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // Zone opens — session SHOULD start.
+    // Zone opens — narrator takes opening snapshot (non-null, epoch 0).
     await handleFrigateEvent(
       newEvent({ type: 'new', camera: 'wheel_cam', zones: ['wheel'], startSec: 1_700_011_000 }),
       deps,
     );
-    expect(_activeSessions.size).toBe(1); // session started
-    expect(_activeSessions.has(cam.id)).toBe(true);
-    expect(spawnMock).toHaveBeenCalledTimes(1);
 
     // Zone closes.
     now = t0 + 30_000;
@@ -1617,10 +1654,10 @@ describe('wheel odometer — odomCameraId is only set when a session actually st
     await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
-    // Session ended after zone closed.
-    expect(_activeSessions.size).toBe(0);
+    // Always-on odometer is still running after visit closes.
+    expect(getRotationSnapshot(cam.id)).not.toBeNull();
 
-    void cam;
+    resetOdometersForTests();
     vi.useRealTimers();
     vi.doUnmock('node:child_process');
   });
@@ -2408,9 +2445,10 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     vi.useRealTimers();
   });
 
-  it('wheel odometer session is ended cleanly even when the gate drops the entry', async () => {
-    // If a wheel track is gated out (false positive), the odometer session must
-    // still be ended — no dangling ffmpeg process left behind.
+  it('wheel odometer keeps running even when the gate drops the entry (always-on model)', async () => {
+    // With always-on odometers, the ffmpeg process is never stopped per-visit.
+    // A false-positive gate still drops the diary entry, but the odometer remains
+    // running for the next wheel run.
     const spawnMock = vi.fn(() => makeFakeProc());
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
 
@@ -2419,7 +2457,8 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { _activeSessions } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, getRotationSnapshot, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
@@ -2439,11 +2478,15 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     });
     db.setSetting('pet_name', 'Remy');
 
+    // Start always-on odometer.
+    initWheelOdometers();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
     const t0 = 1_720_007_000_000;
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // 'new' — odometer session starts (looks like a real track at birth).
+    // 'new' — opening snapshot taken.
     await handleFrigateEvent(
       newEvent({
         type: 'new',
@@ -2455,8 +2498,8 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
       }),
       deps,
     );
-    expect(_activeSessions.size).toBe(1);
-    expect(_activeSessions.has(cam.id)).toBe(true);
+    // Odometer is still running.
+    expect(getRotationSnapshot(cam.id)).not.toBeNull();
 
     // 'end' — Frigate reclassifies as false positive.
     now = t0 + 30_000;
@@ -2475,13 +2518,13 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
-    // Odometer session MUST be ended — no dangling process.
-    expect(_activeSessions.size).toBe(0);
-    // But NO diary entry — false_positive gate drops it.
+    // Odometer is STILL running — always-on; not stopped by gate.
+    expect(getRotationSnapshot(cam.id)).not.toBeNull();
+    // NO diary entry — false_positive gate drops it.
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(0);
 
-    void cam;
+    resetOdometersForTests();
     vi.useRealTimers();
     vi.doUnmock('node:child_process');
   });

@@ -50,6 +50,7 @@ import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
 import { initVapidKeys } from './push.js';
 import { startFrigateStatsPoller, stopFrigateStatsPoller } from './frigate.js';
+import { initWheelOdometers, shutdownWheelOdometers } from './wheel-odometer.js';
 import { registerDiaryStream } from './diary-stream.js';
 import { closeWss, registerLiveWsProxy } from './live-ws.js';
 import { resolveSession } from './session.js';
@@ -440,6 +441,9 @@ export async function startRuntime(): Promise<RuntimeHandles> {
   }
 
   startFrigateStatsPoller();
+  // Fire-and-forget: spawns one background ffmpeg per wheel-enabled camera.
+  // Never blocks startup; per-camera errors are logged and skipped.
+  initWheelOdometers();
   const crons = scheduleCronJobs(app);
 
   await app.listen({ port: cfg.PORT, host: '0.0.0.0' });
@@ -496,6 +500,9 @@ async function shutdown(handles: RuntimeHandles, sig: string): Promise<void> {
     try { t.stop(); } catch { /* noop */ }
   }
   stopFrigateStatsPoller();
+  // Stop always-on wheel odometers before flushing the narrator so any
+  // in-flight rotation data is captured by the closing snapshots.
+  shutdownWheelOdometers();
 
   // 2. Flush the narrator's in-memory coalescing window to the DB.
   try {

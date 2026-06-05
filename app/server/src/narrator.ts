@@ -100,7 +100,11 @@ import { evaluateBadges, type BadgeId } from './badges.js';
 import { childLogger } from './logger.js';
 import { pickTemplate, render } from './narratives.js';
 import { evaluatePushForEntry } from './push.js';
-import { startWheelSession, endWheelSession } from './wheel-odometer.js';
+import {
+  getRotationSnapshot,
+  computeWheelDelta,
+  type RotationSnapshot,
+} from './wheel-odometer.js';
 
 const log = childLogger('narrator');
 
@@ -316,8 +320,19 @@ interface ZoneVisit {
   startedAt: number;
   /** All cameras currently reporting this zone for this pet. */
   cameras: Set<string>;
-  /** Camera id whose wheel odometer session is running (null if none). */
+  /**
+   * Camera id used for wheel odometry (null if none). Set when the visit opens
+   * for a wheel zone and the camera has wheel_mark_enabled=1 and a running
+   * always-on odometer. Used to call getRotationSnapshot at close time.
+   */
   odomCameraId: number | null;
+  /**
+   * The rotation snapshot taken when this wheel visit opened. Used together
+   * with a closing snapshot to compute the distance via computeWheelDelta.
+   * null when no always-on odometer is running for this camera (wheel disabled,
+   * RTSP down, etc.) — the narrator still writes the entry with 0 distance.
+   */
+  odomOpenSnapshot: RotationSnapshot | null;
   /**
    * Commit-gate fields — carried from the most recent Frigate event for this
    * track. `undefined` means the field has not yet been reported (treat as
@@ -626,8 +641,10 @@ interface ScheduledFlushDeps {
 }
 
 /**
- * Open a new zone visit. Starts a wheel odometer session if applicable.
- * Must only be called when the zone is NOT already in petState.zoneVisits.
+ * Open a new zone visit. For wheel zones, takes an opening rotation snapshot
+ * from the always-on odometer (if running) so distance can be computed at
+ * close time. Must only be called when the zone is NOT already in
+ * petState.zoneVisits.
  *
  * `side` is the `after` payload from the opening event — used to seed the
  * commit-gate fields (false_positive, has_snapshot, has_clip). These will be
@@ -641,34 +658,32 @@ function openZoneVisit(
   side: FrigateEventPayloadSide,
 ): void {
   let odomCameraId: number | null = null;
+  let odomOpenSnapshot: RotationSnapshot | null = null;
+
   if (activity === 'wheel') {
-    // Only start an odometer if no other wheel visit is running (invariant 1).
+    // Only record an odometer reference if no other wheel visit is already
+    // tracking one (invariant 1: at most one odometer reference per pet).
     const existingWheel = petState.zoneVisits.get('wheel');
-    const alreadyRunning = existingWheel !== undefined && existingWheel.odomCameraId !== null;
-    if (!alreadyRunning) {
+    const alreadyTracking = existingWheel !== undefined && existingWheel.odomCameraId !== null;
+    if (!alreadyTracking) {
       const camId = cameraIdByName(cameraName);
       if (camId !== null) {
-        try {
-          // startWheelSession returns true only when an ffmpeg session is
-          // actually running (wheel enabled, live_src configured, not a
-          // duplicate). Only set odomCameraId when there is a live session to
-          // end — otherwise prepareCloseVisit would call endWheelSession on a
-          // camera that never had one (returning null and losing any distance).
-          const sessionStarted = startWheelSession(camId, startedAt);
-          if (sessionStarted) {
-            odomCameraId = camId;
-          }
-        } catch (err) {
-          // Never block the narrator path for odometry errors.
-          void err;
-        }
+        // Take an opening snapshot from the always-on odometer. Returns null
+        // if the odometer isn't running yet (feed down, wheel disabled, etc.).
+        // We still set odomCameraId so prepareCloseVisit knows which camera
+        // to take the closing snapshot from — even if the opening snapshot is
+        // null (in which case we'll write 0 distance).
+        odomCameraId = camId;
+        odomOpenSnapshot = getRotationSnapshot(camId);
       }
     }
   }
+
   petState.zoneVisits.set(activity, {
     startedAt,
     cameras: new Set([cameraName]),
     odomCameraId,
+    odomOpenSnapshot,
     falsePositive: side.false_positive,
     hasSnapshot: side.has_snapshot,
     hasClip: side.has_clip,
@@ -712,20 +727,29 @@ function prepareCloseVisit(
     camera: [...visit.cameras][0] ?? cameraName,
   };
 
-  // Always end the odometer session — never leave ffmpeg running.
-  // This MUST happen before any gate check so sessions are always cleaned up.
-  // wheel_meters and rotations are always written (0/0 when no session ran)
+  // Compute wheel distance using the always-on odometer snapshot delta.
+  // wheel_meters and rotations are always written (0/0 when no odometer data)
   // so the UI can distinguish "0 metres measured" from "field missing".
   if (activity === 'wheel') {
-    // Default: zero — written even when no odometer session was active.
     details['wheel_meters'] = 0;
     details['rotations'] = 0;
-    if (visit.odomCameraId !== null) {
+    if (visit.odomCameraId !== null && visit.odomOpenSnapshot !== null) {
       try {
-        const result = endWheelSession(visit.odomCameraId);
-        if (result !== null) {
-          details['wheel_meters'] = result.metres;
-          details['rotations'] = result.rotations;
+        const closeSnapshot = getRotationSnapshot(visit.odomCameraId);
+        if (closeSnapshot !== null) {
+          // diameterMm comes from the camera row — must be re-read since it
+          // could have changed since the visit opened (unlikely but safe).
+          const camRow = db.getCameraById(visit.odomCameraId);
+          const diameterMm = camRow?.wheel_diameter_mm ?? 152;
+          const delta = computeWheelDelta(visit.odomOpenSnapshot, closeSnapshot, diameterMm);
+          details['wheel_meters'] = delta.metres;
+          details['rotations'] = delta.rotations;
+          if (delta.epochCrossed) {
+            log.warn(
+              { cameraId: visit.odomCameraId, openEpoch: visit.odomOpenSnapshot.epoch, closeEpoch: closeSnapshot.epoch },
+              'wheel-odometer: epoch crossed during visit — ffmpeg restarted; only post-restart count recorded',
+            );
+          }
         }
       } catch (err) {
         void err;
@@ -1101,17 +1125,17 @@ export async function handleFrigateEvent(
       updateZoneVisitGateFields(existing, event.after);
 
       // Edge case: existing visit has no odometer but this camera can provide one.
+      // Take an opening snapshot from this camera's always-on odometer.
       if (activity === 'wheel' && existing.odomCameraId === null) {
         const camId = cameraIdByName(cameraName);
         if (camId !== null) {
-          try {
-            const sessionStarted = startWheelSession(camId, existing.startedAt);
-            if (sessionStarted) {
-              existing.odomCameraId = camId;
-            }
-          } catch (err) {
-            void err;
-          }
+          const openSnapshot = getRotationSnapshot(camId);
+          // We set odomCameraId regardless of whether openSnapshot is null —
+          // if the feed comes up before the visit closes we will still have a
+          // closing snapshot, and with openSnapshot=null we write 0 distance
+          // (which is the same safe fallback as when wheel is disabled).
+          existing.odomCameraId = camId;
+          existing.odomOpenSnapshot = openSnapshot;
         }
       }
     } else {

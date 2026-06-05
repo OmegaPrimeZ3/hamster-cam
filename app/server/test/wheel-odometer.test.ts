@@ -384,99 +384,58 @@ async function seedWheelCamera(
   return cam.id;
 }
 
-describe('wheel session lifecycle', () => {
-  it('end-without-start returns null', async () => {
-    const { endWheelSession } = await import('../src/wheel-odometer.js');
-    expect(endWheelSession(999)).toBeNull();
+// ---------------------------------------------------------------------------
+// Always-on odometer lifecycle — initWheelOdometers, getRotationSnapshot,
+// computeWheelDelta. No start/end session API anymore.
+// ---------------------------------------------------------------------------
+
+describe('always-on odometer: initWheelOdometers', () => {
+  it('spawns one ffmpeg per wheel-enabled camera on init', async () => {
+    const camId = await seedWheelCamera();
+    const { initWheelOdometers, _alwaysOnOdometers, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
+
+    initWheelOdometers();
+    expect(currentSpawnMock).toHaveBeenCalledTimes(1);
+    expect(_alwaysOnOdometers.size).toBe(1);
+    expect(_alwaysOnOdometers.has(camId)).toBe(true);
+
+    resetOdometersForTests();
   });
 
-  it('double-start is idempotent — only one ffmpeg process spawned', async () => {
-    const camId = await seedWheelCamera();
-    const { startWheelSession, endWheelSession, _activeSessions } = await import('../src/wheel-odometer.js');
+  it('is a no-op for cameras with wheel_mark_enabled = false', async () => {
+    await seedWheelCamera(false);
+    const { initWheelOdometers, _alwaysOnOdometers, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
 
-    startWheelSession(camId, Date.now());
-    startWheelSession(camId, Date.now());
+    initWheelOdometers();
+    expect(currentSpawnMock).not.toHaveBeenCalled();
+    expect(_alwaysOnOdometers.size).toBe(0);
+
+    resetOdometersForTests();
+  });
+
+  it('is idempotent — second init call does not spawn a second ffmpeg', async () => {
+    const camId = await seedWheelCamera();
+    const { initWheelOdometers, _alwaysOnOdometers, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
+
+    initWheelOdometers();
+    initWheelOdometers(); // second call
 
     expect(currentSpawnMock).toHaveBeenCalledTimes(1);
-    expect(_activeSessions.size).toBe(1);
+    expect(_alwaysOnOdometers.size).toBe(1);
 
-    endWheelSession(camId);
-  });
-
-  it('start is a no-op when wheel_mark_enabled = false', async () => {
-    const camId = await seedWheelCamera(false);
-    const { startWheelSession, _activeSessions } = await import('../src/wheel-odometer.js');
-
-    startWheelSession(camId, Date.now());
-    expect(currentSpawnMock).not.toHaveBeenCalled();
-    expect(_activeSessions.size).toBe(0);
-  });
-
-  it('start→end returns computed metres from rotation count (1 rotation via 1-frame dark pulse)', async () => {
-    // At 30fps with refractory detection, a single dark frame followed by light
-    // is enough for one counted rotation (the regression scenario).
-    const camId = await seedWheelCamera();
-    const { startWheelSession, endWheelSession, _activeSessions } = await import('../src/wheel-odometer.js');
-
-    startWheelSession(camId, Date.now());
-    expect(_activeSessions.size).toBe(1);
-
-    const session = _activeSessions.get(camId);
-    expect(session).toBeDefined();
-
-    // Feed the parser a minimal rotation: 1 light + 1 dark + 1 light.
-    // At 30fps the refractory is ~4.5 frames; this is the first rotation so
-    // lastCountedFrame starts at -Infinity — no refractory block.
-    const header = Buffer.from('P5\n4 4\n255\n', 'ascii');
-    const lightPixels = Buffer.alloc(16, 200); // 200 >= 127.5 → light
-    const darkPixels  = Buffer.alloc(16, 50);  // 50  <  127.5 → dark
-
-    session?.proc.stdout.emit('data', Buffer.concat([header, lightPixels]));
-    session?.proc.stdout.emit('data', Buffer.concat([header, darkPixels]));
-    session?.proc.stdout.emit('data', Buffer.concat([header, lightPixels]));
-
-    const result = endWheelSession(camId);
-    // 1 rotation × π × 152 / 1000
-    expect(result).not.toBeNull();
-    expect(result!.rotations).toBe(1);
-    expect(result!.metres).toBeCloseTo(Math.PI * 152 / 1000, 4);
-  });
-
-  it('ffmpeg crash mid-session — session removed, subsequent end returns null', async () => {
-    const camId = await seedWheelCamera();
-    const { startWheelSession, endWheelSession, _activeSessions } = await import('../src/wheel-odometer.js');
-
-    startWheelSession(camId, Date.now());
-    const session = _activeSessions.get(camId);
-
-    // Simulate unexpected ffmpeg process exit (non-zero).
-    session?.proc.emit('close', 1);
-
-    // After crash, session is cleaned up automatically.
-    expect(_activeSessions.has(camId)).toBe(false);
-
-    // endWheelSession returns null — the session is gone.
-    expect(endWheelSession(camId)).toBeNull();
-  });
-
-  it('endWheelSession kills the ffmpeg process', async () => {
-    const camId = await seedWheelCamera();
-    const { startWheelSession, endWheelSession, _activeSessions } = await import('../src/wheel-odometer.js');
-
-    startWheelSession(camId, Date.now());
-    const session = _activeSessions.get(camId);
-
-    endWheelSession(camId);
-    expect(session?.proc.kill).toHaveBeenCalledWith('SIGTERM');
-    expect(_activeSessions.has(camId)).toBe(false);
+    void camId;
+    resetOdometersForTests();
   });
 
   it('ffmpeg crop filter uses full rectangle: iw*W/100:ih*H/100:iw*X/100:ih*Y/100', async () => {
-    // Camera with a non-default x + width so the crop string is unambiguous.
+    // Camera with non-default x + width so the crop string is unambiguous.
     const camId = await seedWheelCamera(true, { wheel_band_x_pct: 25, wheel_band_width_pct: 50 });
-    const { startWheelSession } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, resetOdometersForTests } = await import('../src/wheel-odometer.js');
 
-    startWheelSession(camId, Date.now());
+    initWheelOdometers();
 
     expect(currentSpawnMock).toHaveBeenCalledTimes(1);
     const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
@@ -484,30 +443,142 @@ describe('wheel session lifecycle', () => {
     expect(vfIdx).toBeGreaterThanOrEqual(0);
     // bandX=25, bandW=50, bandY=50, bandH=10
     expect(args[vfIdx + 1]).toBe('crop=iw*50/100:ih*10/100:iw*25/100:ih*50/100,format=gray');
+
+    void camId;
+    resetOdometersForTests();
   });
 
-  it('ffmpeg crop defaults to full-width when x=0 width=100 (backward compat)', async () => {
-    // Default camera: x_pct=0, width_pct=100 — replicates old full-width strip.
+  it('ffmpeg crop defaults to full-width when x=0 width=100', async () => {
     const camId = await seedWheelCamera();
-    const { startWheelSession } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, resetOdometersForTests } = await import('../src/wheel-odometer.js');
 
-    startWheelSession(camId, Date.now());
+    initWheelOdometers();
 
     const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
     const vfIdx = args.indexOf('-vf');
     expect(args[vfIdx + 1]).toBe('crop=iw*100/100:ih*10/100:iw*0/100:ih*50/100,format=gray');
+
+    void camId;
+    resetOdometersForTests();
   });
 
   it('ffmpeg -r arg is 30 (native camera fps)', async () => {
     const camId = await seedWheelCamera();
-    const { startWheelSession } = await import('../src/wheel-odometer.js');
+    const { initWheelOdometers, resetOdometersForTests } = await import('../src/wheel-odometer.js');
 
-    startWheelSession(camId, Date.now());
+    initWheelOdometers();
 
     const args: string[] = currentSpawnMock.mock.calls[0]?.[1] ?? [];
     const rIdx = args.indexOf('-r');
     expect(rIdx).toBeGreaterThanOrEqual(0);
     expect(args[rIdx + 1]).toBe('30');
+
+    void camId;
+    resetOdometersForTests();
+  });
+
+  it('shutdownWheelOdometers kills all processes and clears the map', async () => {
+    const camId = await seedWheelCamera();
+    const { initWheelOdometers, shutdownWheelOdometers, _alwaysOnOdometers } =
+      await import('../src/wheel-odometer.js');
+
+    initWheelOdometers();
+    const handle = _alwaysOnOdometers.get(camId);
+    expect(handle).toBeDefined();
+
+    shutdownWheelOdometers();
+    expect(handle?.proc.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(_alwaysOnOdometers.size).toBe(0);
+  });
+});
+
+describe('getRotationSnapshot', () => {
+  it('returns null for a camera with no running odometer', async () => {
+    const { getRotationSnapshot } = await import('../src/wheel-odometer.js');
+    expect(getRotationSnapshot(99999)).toBeNull();
+  });
+
+  it('returns a snapshot with epoch=0 and rotations=0 when odometer just started', async () => {
+    const camId = await seedWheelCamera();
+    const { initWheelOdometers, getRotationSnapshot, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
+
+    initWheelOdometers();
+    const snap = getRotationSnapshot(camId);
+    expect(snap).not.toBeNull();
+    expect(snap?.epoch).toBe(0);
+    expect(snap?.rotations).toBe(0);
+    expect(typeof snap?.captureMs).toBe('number');
+
+    resetOdometersForTests();
+  });
+
+  it('rotations increase as PGM frames are fed through the handle', async () => {
+    const camId = await seedWheelCamera();
+    const { initWheelOdometers, getRotationSnapshot, _alwaysOnOdometers, resetOdometersForTests } =
+      await import('../src/wheel-odometer.js');
+
+    initWheelOdometers();
+
+    const handle = _alwaysOnOdometers.get(camId);
+    expect(handle).toBeDefined();
+
+    // Feed 1 light + 1 dark + 1 light → 1 rotation (first count, no refractory block).
+    const header = Buffer.from('P5\n4 4\n255\n', 'ascii');
+    const light = Buffer.alloc(16, 200);
+    const dark  = Buffer.alloc(16, 50);
+    handle?.proc.stdout.emit('data', Buffer.concat([header, light]));
+    handle?.proc.stdout.emit('data', Buffer.concat([header, dark]));
+    handle?.proc.stdout.emit('data', Buffer.concat([header, light]));
+
+    const snap = getRotationSnapshot(camId);
+    expect(snap?.rotations).toBe(1);
+
+    resetOdometersForTests();
+  });
+});
+
+describe('computeWheelDelta', () => {
+  it('returns correct rotation delta when epoch matches', async () => {
+    const { computeWheelDelta } = await import('../src/wheel-odometer.js');
+    const start = { rotations: 5, epoch: 0, captureMs: 1000 };
+    const end   = { rotations: 8, epoch: 0, captureMs: 2000 };
+    const result = computeWheelDelta(start, end, 152);
+    expect(result.rotations).toBe(3);
+    expect(result.metres).toBeCloseTo(3 * Math.PI * 152 / 1000, 5);
+    expect(result.epochCrossed).toBe(false);
+  });
+
+  it('returns post-restart count when epoch differs and sets epochCrossed=true', async () => {
+    const { computeWheelDelta } = await import('../src/wheel-odometer.js');
+    // Odometer restarted: epoch 0→1, end.rotations is the post-restart count.
+    const start = { rotations: 50, epoch: 0, captureMs: 1000 };
+    const end   = { rotations: 3,  epoch: 1, captureMs: 2000 };
+    const result = computeWheelDelta(start, end, 152);
+    expect(result.rotations).toBe(3); // only post-restart count
+    expect(result.metres).toBeCloseTo(3 * Math.PI * 152 / 1000, 5);
+    expect(result.epochCrossed).toBe(true);
+  });
+
+  it('returns 0 rotations when wheel did not move', async () => {
+    const { computeWheelDelta } = await import('../src/wheel-odometer.js');
+    const start = { rotations: 10, epoch: 0, captureMs: 1000 };
+    const end   = { rotations: 10, epoch: 0, captureMs: 2000 };
+    const result = computeWheelDelta(start, end, 152);
+    expect(result.rotations).toBe(0);
+    expect(result.metres).toBe(0);
+    expect(result.epochCrossed).toBe(false);
+  });
+
+  it('clamps negative delta to 0 (clock skew / counter race)', async () => {
+    // Should not happen in practice, but if it does we clamp to 0.
+    const { computeWheelDelta } = await import('../src/wheel-odometer.js');
+    const start = { rotations: 10, epoch: 0, captureMs: 1000 };
+    const end   = { rotations: 8,  epoch: 0, captureMs: 2000 }; // somehow went backwards
+    const result = computeWheelDelta(start, end, 152);
+    expect(result.rotations).toBe(0); // Math.max(0, 8-10) = 0
+    expect(result.metres).toBe(0);
+    expect(result.epochCrossed).toBe(false);
   });
 });
 
