@@ -100,11 +100,7 @@ import { evaluateBadges, type BadgeId } from './badges.js';
 import { childLogger } from './logger.js';
 import { pickTemplate, render } from './narratives.js';
 import { evaluatePushForEntry } from './push.js';
-import {
-  getRotationSnapshot,
-  computeWheelDelta,
-  type RotationSnapshot,
-} from './wheel-odometer.js';
+import type { WheelMotionSession } from './wheel-motion.js';
 
 const log = childLogger('narrator');
 
@@ -314,25 +310,16 @@ interface LastSeen {
  * Represents one open zone visit. Multiple cameras can contribute to the same
  * visit (multi-camera dedup invariant 2). The visit closes when the cameras
  * set empties after a zone departure.
+ *
+ * Wheel zones are NO LONGER tracked here — they are handled exclusively by
+ * the motion-energy detector in wheel-motion.ts. The `wheel` Activity may
+ * still appear in Frigate zone events but we ignore it for diary purposes.
  */
 interface ZoneVisit {
   /** When this zone was first entered (ms since epoch). */
   startedAt: number;
   /** All cameras currently reporting this zone for this pet. */
   cameras: Set<string>;
-  /**
-   * Camera id used for wheel odometry (null if none). Set when the visit opens
-   * for a wheel zone and the camera has wheel_mark_enabled=1 and a running
-   * always-on odometer. Used to call getRotationSnapshot at close time.
-   */
-  odomCameraId: number | null;
-  /**
-   * The rotation snapshot taken when this wheel visit opened. Used together
-   * with a closing snapshot to compute the distance via computeWheelDelta.
-   * null when no always-on odometer is running for this camera (wheel disabled,
-   * RTSP down, etc.) — the narrator still writes the entry with 0 distance.
-   */
-  odomOpenSnapshot: RotationSnapshot | null;
   /**
    * Commit-gate fields — carried from the most recent Frigate event for this
    * track. `undefined` means the field has not yet been reported (treat as
@@ -641,10 +628,11 @@ interface ScheduledFlushDeps {
 }
 
 /**
- * Open a new zone visit. For wheel zones, takes an opening rotation snapshot
- * from the always-on odometer (if running) so distance can be computed at
- * close time. Must only be called when the zone is NOT already in
+ * Open a new zone visit. Must only be called when the zone is NOT already in
  * petState.zoneVisits.
+ *
+ * Wheel zones are deliberately excluded — they are handled by the motion-energy
+ * detector in wheel-motion.ts, not by Frigate zone events.
  *
  * `side` is the `after` payload from the opening event — used to seed the
  * commit-gate fields (false_positive, has_snapshot, has_clip). These will be
@@ -657,33 +645,12 @@ function openZoneVisit(
   startedAt: number,
   side: FrigateEventPayloadSide,
 ): void {
-  let odomCameraId: number | null = null;
-  let odomOpenSnapshot: RotationSnapshot | null = null;
-
-  if (activity === 'wheel') {
-    // Only record an odometer reference if no other wheel visit is already
-    // tracking one (invariant 1: at most one odometer reference per pet).
-    const existingWheel = petState.zoneVisits.get('wheel');
-    const alreadyTracking = existingWheel !== undefined && existingWheel.odomCameraId !== null;
-    if (!alreadyTracking) {
-      const camId = cameraIdByName(cameraName);
-      if (camId !== null) {
-        // Take an opening snapshot from the always-on odometer. Returns null
-        // if the odometer isn't running yet (feed down, wheel disabled, etc.).
-        // We still set odomCameraId so prepareCloseVisit knows which camera
-        // to take the closing snapshot from — even if the opening snapshot is
-        // null (in which case we'll write 0 distance).
-        odomCameraId = camId;
-        odomOpenSnapshot = getRotationSnapshot(camId);
-      }
-    }
-  }
+  // Wheel is owned by the motion-energy detector — skip it here.
+  if (activity === 'wheel') return;
 
   petState.zoneVisits.set(activity, {
     startedAt,
     cameras: new Set([cameraName]),
-    odomCameraId,
-    odomOpenSnapshot,
     falsePositive: side.false_positive,
     hasSnapshot: side.has_snapshot,
     hasClip: side.has_clip,
@@ -708,14 +675,15 @@ function updateZoneVisitGateFields(
 }
 
 /**
- * Close a zone visit and prepare a DeferredEntry. Always ends the wheel
- * odometer session — never leaves an ffmpeg session open regardless of dwell.
+ * Close a zone visit and prepare a DeferredEntry.
+ *
+ * Wheel zone visits are never opened (openZoneVisit skips them), so this
+ * function will never be called for 'wheel' activity. Wheel diary entries
+ * come exclusively from the motion-energy detector via handleWheelMotionSession.
  *
  * The commit-gate fields (falsePositive, hasSnapshot, hasClip) are snapshotted
  * from the visit at close time. The gate itself is applied later in
  * commitDeferred — after dwell-threshold checks but before any DB write.
- * Separating the two concerns keeps this function clean and ensures the
- * odometer is always ended even when the entry is ultimately gated out.
  */
 function prepareCloseVisit(
   visit: ZoneVisit,
@@ -726,36 +694,6 @@ function prepareCloseVisit(
   const details: Record<string, unknown> = {
     camera: [...visit.cameras][0] ?? cameraName,
   };
-
-  // Compute wheel distance using the always-on odometer snapshot delta.
-  // wheel_meters and rotations are always written (0/0 when no odometer data)
-  // so the UI can distinguish "0 metres measured" from "field missing".
-  if (activity === 'wheel') {
-    details['wheel_meters'] = 0;
-    details['rotations'] = 0;
-    if (visit.odomCameraId !== null && visit.odomOpenSnapshot !== null) {
-      try {
-        const closeSnapshot = getRotationSnapshot(visit.odomCameraId);
-        if (closeSnapshot !== null) {
-          // diameterMm comes from the camera row — must be re-read since it
-          // could have changed since the visit opened (unlikely but safe).
-          const camRow = db.getCameraById(visit.odomCameraId);
-          const diameterMm = camRow?.wheel_diameter_mm ?? 152;
-          const delta = computeWheelDelta(visit.odomOpenSnapshot, closeSnapshot, diameterMm);
-          details['wheel_meters'] = delta.metres;
-          details['rotations'] = delta.rotations;
-          if (delta.epochCrossed) {
-            log.warn(
-              { cameraId: visit.odomCameraId, openEpoch: visit.odomOpenSnapshot.epoch, closeEpoch: closeSnapshot.epoch },
-              'wheel-odometer: epoch crossed during visit — ffmpeg restarted; only post-restart count recorded',
-            );
-          }
-        }
-      } catch (err) {
-        void err;
-      }
-    }
-  }
 
   // Guard against negative durations: a visit opened with a server-clock
   // `nowMs` anchor (i.e. opened via an 'update' event) but closed with a
@@ -803,6 +741,13 @@ async function commitDeferred(
   deps: ScheduledFlushDeps,
   options: { interruptedByZone?: boolean } = {},
 ): Promise<db.DiaryEntryRow | null> {
+  // Wheel diary entries come exclusively from the motion-energy detector
+  // (wheel-motion.ts → handleWheelMotionSession). Frigate zone-event-driven
+  // wheel entries are silently discarded here. The PendingEnd is still created
+  // upstream so that cross-camera wheel→food transition detection continues to
+  // work — we just never write the wheel entry itself.
+  if (deferred.activity === 'wheel') return null;
+
   // Activity-specific dwell threshold: exploring requires a much longer dwell
   // than other activities so casual cage wandering is suppressed.
   // Exception: when exploring was interrupted by a zone entry on the same
@@ -853,104 +798,21 @@ async function commitDeferred(
   }
 
   // Back-to-back same-activity coalescing: if the most recent diary entry is
-  // the SAME non-wheel activity and the pet returned to it within
-  // COALESCE_WINDOW_MS, extend that entry instead of writing a near-duplicate
-  // (this is what collapses "Exploring → Exploring" runs into one). Wheel is
-  // excluded from this generic path and handled separately below via the
-  // DB-keyed dedupe. We do NOT re-fire onEntryWritten here — the original entry
-  // already ran badges/push, and re-firing would double-notify for a single
-  // continuing activity.
-  if (deferred.activity !== 'wheel') {
-    const latest = db.getLatestDiaryEntry();
-    if (
-      latest &&
-      latest.kind === 'narrative' &&
-      latest.activity === deferred.activity &&
-      deferred.occurredAt > latest.occurred_at &&
-      deferred.occurredAt - deferred.durationMs - latest.occurred_at <= COALESCE_WINDOW_MS
-    ) {
-      const startedAt = latest.occurred_at - (latest.duration_ms ?? 0);
-      return db.extendDiaryEntry(latest.id, deferred.occurredAt, deferred.occurredAt - startedAt);
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Wheel-specific dedupe: check the most recent wheel diary entry for this
-  // camera. If it ended within WHEEL_DEDUPE_WINDOW_MS, merge the new entry
-  // into the prior one rather than inserting a duplicate row.
-  //
-  // This handles the case where Frigate emits two rapid-fire object tracks
-  // for the same physical wheel session (e.g. inertia padding causes a brief
-  // gap between 'end' and the next 'new'). The merge is DB-keyed so it is
-  // idempotent across process restarts — no in-memory map needed.
-  //
-  // Merge semantics:
-  //   occurred_at  → new end time (deferred.occurredAt)
-  //   duration_ms  → (new_end_ts) - (prior start_ts)
-  //                  where prior start_ts = prior.occurred_at - prior.duration_ms
-  //   wheel_meters → prior + new (accumulated)
-  //   rotations    → prior + new (accumulated)
-  //   merged_sessions → prior count + 1
-  //
-  // We do NOT re-fire onEntryWritten for merged rows — the original row
-  // already triggered badges/push/thumbnail. The merge silently extends it.
-  // -------------------------------------------------------------------------
-  if (deferred.activity === 'wheel' && deferred.cameraId !== null) {
-    const prior = db.getRecentWheelEntryForCamera(deferred.cameraId);
-    if (
-      prior !== null &&
-      prior.occurred_at !== null &&
-      deferred.occurredAt - prior.occurred_at <= WHEEL_DEDUPE_WINDOW_MS
-    ) {
-      // Parse existing details; fall back to an empty object on malformed JSON.
-      let priorDetails: Record<string, unknown> = {};
-      if (prior.details) {
-        try {
-          const parsed = JSON.parse(prior.details) as unknown;
-          if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-            priorDetails = parsed as Record<string, unknown>;
-          }
-        } catch {
-          // Ignore malformed details — treat as empty.
-        }
-      }
-
-      // Accumulate distance and rotation fields from the new entry.
-      const priorMeters = typeof priorDetails['wheel_meters'] === 'number'
-        ? priorDetails['wheel_meters']
-        : 0;
-      const priorRotations = typeof priorDetails['rotations'] === 'number'
-        ? priorDetails['rotations']
-        : 0;
-      const newMeters = typeof deferred.details['wheel_meters'] === 'number'
-        ? deferred.details['wheel_meters']
-        : 0;
-      const newRotations = typeof deferred.details['rotations'] === 'number'
-        ? deferred.details['rotations']
-        : 0;
-      const priorMerged = typeof priorDetails['merged_sessions'] === 'number'
-        ? priorDetails['merged_sessions']
-        : 0;
-
-      const mergedDetails: Record<string, unknown> = {
-        ...priorDetails,
-        wheel_meters: priorMeters + newMeters,
-        rotations: priorRotations + newRotations,
-        merged_sessions: priorMerged + 1,
-      };
-
-      // Extend duration from the prior entry's start time to the new end time.
-      const priorDuration = prior.duration_ms ?? 0;
-      const priorStartTs = prior.occurred_at - priorDuration;
-      const newDurationMs = deferred.occurredAt - priorStartTs;
-
-      return db.mergeWheelDiaryEntry({
-        id: prior.id,
-        occurred_at: deferred.occurredAt,
-        duration_ms: newDurationMs,
-        details: mergedDetails,
-      });
-    }
+  // the SAME activity and the pet returned to it within COALESCE_WINDOW_MS,
+  // extend that entry instead of writing a near-duplicate (this collapses
+  // "Exploring → Exploring" runs into one). We do NOT re-fire onEntryWritten
+  // here — the original entry already ran badges/push, and re-firing would
+  // double-notify for a single continuing activity.
+  const latest = db.getLatestDiaryEntry();
+  if (
+    latest &&
+    latest.kind === 'narrative' &&
+    latest.activity === deferred.activity &&
+    deferred.occurredAt > latest.occurred_at &&
+    deferred.occurredAt - deferred.durationMs - latest.occurred_at <= COALESCE_WINDOW_MS
+  ) {
+    const startedAt = latest.occurred_at - (latest.duration_ms ?? 0);
+    return db.extendDiaryEntry(latest.id, deferred.occurredAt, deferred.occurredAt - startedAt);
   }
 
   const entry = writeEntry({
@@ -1123,21 +985,6 @@ export async function handleFrigateEvent(
       existing.cameras.add(cameraName);
       // Refresh gate fields from this camera's perspective.
       updateZoneVisitGateFields(existing, event.after);
-
-      // Edge case: existing visit has no odometer but this camera can provide one.
-      // Take an opening snapshot from this camera's always-on odometer.
-      if (activity === 'wheel' && existing.odomCameraId === null) {
-        const camId = cameraIdByName(cameraName);
-        if (camId !== null) {
-          const openSnapshot = getRotationSnapshot(camId);
-          // We set odomCameraId regardless of whether openSnapshot is null —
-          // if the feed comes up before the visit closes we will still have a
-          // closing snapshot, and with openSnapshot=null we write 0 distance
-          // (which is the same safe fallback as when wheel is disabled).
-          existing.odomCameraId = camId;
-          existing.odomOpenSnapshot = openSnapshot;
-        }
-      }
     } else {
       // Camera already in this visit: update gate fields from the latest event.
       // This is the critical path for 'update' and 'end' events — Frigate may
@@ -1382,6 +1229,123 @@ export async function saveManualSnapshot(input: {
   void import('./thumbnails.js').then(({ generateThumbnailForEntry }) =>
     generateThumbnailForEntry(entry),
   );
+  return entry;
+}
+
+// ---------------------------------------------------------------------------
+// Wheel motion-session handler (called from wheel-motion.ts onSession)
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a completed wheel-motion session into a diary entry (or merge it
+ * into the most recent prior wheel entry when within WHEEL_DEDUPE_WINDOW_MS).
+ *
+ * Distance formula: durationS × wheel_avg_speed_mps (read from camera row at
+ * session-end time so a mid-night calibration change takes effect immediately).
+ *
+ * Dedupe: if the most recent wheel diary entry for this camera ended within
+ * WHEEL_DEDUPE_WINDOW_MS, we extend that row rather than inserting a new one.
+ * This collapses intra-session Frigate noise / brief gaps within a single
+ * physical wheel run into one diary entry.
+ */
+export async function handleWheelMotionSession(
+  session: WheelMotionSession,
+  deps: NarratorDeps = {},
+): Promise<db.DiaryEntryRow | null> {
+  const resolvedDeps: Required<NarratorDeps> = {
+    now: deps.now ?? defaultDeps.now,
+    rng: deps.rng ?? defaultDeps.rng,
+    onEntryWritten: deps.onEntryWritten ?? defaultDeps.onEntryWritten,
+  };
+
+  const durationMs = session.endedAt - session.startedAt;
+  if (durationMs <= 0) {
+    log.warn({ cameraId: session.cameraId, durationMs }, 'wheel-motion: session has zero/negative duration — skipping');
+    return null;
+  }
+
+  // Look up the camera to get wheel_avg_speed_mps.
+  const camRow = db.getCameraById(session.cameraId);
+  const avgSpeedMps = camRow?.wheel_avg_speed_mps ?? 1.0;
+  const durationS = durationMs / 1000;
+  const wheelMeters = durationS * avgSpeedMps;
+
+  const details: Record<string, unknown> = {
+    camera: camRow?.live_src ?? String(session.cameraId),
+    wheel_meters: wheelMeters,
+    mean_motion_energy: session.meanEnergy,
+  };
+
+  const occurredAt = session.endedAt;
+
+  // Dedupe: check whether we should merge into a recent prior wheel entry.
+  const prior = db.getRecentWheelEntryForCamera(session.cameraId);
+  if (
+    prior !== null &&
+    prior.occurred_at !== null &&
+    occurredAt - prior.occurred_at <= WHEEL_DEDUPE_WINDOW_MS
+  ) {
+    let priorDetails: Record<string, unknown> = {};
+    if (prior.details) {
+      try {
+        const parsed = JSON.parse(prior.details) as unknown;
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+          priorDetails = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Malformed details — treat as empty.
+      }
+    }
+
+    const priorMeters = typeof priorDetails['wheel_meters'] === 'number' ? priorDetails['wheel_meters'] : 0;
+    const priorMerged = typeof priorDetails['merged_sessions'] === 'number' ? priorDetails['merged_sessions'] : 0;
+
+    const mergedDetails: Record<string, unknown> = {
+      ...priorDetails,
+      wheel_meters: priorMeters + wheelMeters,
+      mean_motion_energy: session.meanEnergy,
+      merged_sessions: priorMerged + 1,
+    };
+
+    const priorDuration = prior.duration_ms ?? 0;
+    const priorStartTs = prior.occurred_at - priorDuration;
+    const newDurationMs = occurredAt - priorStartTs;
+
+    const updated = db.mergeWheelDiaryEntry({
+      id: prior.id,
+      occurred_at: occurredAt,
+      duration_ms: newDurationMs,
+      details: mergedDetails,
+    });
+    log.info({ cameraId: session.cameraId, entryId: prior.id, wheelMeters, durationMs }, 'wheel-motion: merged session into prior entry');
+    return updated;
+  }
+
+  // New entry.
+  const pet = petName();
+  const tpl = pickTemplate('wheel', resolvedDeps.rng);
+  const narrative = render(tpl, {
+    pet: pet || 'they',
+    duration: formatDuration(durationMs),
+  });
+
+  const entry = db.createDiaryEntry({
+    occurred_at: occurredAt,
+    kind: 'narrative',
+    activity: 'wheel',
+    narrative,
+    pet_name: pet || null,
+    camera_id: session.cameraId,
+    from_camera_id: null,
+    to_camera_id: null,
+    duration_ms: durationMs,
+    snapshot_id: null,
+    media_path: null,
+    details: JSON.stringify(details),
+  });
+
+  log.info({ cameraId: session.cameraId, entryId: entry.id, wheelMeters, durationMs }, 'wheel-motion: new diary entry');
+  await resolvedDeps.onEntryWritten(entry);
   return entry;
 }
 

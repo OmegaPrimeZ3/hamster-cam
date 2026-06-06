@@ -123,7 +123,7 @@ describe('narrator', () => {
     expect(all[0]?.activity).toBe('transition');
   });
 
-  it('falls back to a standalone wheel entry when no follow-up arrives before the window expires', async () => {
+  it('falls back to a standalone food entry when no follow-up arrives before the window expires', async () => {
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -135,7 +135,7 @@ describe('narrator', () => {
     const t0 = 1_700_000_000_000;
     let now = t0;
     await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }),
+      newEvent({ type: 'end', camera: 'food', zones: ['food'], startSec: 1_700_000_000, endSec: 1_700_000_005 }),
       { now: () => now, rng: () => 0 },
     );
     // Advance past the transition window so the timer flushes.
@@ -145,7 +145,7 @@ describe('narrator', () => {
     await Promise.resolve();
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries[0]?.activity).toBe('food');
     vi.useRealTimers();
   });
 
@@ -273,34 +273,31 @@ describe('narrator', () => {
     vi.useRealTimers();
   });
 
-  it('wheel entries within WHEEL_DEDUPE_WINDOW_MS merge into one row; entries further apart stay distinct', async () => {
-    // Two wheel events 13s apart (within the 20s dedupe window) merge into ONE
-    // row with accumulated distance. This replaces the old "never coalesces"
-    // assertion — wheel entries DO now merge when Frigate rapid-fires two
-    // consecutive tracks within the same physical session.
-    vi.useFakeTimers();
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+  it('wheel motion sessions within WHEEL_DEDUPE_WINDOW_MS merge into one row; sessions further apart stay distinct', async () => {
+    // Two wheel motion sessions 13s apart (within the 20s dedupe window) merge
+    // into ONE row with accumulated distance.
+    const { handleWheelMotionSession, resetNarratorState } =
       await import('../src/narrator.js');
     const db = await import('../src/db.js');
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 500 });
     resetNarratorState();
-    await seedCameras();
+    const cam = db.createCamera({ name: 'wheel-cam', emoji: '🎡', stream_url: 'rtsp://x/w', enabled: true,
+      wheel_avg_speed_mps: 1.0 });
+    db.setSetting('pet_name', 'Remy');
 
     const t0 = 1_700_000_000_000;
-    await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_003 }),
-      { now: () => t0, rng: () => 0 },
+    const deps = { now: () => t0, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // First session: 3s duration.
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 3_000, peakEnergy: 50, meanEnergy: 30 },
+      deps,
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
     // 13s later — within the 20s dedupe window → merged into the first row.
-    await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: 1_700_000_010, endSec: 1_700_000_013 }),
-      { now: () => t0 + 13_000, rng: () => 0 },
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t0 + 10_000, endedAt: t0 + 13_000, peakEnergy: 55, meanEnergy: 35 },
+      { ...deps, now: () => t0 + 13_000 },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     // Within-window → merged: exactly ONE row.
@@ -309,7 +306,9 @@ describe('narrator', () => {
     // The merged row has a merged_sessions counter.
     const details = JSON.parse(entries[0]?.details ?? '{}') as Record<string, unknown>;
     expect(details['merged_sessions']).toBe(1);
-    vi.useRealTimers();
+    // Accumulated wheel_meters: (3 + 3) * 1.0 mps = 6m total.
+    expect(typeof details['wheel_meters']).toBe('number');
+    expect((details['wheel_meters'] as number)).toBeGreaterThan(0);
   });
 
   // -------------------------------------------------------------------------
@@ -328,7 +327,7 @@ describe('narrator', () => {
   // calculation come from the same clock source.
   // -------------------------------------------------------------------------
 
-  it('writes a wheel entry even when the server clock is 30s ahead of the Frigate Pi clock', async () => {
+  it('writes a food entry even when the server clock is 30s ahead of the Frigate Pi clock', async () => {
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -349,13 +348,13 @@ describe('narrator', () => {
 
     // 'new' event: server clock is serverNew, but Frigate's start_time = frigateStart.
     await handleFrigateEvent(
-      newEvent({ type: 'new', camera: 'wheel', zones: ['wheel'], startSec: frigateStart }),
+      newEvent({ type: 'new', camera: 'food', zones: ['food'], startSec: frigateStart }),
       { now: () => serverNew, rng: () => 0 },
     );
 
     // 'end' event: server clock is serverEnd, Frigate's end_time = frigateEnd.
     await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: frigateStart, endSec: frigateEnd }),
+      newEvent({ type: 'end', camera: 'food', zones: ['food'], startSec: frigateStart, endSec: frigateEnd }),
       { now: () => serverEnd, rng: () => 0 },
     );
 
@@ -366,7 +365,7 @@ describe('narrator', () => {
     const entries = db.listDiaryEntriesBetween(0, serverEnd + 1_000_000);
     // Entry MUST be present — clock skew must not cause a silent drop.
     expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries[0]?.activity).toBe('food');
     // Duration should be the Frigate-clocked run time, not the skewed difference.
     expect(entries[0]?.duration_ms).toBe((frigateEnd - frigateStart) * 1000); // 300_000 ms
     vi.useRealTimers();
@@ -393,12 +392,12 @@ describe('narrator', () => {
     const serverEnd = frigateEnd   * 1000 + skewMs;
 
     await handleFrigateEvent(
-      newEvent({ type: 'new', camera: 'wheel', zones: ['wheel'], startSec: frigateStart }),
+      newEvent({ type: 'new', camera: 'food', zones: ['food'], startSec: frigateStart }),
       { now: () => serverNew, rng: () => 0 },
     );
 
     await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: frigateStart, endSec: frigateEnd }),
+      newEvent({ type: 'end', camera: 'food', zones: ['food'], startSec: frigateStart, endSec: frigateEnd }),
       { now: () => serverEnd, rng: () => 0 },
     );
 
@@ -407,7 +406,7 @@ describe('narrator', () => {
 
     const entries = db.listDiaryEntriesBetween(0, serverEnd + 1_000_000);
     expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries[0]?.activity).toBe('food');
     expect(entries[0]?.duration_ms).toBe((frigateEnd - frigateStart) * 1000); // 60_000 ms
     vi.useRealTimers();
   });
@@ -419,6 +418,8 @@ describe('narrator', () => {
 
 describe('exploring dwell gate (by-design noise suppression)', () => {
   it('drops an exploring visit shorter than exploringMinDwellMs (60s default)', async () => {
+    // Wheel zone events are suppressed by the motion-energy gate; use a neutral
+    // camera so the Frigate 'end' event is classified as 'exploring'.
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -426,33 +427,29 @@ describe('exploring dwell gate (by-design noise suppression)', () => {
     // Use default 60s exploring min-dwell.
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 2000, exploringMinDwellMs: 60_000 });
     resetNarratorState();
-    await seedCameras();
+
+    // Neutral camera — no zone keyword in name, so zones:[] → 'exploring'.
+    db.createCamera({ name: 'cam-neutral', emoji: '📷', stream_url: 'rtsp://x/n', enabled: true });
+    db.setSetting('pet_name', 'Remy');
 
     const t0 = 1_700_100_000_000;
-    // 40s dwell in open space (no named zone) — must be suppressed.
+    // 40s dwell in open space (no named zone) — below the 60s exploring threshold.
     await handleFrigateEvent(
       newEvent({
         type: 'end',
-        camera: 'wheel', // camera keyword gives 'wheel' if zones empty → use neutral test
-        zones: [], // overriding: classifyZones on 'wheel' camera gives 'wheel' not 'exploring'!
-        // So we need a camera that has no keyword match. Re-use food camera with a
-        // trick: override with a camera name that has no keyword so we land on 'exploring'.
-        // This is actually not possible with `seedCameras()` — so override the camera name inline.
+        camera: 'cam-neutral',
+        zones: [],
         startSec: 1_700_100_000,
-        endSec: 1_700_100_040, // 40s
+        endSec: 1_700_100_040, // 40s < 60s threshold
       }),
       { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
     );
     await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
-    // Camera 'wheel' has keyword 'wheel', so this comes through as 'wheel' not 'exploring'.
-    // The meaningful assertion: a 40s wheel entry at minDwellMs=2000 DOES appear.
-    // Exploring suppression is tested with a neutral camera below.
+    // 40s < 60s → exploring entry dropped.
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    // wheel at 40s, minDwellMs=2000 → entry present
-    expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries.length).toBe(0);
     vi.useRealTimers();
   });
 
@@ -594,23 +591,23 @@ describe('narrator — update-opened visit with clock-skewed end', () => {
 
     // 'new' — no zones, opens exploring visit anchored at startMs (Pi clock).
     await handleFrigateEvent(
-      newEvent({ type: 'new', camera: 'wheel', zones: [], startSec: frigateTrackStart }),
+      newEvent({ type: 'new', camera: 'food', zones: [], startSec: frigateTrackStart }),
       { now: () => serverNew, rng: () => 0, onEntryWritten: async () => {} },
     );
 
-    // 'update' — pet enters wheel zone mid-track. Opens wheel visit anchored at nowMs (server).
+    // 'update' — pet enters food zone mid-track. Opens food visit anchored at nowMs (server).
     await handleFrigateEvent(
-      newEvent({ type: 'update', camera: 'wheel', zones: ['wheel'] }),
+      newEvent({ type: 'update', camera: 'food', zones: ['food'] }),
       { now: () => serverUpdate, rng: () => 0, onEntryWritten: async () => {} },
     );
 
-    // 'end' — closedAt = endMs (Pi clock). For the update-opened wheel visit:
+    // 'end' — closedAt = endMs (Pi clock). For the update-opened food visit:
     //   rawDuration = endMs - serverUpdate = frigateTrackEnd*1000 - (frigateZoneEnter*1000 + skewMs)
     //               = (1_700_500_070 - 1_700_500_010)*1000 - 40_000
     //               = 60_000 - 40_000 = 20_000ms (positive! dwell 20s > 2s threshold)
     // But if skew were 80s instead, rawDuration = 60_000 - 80_000 = -20_000 → clamped to 0.
     await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: frigateTrackStart, endSec: frigateTrackEnd }),
+      newEvent({ type: 'end', camera: 'food', zones: ['food'], startSec: frigateTrackStart, endSec: frigateTrackEnd }),
       { now: () => serverEnd, rng: () => 0, onEntryWritten: async () => {} },
     );
 
@@ -619,10 +616,10 @@ describe('narrator — update-opened visit with clock-skewed end', () => {
 
     // With 40s skew and 60s zone dwell: duration = 60_000 - 40_000 = 20_000ms > 2_000ms → entry present.
     const entries = db.listDiaryEntriesBetween(0, serverEnd + 1_000_000);
-    const wheelEntries = entries.filter((e) => e.activity === 'wheel');
-    expect(wheelEntries.length).toBe(1);
+    const foodEntries = entries.filter((e) => e.activity === 'food');
+    expect(foodEntries.length).toBe(1);
     // Duration is positive (clamped) not negative.
-    expect(wheelEntries[0]?.duration_ms).toBeGreaterThanOrEqual(0);
+    expect(foodEntries[0]?.duration_ms).toBeGreaterThanOrEqual(0);
     vi.useRealTimers();
   });
 
@@ -787,58 +784,39 @@ describe('narrator multi-camera dedup', () => {
     vi.useRealTimers();
   });
 
-  it('two overlapping cameras on the wheel → exactly one diary entry (always-on odometer model)', async () => {
-    // With always-on odometers, there is no per-visit session to start/stop.
-    // The narrator takes a snapshot on visit-open and a snapshot on visit-close.
-    // Two cameras arriving for the same wheel zone must produce exactly ONE entry.
-    const spawnMock = vi.fn(() => makeFakeProc());
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    process.env['FRIGATE_URL'] = 'http://frigate:5000';
-
+  it('two overlapping cameras on the wheel — Frigate zone events produce NO wheel diary entries (motion-energy detector owns wheel)', async () => {
+    // Since migration 0024, wheel diary entries come exclusively from the
+    // motion-energy detector (wheel-motion.ts). Frigate zone events for the
+    // 'wheel' zone are silently ignored by the narrator.
+    vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { initWheelOdometers, resetOdometersForTests } = await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
     await seedOverlappingWheelCameras(['cam-a', 'cam-b']);
 
-    // Start always-on odometers for both cameras (2 ffmpeg spawns).
-    initWheelOdometers();
-    expect(spawnMock).toHaveBeenCalledTimes(2);
-
-    vi.useFakeTimers();
     const t0 = 1_700_000_000_000;
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // cam-a fires first — visit opens, opening snapshot taken from cam-a's odometer.
+    // Two cameras both reporting wheel zone.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
-
-    // cam-b fires next for same activity → visit already open, no second odomCameraId taken.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-b', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
 
-    // cam-a ends — but cam-b is still active, so no flush yet.
     now = t0 + 5_000;
     await handleFrigateEvent(newEvent({ type: 'end', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }), deps);
-    expect(db.listDiaryEntriesBetween(0, t0 + 1_000_000).length).toBe(0); // no entry yet
-
-    // cam-b ends — now the activity truly ends.
     await handleFrigateEvent(newEvent({ type: 'end', camera: 'cam-b', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }), deps);
 
-    // Advance past transition window to flush.
     await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
+    // Wheel zone events from Frigate no longer produce diary entries.
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries.length).toBe(0);
 
-    resetOdometersForTests();
     vi.useRealTimers();
-    vi.doUnmock('node:child_process');
   });
 
   it('sequential A→B move → still one transition entry (existing behavior preserved)', async () => {
@@ -875,7 +853,7 @@ describe('narrator multi-camera dedup', () => {
     expect(db.listDiaryEntriesBetween(0, t0 + 1_000_000).length).toBe(1);
   });
 
-  it('single-camera behavior is unchanged — standalone wheel entry after window', async () => {
+  it('single-camera wheel Frigate zone event produces no diary entry (motion-energy detector owns wheel)', async () => {
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -898,54 +876,33 @@ describe('narrator multi-camera dedup', () => {
     await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
+    // Wheel zone events from Frigate produce no diary entries.
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries.length).toBe(0);
     vi.useRealTimers();
   });
 
-  it('odometer-disabled cam-a + odometer-enabled cam-b → snapshot taken from cam-b', async () => {
-    // With always-on odometers, only cam-b has a running odometer (cam-a disabled).
-    // The visit-open snapshot should be taken from cam-b's odometer.
-    // The resulting diary entry should exist with the distance from cam-b.
-    const spawnMock = vi.fn(() => makeFakeProc());
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    process.env['FRIGATE_URL'] = 'http://frigate:5000';
-
+  it('wheel zone events from two cameras: Frigate zone events are silently ignored regardless of odometry config', async () => {
+    // Since migration 0024, wheel diary entries come from the motion-energy detector
+    // only. Frigate zone events for 'wheel' produce no diary entries regardless of
+    // which cameras report them.
+    vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
-    const { initWheelOdometers, getRotationSnapshot, resetOdometersForTests } =
-      await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
 
     setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
-    // cam-a has odometry disabled, cam-b has it enabled.
     const ids = await seedOverlappingWheelCameras(['cam-b']);
+    void ids; // camAId and camBId not needed for this assertion
 
-    // Start always-on odometers — only cam-b has wheel_mark_enabled, so only 1 spawn.
-    initWheelOdometers();
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-
-    // cam-b's odometer is running, cam-a's is not.
-    expect(getRotationSnapshot(ids.camBId)).not.toBeNull();
-    expect(getRotationSnapshot(ids.camAId)).toBeNull();
-
-    vi.useFakeTimers();
     const t0 = 1_700_000_000_000;
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // Disabled cam-a fires first — visit opens, but snapshot will be null (no odometer).
-    // The narrator falls back gracefully: cam-a has no running odometer, so when the
-    // second camera (cam-b) fires it fills in the snapshot from cam-b's odometer.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
-
-    // Enabled cam-b fires for same activity — visit already open, fills in odometer from cam-b.
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-b', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
 
-    // Both cameras end.
     now = t0 + 5_000;
     await handleFrigateEvent(newEvent({ type: 'end', camera: 'cam-a', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }), deps);
     await handleFrigateEvent(newEvent({ type: 'end', camera: 'cam-b', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }), deps);
@@ -954,12 +911,9 @@ describe('narrator multi-camera dedup', () => {
     await Promise.resolve();
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries.length).toBe(0);
 
-    resetOdometersForTests();
     vi.useRealTimers();
-    vi.doUnmock('node:child_process');
   });
 
   // -------------------------------------------------------------------------
@@ -967,10 +921,11 @@ describe('narrator multi-camera dedup', () => {
   // -------------------------------------------------------------------------
 
   it('mid-track zone entry: update event moving into a named zone produces an entry immediately', async () => {
-    // The core bug being fixed: hamster enters wheel zone mid-track (via update)
-    // and the wheel visit should be emitted when the object later leaves the zone.
-    // Use a neutral camera name ('cam-wide') so zone detection comes only from
-    // current_zones, not from the camera name keyword fallback.
+    // Hamster enters food zone mid-track (via update event) and the food visit
+    // should be emitted when the object later leaves the zone. Uses a neutral
+    // camera name so zone detection comes only from current_zones.
+    // (Wheel zone is intentionally not tested here — it is owned by the
+    // motion-energy detector and Frigate zone events for 'wheel' are ignored.)
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -989,27 +944,26 @@ describe('narrator multi-camera dedup', () => {
     // Track starts: object born in open space (exploring).
     await handleFrigateEvent(newEvent({ type: 'new', camera: 'cam-wide', zones: [], startSec: 1_700_000_000 }), deps);
 
-    // 2s later: object moves into the wheel zone (update event).
+    // 2s later: object moves into the food zone (update event).
     now = t0 + 2_000;
-    await handleFrigateEvent(newEvent({ type: 'update', camera: 'cam-wide', zones: ['wheel'] }), deps);
+    await handleFrigateEvent(newEvent({ type: 'update', camera: 'cam-wide', zones: ['food'] }), deps);
 
-    // 5s later: object moves back out of the wheel zone (update: zones empty again).
-    // This closes the wheel visit (mid-track close → emit immediately).
+    // 5s later: object moves back out of the food zone (update: zones empty again).
+    // This closes the food visit (mid-track close → emit immediately).
     now = t0 + 7_000;
     const writtenOnLeave = await handleFrigateEvent(
       newEvent({ type: 'update', camera: 'cam-wide', zones: [] }),
       deps,
     );
-    // The wheel visit closed (5s dwell > 500ms) → immediate entry.
+    // The food visit closed (5s dwell > 500ms) → immediate entry.
     expect(writtenOnLeave.length).toBe(1);
-    expect(writtenOnLeave[0]?.activity).toBe('wheel');
+    expect(writtenOnLeave[0]?.activity).toBe('food');
     expect(writtenOnLeave[0]?.duration_ms).toBe(5_000);
 
-    // DB check: one wheel entry emitted mid-track (exploring may also be there
-    // after the transition, but we care the wheel is present).
+    // DB check: one food entry emitted mid-track.
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    const wheelEntries = entries.filter((e) => e.activity === 'wheel');
-    expect(wheelEntries.length).toBe(1);
+    const foodEntries = entries.filter((e) => e.activity === 'food');
+    expect(foodEntries.length).toBe(1);
 
     vi.useRealTimers();
   });
@@ -1027,22 +981,22 @@ describe('narrator multi-camera dedup', () => {
     let now = t0;
     const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // Object enters wheel zone.
-    await handleFrigateEvent(newEvent({ type: 'new', camera: 'wheel', zones: ['wheel'], startSec: 1_700_000_000 }), deps);
+    // Object enters food zone (wheel is now owned by motion-energy detector).
+    await handleFrigateEvent(newEvent({ type: 'new', camera: 'food', zones: ['food'], startSec: 1_700_000_000 }), deps);
 
     // Frigate fires many updates all reporting the same zone — no new entries.
     for (let i = 1; i <= 10; i++) {
       now = t0 + i * 200;
-      await handleFrigateEvent(newEvent({ type: 'update', camera: 'wheel', zones: ['wheel'] }), deps);
+      await handleFrigateEvent(newEvent({ type: 'update', camera: 'food', zones: ['food'] }), deps);
     }
 
     // After 10 updates, still no entries written.
     expect(db.listDiaryEntriesBetween(0, t0 + 1_000_000).length).toBe(0);
 
-    // Track ends → defers wheel entry.
+    // Track ends → defers food entry.
     now = t0 + 5_000;
     await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: 1_700_000_000, endSec: 1_700_000_005 }),
+      newEvent({ type: 'end', camera: 'food', zones: ['food'], startSec: 1_700_000_000, endSec: 1_700_000_005 }),
       deps,
     );
     await vi.advanceTimersByTimeAsync(200);
@@ -1051,7 +1005,7 @@ describe('narrator multi-camera dedup', () => {
     // Exactly ONE entry despite 10+ updates.
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries[0]?.activity).toBe('food');
 
     vi.useRealTimers();
   });
@@ -1166,10 +1120,10 @@ describe('narrator multi-camera dedup', () => {
     await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
+    // Wheel zone events from Frigate are silently ignored — only food entry written.
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    expect(entries.length).toBe(2);
-    const activities = entries.map((e) => e.activity).sort();
-    expect(activities).toEqual(['food', 'wheel']);
+    expect(entries.length).toBe(1);
+    expect(entries[0]?.activity).toBe('food');
     vi.useRealTimers();
   });
 
@@ -1217,8 +1171,9 @@ describe('narrator multi-camera dedup', () => {
     await vi.advanceTimersByTimeAsync(200);
     await Promise.resolve();
 
+    // Wheel zone end is silently ignored — only the food entry is in the DB.
     entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    expect(entries.length).toBe(2);
+    expect(entries.length).toBe(1);
     vi.useRealTimers();
   });
 
@@ -1391,11 +1346,11 @@ describe('cameraIdByName — live_src resolution', () => {
 
   it('falls back to name match when live_src is null', async () => {
     const db = await import('../src/db.js');
-    // Camera with no live_src configured.
+    // Camera with no live_src configured — Frigate sends cameras.name as camera id.
     const cam = db.createCamera({
-      name: 'wheel',
-      emoji: '🎡',
-      stream_url: 'rtsp://x/wheel',
+      name: 'food-bowl',
+      emoji: '🥕',
+      stream_url: 'rtsp://x/food',
       enabled: true,
     });
     db.setSetting('pet_name', 'Remy');
@@ -1409,7 +1364,7 @@ describe('cameraIdByName — live_src resolution', () => {
     const t0 = 1_700_001_000_000;
     // Frigate camera name matches cameras.name exactly (legacy single-cam setup).
     await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel', zones: ['wheel'], startSec: 1_700_001_000, endSec: 1_700_001_005 }),
+      newEvent({ type: 'end', camera: 'food-bowl', zones: ['food'], startSec: 1_700_001_000, endSec: 1_700_001_005 }),
       { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
     );
     await vi.advanceTimersByTimeAsync(200);
@@ -1522,144 +1477,119 @@ describe('cameraIdByName — live_src resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Always-on odometer wiring — narrator correctly takes snapshots and writes
-// wheel_meters / rotations into diary entry details.
+// handleWheelMotionSession — motion-energy detector integration tests
 //
-// With the always-on model, the odometer is never started or stopped per-visit.
-// The narrator takes an opening snapshot when a wheel zone opens and a closing
-// snapshot when it closes, then writes the delta into details.
+// Wheel diary entries now come exclusively from the motion-energy detector.
+// These tests verify the handleWheelMotionSession API in narrator.ts.
 // ---------------------------------------------------------------------------
 
-describe('wheel odometer — always-on snapshot wiring in narrator', () => {
-  it('wheel_mark_enabled=1 with no live_src: no snapshot available, entry written with 0 distance', async () => {
-    // initWheelOdometers skips cameras with no live_src. The narrator gracefully
-    // falls back to 0 distance when getRotationSnapshot returns null.
-    vi.useFakeTimers();
-
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+describe('handleWheelMotionSession — motion-energy detector integration', () => {
+  it('creates a new diary entry with correct wheel_meters and mean_motion_energy in details', async () => {
+    const { handleWheelMotionSession, resetNarratorState } =
       await import('../src/narrator.js');
-    const { getRotationSnapshot } = await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
-
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
 
-    // Camera has wheel mark enabled but live_src is not set — initWheelOdometers
-    // will skip it and getRotationSnapshot will return null.
     const cam = db.createCamera({
-      name: 'wheel-no-src',
+      name: 'wheel-cam',
       emoji: '🎡',
       stream_url: 'rtsp://x/wheel',
-      // live_src deliberately omitted
       enabled: true,
-      wheel_mark_enabled: true,
-      wheel_diameter_mm: 152.0,
-      wheel_band_y_pct: 50.0,
-      wheel_band_height_pct: 10.0,
-      wheel_threshold_pct: 50.0,
+      wheel_avg_speed_mps: 2.0, // 2 m/s
     });
     db.setSetting('pet_name', 'Remy');
-
-    // No initWheelOdometers call — getRotationSnapshot returns null for this camera.
-    expect(getRotationSnapshot(cam.id)).toBeNull();
 
     const t0 = 1_700_010_000_000;
-    let now = t0;
-    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+    const durationMs = 10_000; // 10s × 2 m/s = 20m
 
-    // Zone opens — narrator takes opening snapshot: null (no odometer running).
-    await handleFrigateEvent(
-      newEvent({ type: 'new', camera: 'wheel-no-src', zones: ['wheel'], startSec: 1_700_010_000 }),
-      deps,
+    const entry = await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + durationMs, peakEnergy: 80, meanEnergy: 45 },
+      { now: () => t0 + durationMs, rng: () => 0, onEntryWritten: async () => {} },
     );
 
-    // Zone closes after a meaningful dwell.
-    now = t0 + 30_000;
-    await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel-no-src', zones: ['wheel'], startSec: 1_700_010_000, endSec: 1_700_010_030 }),
-      deps,
-    );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
+    expect(entry).not.toBeNull();
+    expect(entry?.activity).toBe('wheel');
+    expect(entry?.duration_ms).toBe(durationMs);
 
-    // Entry IS written (wheel run happened even without odometry).
-    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
-
-    // wheel_meters and rotations are always written — 0 when no snapshot was available.
-    const details = entries[0]?.details
-      ? (JSON.parse(entries[0].details) as Record<string, unknown>)
-      : {};
-    expect(details['wheel_meters']).toBe(0);
-    expect(details['rotations']).toBe(0);
-
-    vi.useRealTimers();
+    const details = JSON.parse(entry?.details ?? '{}') as Record<string, unknown>;
+    expect(details['wheel_meters']).toBeCloseTo(20.0, 5);
+    expect(details['mean_motion_energy']).toBe(45);
+    expect(typeof details['camera']).toBe('string');
   });
 
-  it('wheel_mark_enabled=1 with live_src set: always-on odometer running, opening snapshot taken', async () => {
-    // With the always-on model, the odometer is started via initWheelOdometers
-    // at app startup. The narrator reads snapshots at visit open/close time.
-    const spawnMock = vi.fn(() => makeFakeProc());
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-    vi.useFakeTimers();
-
-    process.env['FRIGATE_URL'] = 'http://frigate:5000';
-
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+  it('dedupe: two sessions 10s apart produce one merged row with accumulated wheel_meters', async () => {
+    const { handleWheelMotionSession, resetNarratorState } =
       await import('../src/narrator.js');
-    const { initWheelOdometers, getRotationSnapshot, resetOdometersForTests } =
-      await import('../src/wheel-odometer.js');
     const db = await import('../src/db.js');
-
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
 
     const cam = db.createCamera({
-      name: 'wheel-with-src',
+      name: 'wheel-cam',
       emoji: '🎡',
       stream_url: 'rtsp://x/wheel',
-      live_src: 'wheel_cam',
       enabled: true,
-      wheel_mark_enabled: true,
-      wheel_diameter_mm: 152.0,
-      wheel_band_y_pct: 50.0,
-      wheel_band_height_pct: 10.0,
-      wheel_threshold_pct: 50.0,
+      wheel_avg_speed_mps: 1.0,
     });
     db.setSetting('pet_name', 'Remy');
 
-    // Start always-on odometer.
-    initWheelOdometers();
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-    // Odometer is running — snapshot available.
-    expect(getRotationSnapshot(cam.id)).not.toBeNull();
+    const t0 = 1_700_020_000_000;
+    // First session: 5s.
+    const first = await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 5_000, peakEnergy: 60, meanEnergy: 40 },
+      { now: () => t0 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    expect(first).not.toBeNull();
 
-    const t0 = 1_700_011_000_000;
-    let now = t0;
-    const deps = { now: () => now, rng: () => 0 as number, onEntryWritten: async () => {} };
+    // Second session 10s after first ended — within 20s dedupe window.
+    const t1 = t0 + 15_000;
+    const merged = await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t1, endedAt: t1 + 5_000, peakEnergy: 65, meanEnergy: 42 },
+      { now: () => t1 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    expect(merged?.id).toBe(first?.id);
 
-    // Zone opens — narrator takes opening snapshot (non-null, epoch 0).
-    await handleFrigateEvent(
-      newEvent({ type: 'new', camera: 'wheel_cam', zones: ['wheel'], startSec: 1_700_011_000 }),
-      deps,
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+    const det = JSON.parse(entries[0]!.details ?? '{}') as Record<string, unknown>;
+    // Accumulated: 5s + 5s = 10s × 1 m/s = 10m total.
+    expect((det['wheel_meters'] as number)).toBeCloseTo(10.0, 4);
+    expect(det['merged_sessions']).toBe(1);
+  });
+
+  it('two sessions 30s apart produce two separate rows', async () => {
+    const { handleWheelMotionSession, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    resetNarratorState();
+
+    const cam = db.createCamera({
+      name: 'wheel-cam',
+      emoji: '🎡',
+      stream_url: 'rtsp://x/wheel',
+      enabled: true,
+      wheel_avg_speed_mps: 1.0,
+    });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_700_030_000_000;
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 5_000, peakEnergy: 60, meanEnergy: 40 },
+      { now: () => t0 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
     );
 
-    // Zone closes.
-    now = t0 + 30_000;
-    await handleFrigateEvent(
-      newEvent({ type: 'end', camera: 'wheel_cam', zones: ['wheel'], startSec: 1_700_011_000, endSec: 1_700_011_030 }),
-      deps,
+    // 30s later — outside the 20s dedupe window.
+    const t1 = t0 + 30_000;
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t1, endedAt: t1 + 5_000, peakEnergy: 65, meanEnergy: 42 },
+      { now: () => t1 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
-    // Always-on odometer is still running after visit closes.
-    expect(getRotationSnapshot(cam.id)).not.toBeNull();
-
-    resetOdometersForTests();
-    vi.useRealTimers();
-    vi.doUnmock('node:child_process');
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(2);
+    expect(entries.every((e) => e.activity === 'wheel')).toBe(true);
+    // No merged_sessions on the second row.
+    const det2 = JSON.parse(entries[1]!.details ?? '{}') as Record<string, unknown>;
+    expect(det2['merged_sessions']).toBeUndefined();
   });
 });
 
@@ -1824,8 +1754,9 @@ describe('migration 0021 — backfill diary camera_ids from details JSON', () =>
 
 describe('exploring → defined-zone transition (same track)', () => {
   it('produces BOTH an exploring entry and a distinct zone entry in correct occurred_at order', async () => {
-    // Full happy path: explore for 10s, enter wheel zone for 5s.
-    // Both entries must be written and exploring.occurred_at < wheel.occurred_at.
+    // Full happy path: explore for 10s, enter food zone for 5s.
+    // Both entries must be written and exploring.occurred_at < food.occurred_at.
+    // (Wheel zones are now owned by the motion-energy detector; use food instead.)
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -1846,12 +1777,12 @@ describe('exploring → defined-zone transition (same track)', () => {
       deps,
     );
 
-    // 10 seconds later the hamster enters the wheel zone mid-track.
+    // 10 seconds later the hamster enters the food zone mid-track.
     // This must: close exploring (write it NOW, bypassing exploringMinDwellMs),
-    // then open a new wheel visit.
+    // then open a new food visit.
     now = t0 + 10_000;
     const writtenOnZoneEnter = await handleFrigateEvent(
-      newEvent({ type: 'update', camera: 'cam-wide', zones: ['wheel'] }),
+      newEvent({ type: 'update', camera: 'cam-wide', zones: ['food'] }),
       deps,
     );
 
@@ -1860,15 +1791,15 @@ describe('exploring → defined-zone transition (same track)', () => {
     expect(writtenOnZoneEnter[0]?.activity).toBe('exploring');
     expect(writtenOnZoneEnter[0]?.duration_ms).toBe(10_000);
 
-    // Now the wheel visit is open.  Close it with an update that leaves the zone.
+    // Now the food visit is open. Close it with an update that leaves the zone.
     now = t0 + 15_000;
     const writtenOnZoneLeave = await handleFrigateEvent(
       newEvent({ type: 'update', camera: 'cam-wide', zones: [] }),
       deps,
     );
-    // Wheel visit (5s, > 2s floor) is written immediately on zone exit.
+    // Food visit (5s, > 2s floor) is written immediately on zone exit.
     expect(writtenOnZoneLeave.length).toBe(1);
-    expect(writtenOnZoneLeave[0]?.activity).toBe('wheel');
+    expect(writtenOnZoneLeave[0]?.activity).toBe('food');
     expect(writtenOnZoneLeave[0]?.duration_ms).toBe(5_000);
 
     // DB check: both entries, in occurred_at order.
@@ -1877,8 +1808,8 @@ describe('exploring → defined-zone transition (same track)', () => {
     const sorted = [...entries].sort((a, b) => a.occurred_at - b.occurred_at);
     expect(sorted.length).toBe(2);
     expect(sorted[0]?.activity).toBe('exploring');
-    expect(sorted[1]?.activity).toBe('wheel');
-    // exploring.occurred_at < wheel.occurred_at
+    expect(sorted[1]?.activity).toBe('food');
+    // exploring.occurred_at < food.occurred_at
     expect(sorted[0]!.occurred_at).toBeLessThan(sorted[1]!.occurred_at);
 
     vi.useRealTimers();
@@ -1938,7 +1869,8 @@ describe('exploring → defined-zone transition (same track)', () => {
 
   it('short exploring interrupted by a zone still writes the exploring entry (bypasses exploringMinDwellMs)', async () => {
     // Operator specifically wants this: even a 3s exploring spell before the
-    // pet enters a wheel zone must produce a diary entry.
+    // pet enters a food zone must produce a diary entry.
+    // (Wheel zones are now owned by the motion-energy detector; use food instead.)
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -1960,9 +1892,9 @@ describe('exploring → defined-zone transition (same track)', () => {
       deps,
     );
     now = t0 + 3_000;
-    // Pet immediately enters wheel zone — proof that the 3s of exploring was real.
+    // Pet immediately enters food zone — proof that the 3s of exploring was real.
     const writtenOnZoneEnter = await handleFrigateEvent(
-      newEvent({ type: 'update', camera: 'cam-wide', zones: ['wheel'] }),
+      newEvent({ type: 'update', camera: 'cam-wide', zones: ['food'] }),
       deps,
     );
 
@@ -1977,6 +1909,7 @@ describe('exploring → defined-zone transition (same track)', () => {
   it('anti-flicker floor: exploring visit < 2s before zone entry is still suppressed', async () => {
     // A 1s "exploring" blip that immediately classifies into a zone is too
     // short to be meaningful — suppress it (Frigate artefact, not real dwell).
+    // (Wheel zones are now owned by the motion-energy detector; use food instead.)
     vi.useFakeTimers();
     const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
       await import('../src/narrator.js');
@@ -1998,26 +1931,26 @@ describe('exploring → defined-zone transition (same track)', () => {
     );
     now = t0 + 1_000; // 1s < minDwellMs=2s → suppressed even with interruptedByZone
     const writtenOnZoneEnter = await handleFrigateEvent(
-      newEvent({ type: 'update', camera: 'cam-wide', zones: ['wheel'] }),
+      newEvent({ type: 'update', camera: 'cam-wide', zones: ['food'] }),
       deps,
     );
 
     // Below the 2s floor → suppressed.
     expect(writtenOnZoneEnter.length).toBe(0);
 
-    // The wheel visit opened correctly regardless.
+    // The food visit opened correctly regardless.
     now = t0 + 8_000;
     const writtenOnLeave = await handleFrigateEvent(
       newEvent({ type: 'update', camera: 'cam-wide', zones: [] }),
       deps,
     );
     expect(writtenOnLeave.length).toBe(1);
-    expect(writtenOnLeave[0]?.activity).toBe('wheel');
+    expect(writtenOnLeave[0]?.activity).toBe('food');
 
-    // DB: only the wheel entry (exploring suppressed).
+    // DB: only the food entry (exploring suppressed).
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries[0]?.activity).toBe('food');
 
     vi.useRealTimers();
   });
@@ -2225,8 +2158,8 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     await handleFrigateEvent(
       newEvent({
         type: 'end',
-        camera: 'wheel',
-        zones: ['wheel'],
+        camera: 'food',
+        zones: ['food'],
         startSec: 1_720_002_000,
         endSec: 1_720_002_030,
         has_snapshot: true,
@@ -2240,7 +2173,7 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries[0]?.activity).toBe('food');
     vi.useRealTimers();
   });
 
@@ -2294,8 +2227,8 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     await handleFrigateEvent(
       newEvent({
         type: 'new',
-        camera: 'wheel',
-        zones: ['wheel'],
+        camera: 'food',
+        zones: ['food'],
         startSec: 1_720_004_000,
         has_snapshot: false,
         has_clip: false,
@@ -2309,8 +2242,8 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     await handleFrigateEvent(
       newEvent({
         type: 'update',
-        camera: 'wheel',
-        zones: ['wheel'],
+        camera: 'food',
+        zones: ['food'],
         startSec: 1_720_004_000,
         has_snapshot: true,
         has_clip: false,
@@ -2324,8 +2257,8 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     await handleFrigateEvent(
       newEvent({
         type: 'end',
-        camera: 'wheel',
-        zones: ['wheel'],
+        camera: 'food',
+        zones: ['food'],
         startSec: 1_720_004_000,
         endSec: 1_720_004_030,
         has_snapshot: true,
@@ -2340,7 +2273,7 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
     // Entry must be written — snapshot was confirmed on the 'update'.
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
-    expect(entries[0]?.activity).toBe('wheel');
+    expect(entries[0]?.activity).toBe('food');
     vi.useRealTimers();
   });
 
@@ -2534,148 +2467,135 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
 // Wheel diary-entry dedupe (WHEEL_DEDUPE_WINDOW_MS = 20s)
 // ---------------------------------------------------------------------------
 
+// Wheel diary-entry dedupe via handleWheelMotionSession (motion-energy detector path)
+// ---------------------------------------------------------------------------
+
 describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
-  it("two wheel events on the same camera within 20s merge into one row", async () => {
-    vi.useFakeTimers();
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+  it("two wheel motion sessions on the same camera within 20s merge into one row", async () => {
+    const { handleWheelMotionSession, resetNarratorState } =
       await import("../src/narrator.js");
     const db = await import("../src/db.js");
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
-    await seedCameras();
+    const cam = db.createCamera({ name: "wheel-cam", emoji: "🎡", stream_url: "rtsp://x/w",
+      enabled: true, wheel_avg_speed_mps: 1.0 });
+    db.setSetting("pet_name", "Remy");
 
     const t0 = 1_730_000_000_000;
-    await handleFrigateEvent(
-      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: 1_730_000_000, endSec: 1_730_000_005 }),
-      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+    const deps = { now: () => t0, rng: () => 0 as number, onEntryWritten: async () => {} };
+
+    // First session: ends at t0.
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t0 - 5_000, endedAt: t0, peakEnergy: 50, meanEnergy: 30 },
+      deps,
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
     let entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
     const firstId = entries[0]!.id;
 
+    // Second session 10s later — within the 20s dedupe window.
     const t1 = t0 + 10_000;
-    await handleFrigateEvent(
-      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: 1_730_000_010, endSec: 1_730_000_013 }),
-      { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t1 - 3_000, endedAt: t1, peakEnergy: 55, meanEnergy: 35 },
+      { ...deps, now: () => t1 },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
     entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
     expect(entries[0]!.id).toBe(firstId);
-    expect(entries[0]!.occurred_at).toBe(1_730_000_013_000);
+    expect(entries[0]!.occurred_at).toBe(t1);
     const details = JSON.parse(entries[0]!.details ?? "{}") as Record<string, unknown>;
     expect(typeof details["wheel_meters"]).toBe("number");
-    expect(typeof details["rotations"]).toBe("number");
     expect(details["merged_sessions"]).toBe(1);
-    vi.useRealTimers();
   });
 
-  it("two wheel events on the same camera more than 20s apart produce two distinct rows", async () => {
-    vi.useFakeTimers();
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+  it("two wheel motion sessions on the same camera more than 20s apart produce two distinct rows", async () => {
+    const { handleWheelMotionSession, resetNarratorState } =
       await import("../src/narrator.js");
     const db = await import("../src/db.js");
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
-    await seedCameras();
+    const cam = db.createCamera({ name: "wheel-cam", emoji: "🎡", stream_url: "rtsp://x/w",
+      enabled: true, wheel_avg_speed_mps: 1.0 });
+    db.setSetting("pet_name", "Remy");
 
     const t0 = 1_730_100_000_000;
-    await handleFrigateEvent(
-      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: 1_730_100_000, endSec: 1_730_100_005 }),
+
+    // First session ends at t0.
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t0 - 5_000, endedAt: t0, peakEnergy: 50, meanEnergy: 30 },
       { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
+    // Second session 25s later — outside the 20s dedupe window.
     const t1 = t0 + 25_000;
-    await handleFrigateEvent(
-      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: 1_730_100_025, endSec: 1_730_100_030 }),
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: t1 - 5_000, endedAt: t1, peakEnergy: 55, meanEnergy: 35 },
       { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(2);
     expect(entries.every((e) => e.activity === "wheel")).toBe(true);
-    vi.useRealTimers();
   });
 
-  it("two wheel events on DIFFERENT cameras within 20s produce two distinct rows", async () => {
-    vi.useFakeTimers();
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+  it("two wheel motion sessions on DIFFERENT cameras within 20s produce two distinct rows", async () => {
+    const { handleWheelMotionSession, resetNarratorState } =
       await import("../src/narrator.js");
     const db = await import("../src/db.js");
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
-    db.createCamera({ name: "wheel-a", emoji: "A", stream_url: "rtsp://x/wa", live_src: "wheel_a", enabled: true });
-    db.createCamera({ name: "wheel-b", emoji: "B", stream_url: "rtsp://x/wb", live_src: "wheel_b", enabled: true });
+    const camA = db.createCamera({ name: "wheel-a", emoji: "A", stream_url: "rtsp://x/wa",
+      live_src: "wheel_a", enabled: true, wheel_avg_speed_mps: 1.0 });
+    const camB = db.createCamera({ name: "wheel-b", emoji: "B", stream_url: "rtsp://x/wb",
+      live_src: "wheel_b", enabled: true, wheel_avg_speed_mps: 1.0 });
     db.setSetting("pet_name", "Remy");
 
     const t0 = 1_730_200_000_000;
-    await handleFrigateEvent(
-      newEvent({ type: "end", camera: "wheel_a", zones: ["wheel"], startSec: 1_730_200_000, endSec: 1_730_200_005 }),
+    const t1 = t0 + 5_000;
+
+    await handleWheelMotionSession(
+      { cameraId: camA.id, startedAt: t0 - 5_000, endedAt: t0, peakEnergy: 50, meanEnergy: 30 },
       { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
-
-    const t1 = t0 + 5_000;
-    await handleFrigateEvent(
-      newEvent({ type: "end", camera: "wheel_b", zones: ["wheel"], startSec: 1_730_200_005, endSec: 1_730_200_010 }),
+    await handleWheelMotionSession(
+      { cameraId: camB.id, startedAt: t1 - 5_000, endedAt: t1, peakEnergy: 55, meanEnergy: 35 },
       { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(2);
     expect(entries.every((e) => e.activity === "wheel")).toBe(true);
-    vi.useRealTimers();
   });
 
   it("merged row duration never exceeds new_end_time minus first_start_time", async () => {
-    vi.useFakeTimers();
-    const { handleFrigateEvent, setNarratorTuningsForTests, resetNarratorState } =
+    const { handleWheelMotionSession, resetNarratorState } =
       await import("../src/narrator.js");
     const db = await import("../src/db.js");
-    setNarratorTuningsForTests({ transitionWindowMs: 50, minDwellMs: 10 });
     resetNarratorState();
-    await seedCameras();
+    const cam = db.createCamera({ name: "wheel-cam", emoji: "🎡", stream_url: "rtsp://x/w",
+      enabled: true, wheel_avg_speed_mps: 1.0 });
+    db.setSetting("pet_name", "Remy");
 
-    const frigateStart1 = 1_730_300_000;
-    const frigateEnd1   = 1_730_300_005;
-    const t0 = frigateEnd1 * 1000;
-    await handleFrigateEvent(
-      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: frigateStart1, endSec: frigateEnd1 }),
+    const t0 = 1_730_300_005_000; // end of first session
+    const firstStart = t0 - 5_000;
+
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: firstStart, endedAt: t0, peakEnergy: 50, meanEnergy: 30 },
       { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
-    const frigateStart2 = 1_730_300_010;
-    const frigateEnd2   = 1_730_300_018;
-    const t1 = frigateEnd2 * 1000;
-    await handleFrigateEvent(
-      newEvent({ type: "end", camera: "wheel", zones: ["wheel"], startSec: frigateStart2, endSec: frigateEnd2 }),
+    const t1 = t0 + 8_000; // 8s later — within 20s window
+    const secondStart = t1 - 3_000;
+    await handleWheelMotionSession(
+      { cameraId: cam.id, startedAt: secondStart, endedAt: t1, peakEnergy: 55, meanEnergy: 35 },
       { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
     );
-    await vi.advanceTimersByTimeAsync(200);
-    await Promise.resolve();
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
     const merged = entries[0]!;
-    expect(merged.occurred_at).toBe(frigateEnd2 * 1000);
-    const firstStartMs = frigateStart1 * 1000;
-    const maxAllowedDuration = merged.occurred_at - firstStartMs;
+    expect(merged.occurred_at).toBe(t1);
+    const maxAllowedDuration = merged.occurred_at - firstStart;
     expect(merged.duration_ms).toBeLessThanOrEqual(maxAllowedDuration);
     expect(merged.duration_ms).toBeGreaterThan(0);
-    vi.useRealTimers();
   });
 });

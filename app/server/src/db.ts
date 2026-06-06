@@ -61,20 +61,35 @@ export interface CameraRow {
   created_at: number;
   /** Operator-configured zone keywords for this camera (matches narrator vocabulary). */
   zones: string[];
-  /** Whether optical-mark wheel odometry is active for this camera. */
+  /** Whether optical-mark wheel odometry is active for this camera. @deprecated unused since migration 0024 */
   wheel_mark_enabled: 0 | 1;
-  /** Physical wheel diameter in millimetres — used to convert rotations → metres. */
+  /** Physical wheel diameter in millimetres. @deprecated unused since migration 0024 */
   wheel_diameter_mm: number;
-  /** Left edge of the ROI box as a percentage of frame width (0–100). */
+  /** Left edge of the ROI box as a percentage of frame width (0–100). @deprecated unused since migration 0024 */
   wheel_band_x_pct: number;
-  /** ROI box width as a percentage of frame width (0–100). */
+  /** ROI box width as a percentage of frame width (0–100). @deprecated unused since migration 0024 */
   wheel_band_width_pct: number;
-  /** Centre of the sampling band as a percentage of frame height (0–100). */
+  /** Centre of the sampling band as a percentage of frame height (0–100). @deprecated unused since migration 0024 */
   wheel_band_y_pct: number;
-  /** Sampling band height as a percentage of frame height (0–100). */
+  /** Sampling band height as a percentage of frame height (0–100). @deprecated unused since migration 0024 */
   wheel_band_height_pct: number;
-  /** Pixels with mean intensity below `255 * (1 − threshold_pct/100)` are "dark" (0–100). */
+  /** Dark-pixel intensity cutoff as % (0–100). @deprecated unused since migration 0024 */
   wheel_threshold_pct: number;
+  // ---------------------------------------------------------------------------
+  // Motion-energy detector (migration 0024)
+  // ---------------------------------------------------------------------------
+  /** Left edge of the whole-wheel ROI as % of frame width (0–100). NULL = detector disabled. */
+  wheel_motion_roi_x: number | null;
+  /** Top edge of the whole-wheel ROI as % of frame height (0–100). NULL = detector disabled. */
+  wheel_motion_roi_y: number | null;
+  /** Width of the whole-wheel ROI as % of frame width (0–100). NULL = detector disabled. */
+  wheel_motion_roi_w: number | null;
+  /** Height of the whole-wheel ROI as % of frame height (0–100). NULL = detector disabled. */
+  wheel_motion_roi_h: number | null;
+  /** Mean-abs-pixel-diff threshold to classify a frame as "in motion" (0–255 scale). */
+  wheel_motion_threshold: number;
+  /** Calibrated average wheel speed in metres per second (1.0 ≈ 3.6 km/h). */
+  wheel_avg_speed_mps: number;
 }
 
 export interface SnapshotRow {
@@ -453,13 +468,17 @@ function statements(): Statements {
         name, emoji, stream_url, live_src, position, enabled, created_at, zones,
         wheel_mark_enabled, wheel_diameter_mm,
         wheel_band_x_pct, wheel_band_width_pct,
-        wheel_band_y_pct, wheel_band_height_pct, wheel_threshold_pct
+        wheel_band_y_pct, wheel_band_height_pct, wheel_threshold_pct,
+        wheel_motion_roi_x, wheel_motion_roi_y, wheel_motion_roi_w, wheel_motion_roi_h,
+        wheel_motion_threshold, wheel_avg_speed_mps
       )
       VALUES (
         @name, @emoji, @stream_url, @live_src, @position, @enabled, @created_at, @zones,
         @wheel_mark_enabled, @wheel_diameter_mm,
         @wheel_band_x_pct, @wheel_band_width_pct,
-        @wheel_band_y_pct, @wheel_band_height_pct, @wheel_threshold_pct
+        @wheel_band_y_pct, @wheel_band_height_pct, @wheel_threshold_pct,
+        @wheel_motion_roi_x, @wheel_motion_roi_y, @wheel_motion_roi_w, @wheel_motion_roi_h,
+        @wheel_motion_threshold, @wheel_avg_speed_mps
       )
     `),
     cameraUpdate: db.prepare(`
@@ -476,7 +495,13 @@ function statements(): Statements {
              wheel_band_width_pct  = @wheel_band_width_pct,
              wheel_band_y_pct      = @wheel_band_y_pct,
              wheel_band_height_pct = @wheel_band_height_pct,
-             wheel_threshold_pct   = @wheel_threshold_pct
+             wheel_threshold_pct   = @wheel_threshold_pct,
+             wheel_motion_roi_x    = @wheel_motion_roi_x,
+             wheel_motion_roi_y    = @wheel_motion_roi_y,
+             wheel_motion_roi_w    = @wheel_motion_roi_w,
+             wheel_motion_roi_h    = @wheel_motion_roi_h,
+             wheel_motion_threshold = @wheel_motion_threshold,
+             wheel_avg_speed_mps   = @wheel_avg_speed_mps
        WHERE id = @id
     `),
     cameraSetEnabled: db.prepare('UPDATE cameras SET enabled = ? WHERE id = ?'),
@@ -1073,6 +1098,14 @@ function decodeCameraRow(raw: unknown): CameraRow {
       // see "no zones" in the UI and can re-save).
     }
   }
+
+  // Decode motion-detector ROI: SQLite returns NULL as null for INTEGER columns
+  // that have no DEFAULT, which is what we want — null means disabled.
+  const roiX = typeof r.wheel_motion_roi_x === 'number' ? r.wheel_motion_roi_x : null;
+  const roiY = typeof r.wheel_motion_roi_y === 'number' ? r.wheel_motion_roi_y : null;
+  const roiW = typeof r.wheel_motion_roi_w === 'number' ? r.wheel_motion_roi_w : null;
+  const roiH = typeof r.wheel_motion_roi_h === 'number' ? r.wheel_motion_roi_h : null;
+
   return {
     ...r,
     live_src: typeof r.live_src === 'string' && r.live_src.length > 0 ? r.live_src : null,
@@ -1084,6 +1117,12 @@ function decodeCameraRow(raw: unknown): CameraRow {
     wheel_band_y_pct: typeof r.wheel_band_y_pct === 'number' ? r.wheel_band_y_pct : 50.0,
     wheel_band_height_pct: typeof r.wheel_band_height_pct === 'number' ? r.wheel_band_height_pct : 10.0,
     wheel_threshold_pct: typeof r.wheel_threshold_pct === 'number' ? r.wheel_threshold_pct : 50.0,
+    wheel_motion_roi_x: roiX,
+    wheel_motion_roi_y: roiY,
+    wheel_motion_roi_w: roiW,
+    wheel_motion_roi_h: roiH,
+    wheel_motion_threshold: typeof r.wheel_motion_threshold === 'number' ? r.wheel_motion_threshold : 12.0,
+    wheel_avg_speed_mps: typeof r.wheel_avg_speed_mps === 'number' ? r.wheel_avg_speed_mps : 1.0,
   };
 }
 
@@ -1106,13 +1145,26 @@ export interface CreateCameraInput {
   live_src?: string | null;
   enabled: boolean;
   zones?: string[];
+  /** @deprecated use wheel_motion_* instead */
   wheel_mark_enabled?: boolean;
+  /** @deprecated use wheel_avg_speed_mps instead */
   wheel_diameter_mm?: number;
+  /** @deprecated use wheel_motion_roi_* instead */
   wheel_band_x_pct?: number;
+  /** @deprecated use wheel_motion_roi_* instead */
   wheel_band_width_pct?: number;
+  /** @deprecated use wheel_motion_roi_* instead */
   wheel_band_y_pct?: number;
+  /** @deprecated use wheel_motion_roi_* instead */
   wheel_band_height_pct?: number;
+  /** @deprecated use wheel_motion_threshold instead */
   wheel_threshold_pct?: number;
+  wheel_motion_roi_x?: number | null;
+  wheel_motion_roi_y?: number | null;
+  wheel_motion_roi_w?: number | null;
+  wheel_motion_roi_h?: number | null;
+  wheel_motion_threshold?: number;
+  wheel_avg_speed_mps?: number;
 }
 
 export function createCamera(input: CreateCameraInput): CameraRow {
@@ -1134,6 +1186,12 @@ export function createCamera(input: CreateCameraInput): CameraRow {
     wheel_band_y_pct: input.wheel_band_y_pct ?? 50.0,
     wheel_band_height_pct: input.wheel_band_height_pct ?? 10.0,
     wheel_threshold_pct: input.wheel_threshold_pct ?? 50.0,
+    wheel_motion_roi_x: input.wheel_motion_roi_x ?? null,
+    wheel_motion_roi_y: input.wheel_motion_roi_y ?? null,
+    wheel_motion_roi_w: input.wheel_motion_roi_w ?? null,
+    wheel_motion_roi_h: input.wheel_motion_roi_h ?? null,
+    wheel_motion_threshold: input.wheel_motion_threshold ?? 12.0,
+    wheel_avg_speed_mps: input.wheel_avg_speed_mps ?? 1.0,
   });
   const id = Number(result.lastInsertRowid);
   const row = getCameraById(id);
@@ -1149,13 +1207,26 @@ export interface UpdateCameraInput {
   live_src?: string | null;
   enabled: boolean;
   zones?: string[];
+  /** @deprecated use wheel_motion_* instead */
   wheel_mark_enabled?: boolean;
+  /** @deprecated use wheel_avg_speed_mps instead */
   wheel_diameter_mm?: number;
+  /** @deprecated use wheel_motion_roi_* instead */
   wheel_band_x_pct?: number;
+  /** @deprecated use wheel_motion_roi_* instead */
   wheel_band_width_pct?: number;
+  /** @deprecated use wheel_motion_roi_* instead */
   wheel_band_y_pct?: number;
+  /** @deprecated use wheel_motion_roi_* instead */
   wheel_band_height_pct?: number;
+  /** @deprecated use wheel_motion_threshold instead */
   wheel_threshold_pct?: number;
+  wheel_motion_roi_x?: number | null;
+  wheel_motion_roi_y?: number | null;
+  wheel_motion_roi_w?: number | null;
+  wheel_motion_roi_h?: number | null;
+  wheel_motion_threshold?: number;
+  wheel_avg_speed_mps?: number;
 }
 
 export function updateCamera(input: UpdateCameraInput): CameraRow | null {
@@ -1167,6 +1238,14 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
   const live_src = 'live_src' in input
     ? (input.live_src ?? null)
     : (existing?.live_src ?? null);
+  // For motion-detector ROI, preserve existing values when caller omits them.
+  // null means "disable detector" and is a legitimate explicit value.
+  const hasMotionRoi = 'wheel_motion_roi_x' in input;
+  const motionRoiX = hasMotionRoi ? (input.wheel_motion_roi_x ?? null) : (existing?.wheel_motion_roi_x ?? null);
+  const motionRoiY = hasMotionRoi ? (input.wheel_motion_roi_y ?? null) : (existing?.wheel_motion_roi_y ?? null);
+  const motionRoiW = hasMotionRoi ? (input.wheel_motion_roi_w ?? null) : (existing?.wheel_motion_roi_w ?? null);
+  const motionRoiH = hasMotionRoi ? (input.wheel_motion_roi_h ?? null) : (existing?.wheel_motion_roi_h ?? null);
+
   statements().cameraUpdate.run({
     id: input.id,
     name: input.name,
@@ -1184,6 +1263,46 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
     wheel_band_y_pct: input.wheel_band_y_pct ?? existing?.wheel_band_y_pct ?? 50.0,
     wheel_band_height_pct: input.wheel_band_height_pct ?? existing?.wheel_band_height_pct ?? 10.0,
     wheel_threshold_pct: input.wheel_threshold_pct ?? existing?.wheel_threshold_pct ?? 50.0,
+    wheel_motion_roi_x: motionRoiX,
+    wheel_motion_roi_y: motionRoiY,
+    wheel_motion_roi_w: motionRoiW,
+    wheel_motion_roi_h: motionRoiH,
+    wheel_motion_threshold: input.wheel_motion_threshold ?? existing?.wheel_motion_threshold ?? 12.0,
+    wheel_avg_speed_mps: input.wheel_avg_speed_mps ?? existing?.wheel_avg_speed_mps ?? 1.0,
+  });
+  return getCameraById(input.id);
+}
+
+export interface SetWheelMotionInput {
+  id: number;
+  roi: { x: number; y: number; w: number; h: number } | null;
+  threshold: number;
+  avgSpeedMps: number;
+}
+
+/**
+ * Update only the motion-energy detector columns for a camera, leaving all
+ * other columns intact. Returns the updated row, or null when no camera with
+ * the given id exists.
+ */
+export function setWheelMotionConfig(input: SetWheelMotionInput): CameraRow | null {
+  getDb().prepare(`
+    UPDATE cameras
+       SET wheel_motion_roi_x      = @wheel_motion_roi_x,
+           wheel_motion_roi_y      = @wheel_motion_roi_y,
+           wheel_motion_roi_w      = @wheel_motion_roi_w,
+           wheel_motion_roi_h      = @wheel_motion_roi_h,
+           wheel_motion_threshold  = @wheel_motion_threshold,
+           wheel_avg_speed_mps     = @wheel_avg_speed_mps
+     WHERE id = @id
+  `).run({
+    id: input.id,
+    wheel_motion_roi_x: input.roi?.x ?? null,
+    wheel_motion_roi_y: input.roi?.y ?? null,
+    wheel_motion_roi_w: input.roi?.w ?? null,
+    wheel_motion_roi_h: input.roi?.h ?? null,
+    wheel_motion_threshold: input.threshold,
+    wheel_avg_speed_mps: input.avgSpeedMps,
   });
   return getCameraById(input.id);
 }

@@ -31,7 +31,7 @@ import {
   getVapidPublicKey,
   sendPushToUser,
 } from './push.js';
-import { testWheelDetection, liveWheelRotationTest } from './wheel-odometer.js';
+import { getLatestMotionEnergy, onSession, restartDetectorForCamera, type WheelMotionSession } from './wheel-motion.js';
 
 import * as db from './db.js';
 import { resolveSession } from './session.js';
@@ -40,6 +40,62 @@ import { triggerForgotPassword, registerAccount, ZyphrEmailTaken } from './zyphr
 import { saveManualSnapshot, getRecentEvents, getPetStatus, refreshNarratorTunings } from './narrator.js';
 import { startShareJob } from './share.js';
 import { getMqttErrorStats } from './mqtt.js';
+
+// ---------------------------------------------------------------------------
+// Wheel-motion session ring buffer — backs getWheelMotionSessionsRecent
+// ---------------------------------------------------------------------------
+
+const WHEEL_SESSION_RING_SIZE = 20;
+/** Per-camera ring buffers of the most recent completed sessions. */
+const wheelSessionsByCamera = new Map<number, WheelMotionSession[]>();
+
+// Subscribe to session events at module load time so we buffer them regardless
+// of when the tRPC router is queried. Sessions from all cameras are stored.
+onSession((session) => {
+  let ring = wheelSessionsByCamera.get(session.cameraId);
+  if (!ring) {
+    ring = [];
+    wheelSessionsByCamera.set(session.cameraId, ring);
+  }
+  ring.push(session);
+  while (ring.length > WHEEL_SESSION_RING_SIZE) ring.shift();
+});
+
+function getRecentWheelMotionSessions(cameraId: number): Array<{
+  cameraId: number;
+  startedAt: number;
+  endedAt: number;
+  durationMs: number;
+  peakEnergy: number;
+  meanEnergy: number;
+  wheelMeters: number;
+}> {
+  const ring = wheelSessionsByCamera.get(cameraId) ?? [];
+  // Return newest-first.
+  return ring
+    .slice()
+    .reverse()
+    .map((s) => {
+      const camRow = db.getCameraById(s.cameraId);
+      const avgSpeedMps = camRow?.wheel_avg_speed_mps ?? 1.0;
+      const durationMs = s.endedAt - s.startedAt;
+      const wheelMeters = (durationMs / 1000) * avgSpeedMps;
+      return {
+        cameraId: s.cameraId,
+        startedAt: s.startedAt,
+        endedAt: s.endedAt,
+        durationMs,
+        peakEnergy: s.peakEnergy,
+        meanEnergy: s.meanEnergy,
+        wheelMeters,
+      };
+    });
+}
+
+/** Test helper: clear the in-memory session ring buffer. */
+export function resetWheelSessionRingForTests(): void {
+  wheelSessionsByCamera.clear();
+}
 
 // ---------------------------------------------------------------------------
 // Context
@@ -246,20 +302,33 @@ const cameraSchema = z.object({
   zones: z.array(z.string()),
   /** ms since epoch of Frigate's most recent frame; null = unknown. */
   last_frame_at: z.number().int().nullable(),
-  /** Wheel odometer — whether optical mark detection is active. */
+  /** @deprecated Optical-mark detection flag (unused since migration 0024). */
   wheel_mark_enabled: z.boolean(),
-  /** Physical wheel diameter in millimetres. */
+  /** @deprecated Physical wheel diameter in mm (unused since migration 0024). */
   wheel_diameter_mm: z.number(),
-  /** Left edge of the ROI box as % of frame width (0–100). */
+  /** @deprecated Band ROI left edge % (unused since migration 0024). */
   wheel_band_x_pct: z.number(),
-  /** ROI box width as % of frame width (0–100). */
+  /** @deprecated Band ROI width % (unused since migration 0024). */
   wheel_band_width_pct: z.number(),
-  /** Centre of the sampling band as % of frame height (0–100). */
+  /** @deprecated Band ROI top % (unused since migration 0024). */
   wheel_band_y_pct: z.number(),
-  /** Sampling band height as % of frame height (0–100). */
+  /** @deprecated Band ROI height % (unused since migration 0024). */
   wheel_band_height_pct: z.number(),
-  /** Dark-pixel intensity cutoff as % (0–100). */
+  /** @deprecated Dark-pixel threshold % (unused since migration 0024). */
   wheel_threshold_pct: z.number(),
+  // Motion-energy detector (migration 0024)
+  /** Left edge of the whole-wheel ROI as % of frame width (0–100). Null = detector disabled. */
+  wheel_motion_roi_x: z.number().int().nullable(),
+  /** Top edge of the whole-wheel ROI as % of frame height (0–100). Null = detector disabled. */
+  wheel_motion_roi_y: z.number().int().nullable(),
+  /** Width of the whole-wheel ROI as % of frame width (0–100). Null = detector disabled. */
+  wheel_motion_roi_w: z.number().int().nullable(),
+  /** Height of the whole-wheel ROI as % of frame height (0–100). Null = detector disabled. */
+  wheel_motion_roi_h: z.number().int().nullable(),
+  /** Mean-abs-pixel-diff threshold (0–255 scale) above which a frame is "in motion". */
+  wheel_motion_threshold: z.number(),
+  /** Calibrated average wheel speed in metres per second (1.0 ≈ 3.6 km/h). */
+  wheel_avg_speed_mps: z.number(),
 });
 export type CameraDTO = z.infer<typeof cameraSchema>;
 
@@ -360,6 +429,12 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
     wheel_band_y_pct: row.wheel_band_y_pct,
     wheel_band_height_pct: row.wheel_band_height_pct,
     wheel_threshold_pct: row.wheel_threshold_pct,
+    wheel_motion_roi_x: row.wheel_motion_roi_x ?? null,
+    wheel_motion_roi_y: row.wheel_motion_roi_y ?? null,
+    wheel_motion_roi_w: row.wheel_motion_roi_w ?? null,
+    wheel_motion_roi_h: row.wheel_motion_roi_h ?? null,
+    wheel_motion_threshold: row.wheel_motion_threshold,
+    wheel_avg_speed_mps: row.wheel_avg_speed_mps,
   };
 }
 
@@ -796,10 +871,9 @@ const camerasRouter = router({
     }),
 
   /**
-   * Grab one frame from the camera RTSP stream, crop to the configured band,
-   * and return a base64 PNG of the cropped band plus the computed dark-pixel
-   * ratio. Used by Settings → Cameras → Wheel Odometer to tune the band/threshold
-   * visually before enabling the feature. Read-only — no state changes.
+   * @deprecated Tape-mark detection is no longer used. This procedure is a
+   * no-op retained for one release so frontend code calling it doesn't crash.
+   * Remove after the frontend stops calling it.
    */
   testWheelDetection: adminProcedure
     .meta({ audit: false })
@@ -810,21 +884,19 @@ const camerasRouter = router({
       thresholdPct: z.number(),
       error: z.string().nullable(),
     }))
-    .mutation(async ({ input }) => {
-      const result = await testWheelDetection(input.cameraId);
-      if ('error' in result) {
-        return { croppedPngBase64: '', darkPixelRatio: 0, thresholdPct: 0, error: result.error };
-      }
-      return { ...result, error: null };
+    .mutation(() => {
+      return {
+        croppedPngBase64: '',
+        darkPixelRatio: 0,
+        thresholdPct: 0,
+        error: 'Tape-mark detection has been replaced by the motion-energy detector. Use getWheelMotion to read live energy.',
+      };
     }),
 
   /**
-   * Sample the live RTSP feed for up to 30 s and return rotation-count,
-   * distance, and a per-frame dark-pixel ratio trace. The operator runs this
-   * after placing the tape mark to verify the odometer picks up real rotations
-   * before enabling the persistent live session.
-   *
-   * Read-only — does not affect the persistent activeSessions map.
+   * @deprecated Rotation-test pipeline is no longer used. This procedure is a
+   * no-op retained for one release so frontend code calling it doesn't crash.
+   * Remove after the frontend stops calling it.
    */
   testWheelRotation: adminProcedure
     .meta({ audit: false })
@@ -842,33 +914,124 @@ const camerasRouter = router({
       distanceMeters: z.number(),
       diameterMm: z.number(),
     }))
-    .mutation(async ({ input }) => {
-      const { cameraId, durationS } = input;
+    .mutation(({ input }) => {
+      void input;
+      return {
+        rotations: 0,
+        sampledDurationS: 0,
+        sampleFps: 5,
+        framesSampled: 0,
+        ratioTrace: [],
+        thresholdRatio: 0,
+        distanceMeters: 0,
+        diameterMm: 0,
+      };
+    }),
 
-      // Gate checks are inside liveWheelRotationTest; we translate its thrown
-      // Errors into typed TRPCErrors the UI can display, and surface ffmpeg
-      // stderr in the server log without leaking it to the client.
-      try {
-        return await liveWheelRotationTest(cameraId, durationS ?? 15);
-      } catch (err) {
-        if (err instanceof FfmpegError) {
-          const log = childLogger('trpc.cameras');
-          log.error(
-            { cameraId, ffmpegCode: err.code, stderr: err.stderr },
-            'testWheelRotation: ffmpeg failed',
-          );
-          throw new TRPCError({
-            code: 'INTERNAL_SERVER_ERROR',
-            message: `ffmpeg failed (exit ${err.code ?? 'signal'}): ${err.message}`,
-          });
-        }
-        if (err instanceof Error) {
-          // Eligibility / configuration errors — surface them as BAD_REQUEST so
-          // the UI can show a user-readable reason without a stack trace.
-          throw new TRPCError({ code: 'BAD_REQUEST', message: err.message });
-        }
-        throw err;
-      }
+  /**
+   * Configure the motion-energy detector for a camera.
+   * Pass `roi: null` to disable the detector entirely for this camera.
+   * Restarts the running detector process if the camera has an active one.
+   */
+  setWheelMotion: adminProcedure
+    .meta({
+      audit: {
+        action: 'cameras.setWheelMotion',
+        targetType: 'camera',
+        targetIdFrom: (input) =>
+          isRecord(input) && typeof input['cameraId'] === 'number' ? input['cameraId'] : null,
+        detailsFrom: (input) => (isRecord(input) ? { cameraId: input['cameraId'], roi: input['roi'], threshold: input['threshold'], avgSpeedMps: input['avgSpeedMps'] } : null),
+      },
+    })
+    .input(z.object({
+      cameraId: z.number().int(),
+      /** Pass null to disable the detector for this camera. */
+      roi: z.object({
+        x: z.number().int().min(0).max(100),
+        y: z.number().int().min(0).max(100),
+        w: z.number().int().min(1).max(100),
+        h: z.number().int().min(1).max(100),
+      }).nullable(),
+      /** Mean-abs-pixel-diff threshold (0–255 scale). */
+      threshold: z.number().min(0).max(255),
+      /** Calibrated average speed in metres per second (0.1–5.0 m/s). */
+      avgSpeedMps: z.number().min(0.1).max(5.0),
+    }))
+    .output(cameraSchema)
+    .mutation(({ input }) => {
+      const row = db.setWheelMotionConfig({
+        id: input.cameraId,
+        roi: input.roi,
+        threshold: input.threshold,
+        avgSpeedMps: input.avgSpeedMps,
+      });
+      if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'camera not found' });
+      // Restart the detector for this camera so the new config takes effect
+      // immediately. Fire-and-forget; errors are logged inside the module.
+      restartDetectorForCamera(input.cameraId);
+      const stats = frigate.getCachedCameraStats(row.live_src ?? row.name);
+      return cameraToDTO(row, stats.lastFrameAt);
+    }),
+
+  /**
+   * Read the current motion-energy detector config + latest sampled energy
+   * for a camera. The `currentMotionEnergy` field is live — poll at ~1 Hz
+   * in the calibration UI to display a real-time energy meter.
+   */
+  getWheelMotion: protectedProcedure
+    .input(z.object({ cameraId: z.number().int() }))
+    .output(z.object({
+      roi: z.object({
+        x: z.number().int(),
+        y: z.number().int(),
+        w: z.number().int(),
+        h: z.number().int(),
+      }).nullable(),
+      threshold: z.number(),
+      avgSpeedMps: z.number(),
+      /** Latest motion_energy value (0–255 scale) from the running detector, or 0 if disabled. */
+      currentMotionEnergy: z.number(),
+    }))
+    .query(({ input }) => {
+      const row = db.getCameraById(input.cameraId);
+      if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'camera not found' });
+      const roi =
+        row.wheel_motion_roi_x !== null &&
+        row.wheel_motion_roi_y !== null &&
+        row.wheel_motion_roi_w !== null &&
+        row.wheel_motion_roi_h !== null
+          ? {
+              x: row.wheel_motion_roi_x,
+              y: row.wheel_motion_roi_y,
+              w: row.wheel_motion_roi_w,
+              h: row.wheel_motion_roi_h,
+            }
+          : null;
+      return {
+        roi,
+        threshold: row.wheel_motion_threshold,
+        avgSpeedMps: row.wheel_avg_speed_mps,
+        currentMotionEnergy: getLatestMotionEnergy(input.cameraId),
+      };
+    }),
+
+  /**
+   * Return the last 20 completed wheel-motion sessions for this camera.
+   * Used by the debug/calibration panel to verify the state machine is firing.
+   */
+  getWheelMotionSessionsRecent: protectedProcedure
+    .input(z.object({ cameraId: z.number().int() }))
+    .output(z.array(z.object({
+      cameraId: z.number().int(),
+      startedAt: z.number().int(),
+      endedAt: z.number().int(),
+      durationMs: z.number().int(),
+      peakEnergy: z.number(),
+      meanEnergy: z.number(),
+      wheelMeters: z.number(),
+    })))
+    .query(({ input }) => {
+      return getRecentWheelMotionSessions(input.cameraId);
     }),
 });
 

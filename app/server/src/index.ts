@@ -47,10 +47,10 @@ import { runThumbnailBackfillJob } from './jobs/thumbnail-backfill.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
 import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
-import { flushPendingEntries, refreshNarratorTunings } from './narrator.js';
+import { flushPendingEntries, handleWheelMotionSession, refreshNarratorTunings } from './narrator.js';
 import { initVapidKeys } from './push.js';
 import { startFrigateStatsPoller, stopFrigateStatsPoller } from './frigate.js';
-import { initWheelOdometers, shutdownWheelOdometers } from './wheel-odometer.js';
+import { initWheelMotionDetectors, onSession, shutdownWheelMotionDetectors } from './wheel-motion.js';
 import { registerDiaryStream } from './diary-stream.js';
 import { closeWss, registerLiveWsProxy } from './live-ws.js';
 import { resolveSession } from './session.js';
@@ -441,9 +441,18 @@ export async function startRuntime(): Promise<RuntimeHandles> {
   }
 
   startFrigateStatsPoller();
-  // Fire-and-forget: spawns one background ffmpeg per wheel-enabled camera.
-  // Never blocks startup; per-camera errors are logged and skipped.
-  initWheelOdometers();
+
+  // Wire wheel-motion sessions → narrator diary entries before starting the
+  // detectors so no session is dropped during startup.
+  onSession((session) => {
+    handleWheelMotionSession(session).catch((err: unknown) => {
+      app.log.error({ err, cameraId: session.cameraId }, 'wheel-motion: session handler failed');
+    });
+  });
+
+  // Fire-and-forget: spawns one background ffmpeg per camera with a configured
+  // wheel-motion ROI. Never blocks startup; per-camera errors are logged and skipped.
+  initWheelMotionDetectors();
   const crons = scheduleCronJobs(app);
 
   await app.listen({ port: cfg.PORT, host: '0.0.0.0' });
@@ -500,9 +509,9 @@ async function shutdown(handles: RuntimeHandles, sig: string): Promise<void> {
     try { t.stop(); } catch { /* noop */ }
   }
   stopFrigateStatsPoller();
-  // Stop always-on wheel odometers before flushing the narrator so any
-  // in-flight rotation data is captured by the closing snapshots.
-  shutdownWheelOdometers();
+  // Stop wheel-motion detectors before flushing the narrator so in-flight
+  // sessions don't fire callbacks after the narrator has already flushed.
+  shutdownWheelMotionDetectors();
 
   // 2. Flush the narrator's in-memory coalescing window to the DB.
   try {
