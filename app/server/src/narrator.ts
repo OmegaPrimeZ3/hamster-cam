@@ -100,7 +100,7 @@ import { evaluateBadges, type BadgeId } from './badges.js';
 import { childLogger } from './logger.js';
 import { pickTemplate, render } from './narratives.js';
 import { evaluatePushForEntry } from './push.js';
-import type { WheelMotionSession } from './wheel-motion.js';
+import type { WheelTapeSession } from './wheel-tape.js';
 
 const log = childLogger('narrator');
 
@@ -1233,23 +1233,25 @@ export async function saveManualSnapshot(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Wheel motion-session handler (called from wheel-motion.ts onSession)
+// Wheel tape-session handler (called from wheel-tape.ts onSession)
 // ---------------------------------------------------------------------------
 
 /**
- * Convert a completed wheel-motion session into a diary entry (or merge it
+ * Convert a completed wheel tape session into a diary entry (or merge it
  * into the most recent prior wheel entry when within WHEEL_DEDUPE_WINDOW_MS).
  *
- * Distance formula: durationS × wheel_avg_speed_mps (read from camera row at
- * session-end time so a mid-night calibration change takes effect immediately).
+ * Distance formula: rotations × wheel_tape_circumference_cm / 100 (read from
+ * camera row at session-end time so a mid-night calibration change takes effect
+ * immediately).
  *
  * Dedupe: if the most recent wheel diary entry for this camera ended within
  * WHEEL_DEDUPE_WINDOW_MS, we extend that row rather than inserting a new one.
- * This collapses intra-session Frigate noise / brief gaps within a single
- * physical wheel run into one diary entry.
+ * This collapses intra-session brief gaps within a single physical wheel run
+ * into one diary entry. When merging, rotations are summed and wheel_meters
+ * is recomputed from the total rotation count.
  */
-export async function handleWheelMotionSession(
-  session: WheelMotionSession,
+export async function handleWheelTapeSession(
+  session: WheelTapeSession,
   deps: NarratorDeps = {},
 ): Promise<db.DiaryEntryRow | null> {
   const resolvedDeps: Required<NarratorDeps> = {
@@ -1260,20 +1262,21 @@ export async function handleWheelMotionSession(
 
   const durationMs = session.endedAt - session.startedAt;
   if (durationMs <= 0) {
-    log.warn({ cameraId: session.cameraId, durationMs }, 'wheel-motion: session has zero/negative duration — skipping');
+    log.warn({ cameraId: session.cameraId, durationMs }, 'wheel-tape: session has zero/negative duration — skipping');
     return null;
   }
 
-  // Look up the camera to get wheel_avg_speed_mps.
+  // Look up the camera to get wheel_tape_circumference_cm.
   const camRow = db.getCameraById(session.cameraId);
-  const avgSpeedMps = camRow?.wheel_avg_speed_mps ?? 1.0;
-  const durationS = durationMs / 1000;
-  const wheelMeters = durationS * avgSpeedMps;
+  const circumferenceCm = camRow?.wheel_tape_circumference_cm ?? 13.0;
+  const wheelMeters = session.rotations * circumferenceCm / 100;
 
   const details: Record<string, unknown> = {
     camera: camRow?.live_src ?? String(session.cameraId),
     wheel_meters: wheelMeters,
-    mean_motion_energy: session.meanEnergy,
+    rotations: session.rotations,
+    mean_rps: session.meanRps,
+    peak_rps: session.peakRps,
   };
 
   const occurredAt = session.endedAt;
@@ -1298,12 +1301,19 @@ export async function handleWheelMotionSession(
     }
 
     const priorMeters = typeof priorDetails['wheel_meters'] === 'number' ? priorDetails['wheel_meters'] : 0;
+    const priorRotations = typeof priorDetails['rotations'] === 'number' ? priorDetails['rotations'] : 0;
     const priorMerged = typeof priorDetails['merged_sessions'] === 'number' ? priorDetails['merged_sessions'] : 0;
+    const totalRotations = priorRotations + session.rotations;
 
     const mergedDetails: Record<string, unknown> = {
       ...priorDetails,
       wheel_meters: priorMeters + wheelMeters,
-      mean_motion_energy: session.meanEnergy,
+      rotations: totalRotations,
+      mean_rps: session.meanRps,
+      peak_rps: Math.max(
+        typeof priorDetails['peak_rps'] === 'number' ? priorDetails['peak_rps'] : 0,
+        session.peakRps,
+      ),
       merged_sessions: priorMerged + 1,
     };
 
@@ -1317,7 +1327,10 @@ export async function handleWheelMotionSession(
       duration_ms: newDurationMs,
       details: mergedDetails,
     });
-    log.info({ cameraId: session.cameraId, entryId: prior.id, wheelMeters, durationMs }, 'wheel-motion: merged session into prior entry');
+    log.info(
+      { cameraId: session.cameraId, entryId: prior.id, wheelMeters, rotations: session.rotations, durationMs },
+      'wheel-tape: merged session into prior entry',
+    );
     return updated;
   }
 
@@ -1344,7 +1357,10 @@ export async function handleWheelMotionSession(
     details: JSON.stringify(details),
   });
 
-  log.info({ cameraId: session.cameraId, entryId: entry.id, wheelMeters, durationMs }, 'wheel-motion: new diary entry');
+  log.info(
+    { cameraId: session.cameraId, entryId: entry.id, wheelMeters, rotations: session.rotations, durationMs },
+    'wheel-tape: new diary entry',
+  );
   await resolvedDeps.onEntryWritten(entry);
   return entry;
 }

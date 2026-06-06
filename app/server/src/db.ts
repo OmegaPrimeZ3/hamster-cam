@@ -90,6 +90,13 @@ export interface CameraRow {
   wheel_motion_threshold: number;
   /** Calibrated average wheel speed in metres per second (1.0 ≈ 3.6 km/h). */
   wheel_avg_speed_mps: number;
+  // ---------------------------------------------------------------------------
+  // Tape-crossing detector (migration 0025)
+  // ---------------------------------------------------------------------------
+  /** Sigma multiplier for the adaptive dip threshold (1.5–3.5, default 2.0). */
+  wheel_tape_sensitivity: number;
+  /** Physical wheel circumference in cm. wheel_meters = rotations × cm / 100. */
+  wheel_tape_circumference_cm: number;
 }
 
 export interface SnapshotRow {
@@ -470,7 +477,8 @@ function statements(): Statements {
         wheel_band_x_pct, wheel_band_width_pct,
         wheel_band_y_pct, wheel_band_height_pct, wheel_threshold_pct,
         wheel_motion_roi_x, wheel_motion_roi_y, wheel_motion_roi_w, wheel_motion_roi_h,
-        wheel_motion_threshold, wheel_avg_speed_mps
+        wheel_motion_threshold, wheel_avg_speed_mps,
+        wheel_tape_sensitivity, wheel_tape_circumference_cm
       )
       VALUES (
         @name, @emoji, @stream_url, @live_src, @position, @enabled, @created_at, @zones,
@@ -478,30 +486,33 @@ function statements(): Statements {
         @wheel_band_x_pct, @wheel_band_width_pct,
         @wheel_band_y_pct, @wheel_band_height_pct, @wheel_threshold_pct,
         @wheel_motion_roi_x, @wheel_motion_roi_y, @wheel_motion_roi_w, @wheel_motion_roi_h,
-        @wheel_motion_threshold, @wheel_avg_speed_mps
+        @wheel_motion_threshold, @wheel_avg_speed_mps,
+        @wheel_tape_sensitivity, @wheel_tape_circumference_cm
       )
     `),
     cameraUpdate: db.prepare(`
       UPDATE cameras
-         SET name                  = @name,
-             emoji                 = @emoji,
-             stream_url            = @stream_url,
-             live_src              = @live_src,
-             enabled               = @enabled,
-             zones                 = @zones,
-             wheel_mark_enabled    = @wheel_mark_enabled,
-             wheel_diameter_mm     = @wheel_diameter_mm,
-             wheel_band_x_pct      = @wheel_band_x_pct,
-             wheel_band_width_pct  = @wheel_band_width_pct,
-             wheel_band_y_pct      = @wheel_band_y_pct,
-             wheel_band_height_pct = @wheel_band_height_pct,
-             wheel_threshold_pct   = @wheel_threshold_pct,
-             wheel_motion_roi_x    = @wheel_motion_roi_x,
-             wheel_motion_roi_y    = @wheel_motion_roi_y,
-             wheel_motion_roi_w    = @wheel_motion_roi_w,
-             wheel_motion_roi_h    = @wheel_motion_roi_h,
-             wheel_motion_threshold = @wheel_motion_threshold,
-             wheel_avg_speed_mps   = @wheel_avg_speed_mps
+         SET name                        = @name,
+             emoji                       = @emoji,
+             stream_url                  = @stream_url,
+             live_src                    = @live_src,
+             enabled                     = @enabled,
+             zones                       = @zones,
+             wheel_mark_enabled          = @wheel_mark_enabled,
+             wheel_diameter_mm           = @wheel_diameter_mm,
+             wheel_band_x_pct            = @wheel_band_x_pct,
+             wheel_band_width_pct        = @wheel_band_width_pct,
+             wheel_band_y_pct            = @wheel_band_y_pct,
+             wheel_band_height_pct       = @wheel_band_height_pct,
+             wheel_threshold_pct         = @wheel_threshold_pct,
+             wheel_motion_roi_x          = @wheel_motion_roi_x,
+             wheel_motion_roi_y          = @wheel_motion_roi_y,
+             wheel_motion_roi_w          = @wheel_motion_roi_w,
+             wheel_motion_roi_h          = @wheel_motion_roi_h,
+             wheel_motion_threshold      = @wheel_motion_threshold,
+             wheel_avg_speed_mps         = @wheel_avg_speed_mps,
+             wheel_tape_sensitivity      = @wheel_tape_sensitivity,
+             wheel_tape_circumference_cm = @wheel_tape_circumference_cm
        WHERE id = @id
     `),
     cameraSetEnabled: db.prepare('UPDATE cameras SET enabled = ? WHERE id = ?'),
@@ -1123,6 +1134,8 @@ function decodeCameraRow(raw: unknown): CameraRow {
     wheel_motion_roi_h: roiH,
     wheel_motion_threshold: typeof r.wheel_motion_threshold === 'number' ? r.wheel_motion_threshold : 12.0,
     wheel_avg_speed_mps: typeof r.wheel_avg_speed_mps === 'number' ? r.wheel_avg_speed_mps : 1.0,
+    wheel_tape_sensitivity: typeof r.wheel_tape_sensitivity === 'number' ? r.wheel_tape_sensitivity : 2.0,
+    wheel_tape_circumference_cm: typeof r.wheel_tape_circumference_cm === 'number' ? r.wheel_tape_circumference_cm : 13.0,
   };
 }
 
@@ -1165,6 +1178,8 @@ export interface CreateCameraInput {
   wheel_motion_roi_h?: number | null;
   wheel_motion_threshold?: number;
   wheel_avg_speed_mps?: number;
+  wheel_tape_sensitivity?: number;
+  wheel_tape_circumference_cm?: number;
 }
 
 export function createCamera(input: CreateCameraInput): CameraRow {
@@ -1192,6 +1207,8 @@ export function createCamera(input: CreateCameraInput): CameraRow {
     wheel_motion_roi_h: input.wheel_motion_roi_h ?? null,
     wheel_motion_threshold: input.wheel_motion_threshold ?? 12.0,
     wheel_avg_speed_mps: input.wheel_avg_speed_mps ?? 1.0,
+    wheel_tape_sensitivity: input.wheel_tape_sensitivity ?? 2.0,
+    wheel_tape_circumference_cm: input.wheel_tape_circumference_cm ?? 13.0,
   });
   const id = Number(result.lastInsertRowid);
   const row = getCameraById(id);
@@ -1227,6 +1244,8 @@ export interface UpdateCameraInput {
   wheel_motion_roi_h?: number | null;
   wheel_motion_threshold?: number;
   wheel_avg_speed_mps?: number;
+  wheel_tape_sensitivity?: number;
+  wheel_tape_circumference_cm?: number;
 }
 
 export function updateCamera(input: UpdateCameraInput): CameraRow | null {
@@ -1269,6 +1288,8 @@ export function updateCamera(input: UpdateCameraInput): CameraRow | null {
     wheel_motion_roi_h: motionRoiH,
     wheel_motion_threshold: input.wheel_motion_threshold ?? existing?.wheel_motion_threshold ?? 12.0,
     wheel_avg_speed_mps: input.wheel_avg_speed_mps ?? existing?.wheel_avg_speed_mps ?? 1.0,
+    wheel_tape_sensitivity: input.wheel_tape_sensitivity ?? existing?.wheel_tape_sensitivity ?? 2.0,
+    wheel_tape_circumference_cm: input.wheel_tape_circumference_cm ?? existing?.wheel_tape_circumference_cm ?? 13.0,
   });
   return getCameraById(input.id);
 }
@@ -1284,6 +1305,9 @@ export interface SetWheelMotionInput {
  * Update only the motion-energy detector columns for a camera, leaving all
  * other columns intact. Returns the updated row, or null when no camera with
  * the given id exists.
+ *
+ * @deprecated retained for one release to support any callers that have not
+ * yet migrated to setWheelTapeConfig.
  */
 export function setWheelMotionConfig(input: SetWheelMotionInput): CameraRow | null {
   getDb().prepare(`
@@ -1303,6 +1327,40 @@ export function setWheelMotionConfig(input: SetWheelMotionInput): CameraRow | nu
     wheel_motion_roi_h: input.roi?.h ?? null,
     wheel_motion_threshold: input.threshold,
     wheel_avg_speed_mps: input.avgSpeedMps,
+  });
+  return getCameraById(input.id);
+}
+
+export interface SetWheelTapeInput {
+  id: number;
+  roi: { x: number; y: number; w: number; h: number } | null;
+  sensitivity: number;
+  circumferenceCm: number;
+}
+
+/**
+ * Update the tape-crossing detector columns for a camera, leaving all other
+ * columns intact. Returns the updated row, or null when no camera with the
+ * given id exists.
+ */
+export function setWheelTapeConfig(input: SetWheelTapeInput): CameraRow | null {
+  getDb().prepare(`
+    UPDATE cameras
+       SET wheel_motion_roi_x          = @wheel_motion_roi_x,
+           wheel_motion_roi_y          = @wheel_motion_roi_y,
+           wheel_motion_roi_w          = @wheel_motion_roi_w,
+           wheel_motion_roi_h          = @wheel_motion_roi_h,
+           wheel_tape_sensitivity      = @wheel_tape_sensitivity,
+           wheel_tape_circumference_cm = @wheel_tape_circumference_cm
+     WHERE id = @id
+  `).run({
+    id: input.id,
+    wheel_motion_roi_x: input.roi?.x ?? null,
+    wheel_motion_roi_y: input.roi?.y ?? null,
+    wheel_motion_roi_w: input.roi?.w ?? null,
+    wheel_motion_roi_h: input.roi?.h ?? null,
+    wheel_tape_sensitivity: input.sensitivity,
+    wheel_tape_circumference_cm: input.circumferenceCm,
   });
   return getCameraById(input.id);
 }

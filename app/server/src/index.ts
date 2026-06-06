@@ -47,10 +47,10 @@ import { runThumbnailBackfillJob } from './jobs/thumbnail-backfill.js';
 import { runTimelapseJob } from './jobs/timelapse.js';
 import { logger } from './logger.js';
 import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
-import { flushPendingEntries, handleWheelMotionSession, refreshNarratorTunings } from './narrator.js';
+import { flushPendingEntries, handleWheelTapeSession, refreshNarratorTunings } from './narrator.js';
 import { initVapidKeys } from './push.js';
 import { startFrigateStatsPoller, stopFrigateStatsPoller } from './frigate.js';
-import { initWheelMotionDetectors, onSession, shutdownWheelMotionDetectors } from './wheel-motion.js';
+import { initWheelTapeDetectors, onSession, shutdownWheelTapeDetectors } from './wheel-tape.js';
 import { registerDiaryStream } from './diary-stream.js';
 import { closeWss, registerLiveWsProxy } from './live-ws.js';
 import { resolveSession } from './session.js';
@@ -442,17 +442,17 @@ export async function startRuntime(): Promise<RuntimeHandles> {
 
   startFrigateStatsPoller();
 
-  // Wire wheel-motion sessions → narrator diary entries before starting the
+  // Wire wheel-tape sessions → narrator diary entries before starting the
   // detectors so no session is dropped during startup.
   onSession((session) => {
-    handleWheelMotionSession(session).catch((err: unknown) => {
-      app.log.error({ err, cameraId: session.cameraId }, 'wheel-motion: session handler failed');
+    handleWheelTapeSession(session).catch((err: unknown) => {
+      app.log.error({ err, cameraId: session.cameraId }, 'wheel-tape: session handler failed');
     });
   });
 
   // Fire-and-forget: spawns one background ffmpeg per camera with a configured
-  // wheel-motion ROI. Never blocks startup; per-camera errors are logged and skipped.
-  initWheelMotionDetectors();
+  // wheel-tape ROI. Never blocks startup; per-camera errors are logged and skipped.
+  initWheelTapeDetectors();
   const crons = scheduleCronJobs(app);
 
   await app.listen({ port: cfg.PORT, host: '0.0.0.0' });
@@ -509,9 +509,9 @@ async function shutdown(handles: RuntimeHandles, sig: string): Promise<void> {
     try { t.stop(); } catch { /* noop */ }
   }
   stopFrigateStatsPoller();
-  // Stop wheel-motion detectors before flushing the narrator so in-flight
+  // Stop wheel-tape detectors before flushing the narrator so in-flight
   // sessions don't fire callbacks after the narrator has already flushed.
-  shutdownWheelMotionDetectors();
+  shutdownWheelTapeDetectors();
 
   // 2. Flush the narrator's in-memory coalescing window to the DB.
   try {
