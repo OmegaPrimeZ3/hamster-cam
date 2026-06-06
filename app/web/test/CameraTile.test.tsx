@@ -35,6 +35,8 @@ function makeCamera(lastFrameAt: number | null, liveSrc: string | null = null): 
     wheel_motion_roi_h: null,
     wheel_motion_threshold: 12,
     wheel_avg_speed_mps: 1.0,
+    wheel_tape_sensitivity: 2.0,
+    wheel_tape_circumference_cm: 13,
     last_frame_at: lastFrameAt,
   };
 }

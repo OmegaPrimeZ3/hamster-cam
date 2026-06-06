@@ -31,7 +31,7 @@ import {
   getVapidPublicKey,
   sendPushToUser,
 } from './push.js';
-import { getLatestMotionEnergy, onSession, restartDetectorForCamera, type WheelMotionSession } from './wheel-motion.js';
+import { getLiveSignal, onSession, restartDetectorForCamera, type WheelTapeSession } from './wheel-tape.js';
 
 import * as db from './db.js';
 import { resolveSession } from './session.js';
@@ -42,12 +42,12 @@ import { startShareJob } from './share.js';
 import { getMqttErrorStats } from './mqtt.js';
 
 // ---------------------------------------------------------------------------
-// Wheel-motion session ring buffer — backs getWheelMotionSessionsRecent
+// Wheel tape session ring buffer — backs getWheelTapeSessionsRecent
 // ---------------------------------------------------------------------------
 
 const WHEEL_SESSION_RING_SIZE = 20;
-/** Per-camera ring buffers of the most recent completed sessions. */
-const wheelSessionsByCamera = new Map<number, WheelMotionSession[]>();
+/** Per-camera ring buffers of the most recent completed tape sessions. */
+const wheelSessionsByCamera = new Map<number, WheelTapeSession[]>();
 
 // Subscribe to session events at module load time so we buffer them regardless
 // of when the tRPC router is queried. Sessions from all cameras are stored.
@@ -61,35 +61,27 @@ onSession((session) => {
   while (ring.length > WHEEL_SESSION_RING_SIZE) ring.shift();
 });
 
-function getRecentWheelMotionSessions(cameraId: number): Array<{
+function getRecentWheelTapeSessions(cameraId: number): Array<{
   cameraId: number;
   startedAt: number;
   endedAt: number;
-  durationMs: number;
-  peakEnergy: number;
-  meanEnergy: number;
-  wheelMeters: number;
+  rotations: number;
+  meanRps: number;
+  peakRps: number;
 }> {
   const ring = wheelSessionsByCamera.get(cameraId) ?? [];
   // Return newest-first.
   return ring
     .slice()
     .reverse()
-    .map((s) => {
-      const camRow = db.getCameraById(s.cameraId);
-      const avgSpeedMps = camRow?.wheel_avg_speed_mps ?? 1.0;
-      const durationMs = s.endedAt - s.startedAt;
-      const wheelMeters = (durationMs / 1000) * avgSpeedMps;
-      return {
-        cameraId: s.cameraId,
-        startedAt: s.startedAt,
-        endedAt: s.endedAt,
-        durationMs,
-        peakEnergy: s.peakEnergy,
-        meanEnergy: s.meanEnergy,
-        wheelMeters,
-      };
-    });
+    .map((s) => ({
+      cameraId: s.cameraId,
+      startedAt: s.startedAt,
+      endedAt: s.endedAt,
+      rotations: s.rotations,
+      meanRps: s.meanRps,
+      peakRps: s.peakRps,
+    }));
 }
 
 /** Test helper: clear the in-memory session ring buffer. */
@@ -329,6 +321,11 @@ const cameraSchema = z.object({
   wheel_motion_threshold: z.number(),
   /** Calibrated average wheel speed in metres per second (1.0 ≈ 3.6 km/h). */
   wheel_avg_speed_mps: z.number(),
+  // Tape-crossing detector (migration 0025)
+  /** σ-multiplier for adaptive dip threshold (1.5–3.5, default 2.0). */
+  wheel_tape_sensitivity: z.number(),
+  /** Wheel circumference in cm (default 13.0 for a 5-inch wheel). */
+  wheel_tape_circumference_cm: z.number(),
 });
 export type CameraDTO = z.infer<typeof cameraSchema>;
 
@@ -435,6 +432,8 @@ function cameraToDTO(row: db.CameraRow, lastFrameAt: number | null): CameraDTO {
     wheel_motion_roi_h: row.wheel_motion_roi_h ?? null,
     wheel_motion_threshold: row.wheel_motion_threshold,
     wheel_avg_speed_mps: row.wheel_avg_speed_mps,
+    wheel_tape_sensitivity: row.wheel_tape_sensitivity,
+    wheel_tape_circumference_cm: row.wheel_tape_circumference_cm,
   };
 }
 
@@ -929,68 +928,91 @@ const camerasRouter = router({
     }),
 
   /**
-   * Configure the motion-energy detector for a camera.
-   * Pass `roi: null` to disable the detector entirely for this camera.
-   * Restarts the running detector process if the camera has an active one.
+   * Configure the tape-crossing detector for a camera.
+   * Pass `roi: null` to disable tracking entirely for this camera.
+   * Restarts the running detector process so the new config takes effect immediately.
    */
-  setWheelMotion: adminProcedure
+  setWheelTape: adminProcedure
     .meta({
       audit: {
-        action: 'cameras.setWheelMotion',
+        action: 'cameras.setWheelTape',
         targetType: 'camera',
         targetIdFrom: (input) =>
           isRecord(input) && typeof input['cameraId'] === 'number' ? input['cameraId'] : null,
-        detailsFrom: (input) => (isRecord(input) ? { cameraId: input['cameraId'], roi: input['roi'], threshold: input['threshold'], avgSpeedMps: input['avgSpeedMps'] } : null),
+        detailsFrom: (input) =>
+          isRecord(input)
+            ? {
+                cameraId: input['cameraId'],
+                roi: input['roi'],
+                sensitivity: input['sensitivity'],
+                circumferenceCm: input['circumferenceCm'],
+              }
+            : null,
       },
     })
     .input(z.object({
       cameraId: z.number().int(),
-      /** Pass null to disable the detector for this camera. */
+      /** Wide horizontal strip ROI as % of frame dimensions. Null disables the detector. */
       roi: z.object({
-        x: z.number().int().min(0).max(100),
-        y: z.number().int().min(0).max(100),
-        w: z.number().int().min(1).max(100),
-        h: z.number().int().min(1).max(100),
+        x: z.number().min(0).max(100),
+        y: z.number().min(0).max(100),
+        w: z.number().min(1).max(100),
+        h: z.number().min(1).max(100),
       }).nullable(),
-      /** Mean-abs-pixel-diff threshold (0–255 scale). */
-      threshold: z.number().min(0).max(255),
-      /** Calibrated average speed in metres per second (0.1–5.0 m/s). */
-      avgSpeedMps: z.number().min(0.1).max(5.0),
+      /** σ-multiplier for adaptive dip threshold (1.5–3.5, default 2.0). */
+      sensitivity: z.number().min(1.5).max(3.5),
+      /** Physical wheel circumference in cm (5–30, default 13). */
+      circumferenceCm: z.number().min(5).max(30),
     }))
     .output(cameraSchema)
     .mutation(({ input }) => {
-      const row = db.setWheelMotionConfig({
+      const row = db.setWheelTapeConfig({
         id: input.cameraId,
         roi: input.roi,
-        threshold: input.threshold,
-        avgSpeedMps: input.avgSpeedMps,
+        sensitivity: input.sensitivity,
+        circumferenceCm: input.circumferenceCm,
       });
       if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'camera not found' });
-      // Restart the detector for this camera so the new config takes effect
-      // immediately. Fire-and-forget; errors are logged inside the module.
+      // Restart the detector so the new config takes effect immediately.
       restartDetectorForCamera(input.cameraId);
       const stats = frigate.getCachedCameraStats(row.live_src ?? row.name);
       return cameraToDTO(row, stats.lastFrameAt);
     }),
 
   /**
-   * Read the current motion-energy detector config + latest sampled energy
-   * for a camera. The `currentMotionEnergy` field is live — poll at ~1 Hz
-   * in the calibration UI to display a real-time energy meter.
+   * Read the tape-crossing detector config + live signal snapshot for a camera.
+   * Poll at 100–200 ms while the calibration UI is open (oscilloscope feed).
    */
-  getWheelMotion: protectedProcedure
+  getWheelTape: protectedProcedure
     .input(z.object({ cameraId: z.number().int() }))
     .output(z.object({
       roi: z.object({
-        x: z.number().int(),
-        y: z.number().int(),
-        w: z.number().int(),
-        h: z.number().int(),
+        x: z.number(),
+        y: z.number(),
+        w: z.number(),
+        h: z.number(),
       }).nullable(),
-      threshold: z.number(),
-      avgSpeedMps: z.number(),
-      /** Latest motion_energy value (0–255 scale) from the running detector, or 0 if disabled. */
-      currentMotionEnergy: z.number(),
+      sensitivity: z.number(),
+      circumferenceCm: z.number(),
+      /** Live signal data; null when the detector is disabled (roi === null). */
+      signal: z.object({
+        /** Last ~300 brightness values (0–255 scale, newest last). */
+        samples: z.array(z.number()),
+        /** Milliseconds between consecutive samples (≈33ms at 30fps). */
+        sampleMs: z.number(),
+        /** Current rolling mean of the brightness series. */
+        mean: z.number(),
+        /** Current rolling std of the brightness series. */
+        std: z.number(),
+        /** Dip-detection threshold = mean − sensitivity×std. */
+        threshold: z.number(),
+        /** Epoch-ms timestamps of detected dips in the last 30s. */
+        recentDips: z.array(z.number()),
+        /** Number of rotations in the last 30s. */
+        rotationsLast30s: z.number(),
+        /** Rotation rate in rps over the last 5s of dips. */
+        rotationRateRps: z.number(),
+      }).nullable(),
     }))
     .query(({ input }) => {
       const row = db.getCameraById(input.cameraId);
@@ -1009,29 +1031,28 @@ const camerasRouter = router({
           : null;
       return {
         roi,
-        threshold: row.wheel_motion_threshold,
-        avgSpeedMps: row.wheel_avg_speed_mps,
-        currentMotionEnergy: getLatestMotionEnergy(input.cameraId),
+        sensitivity: row.wheel_tape_sensitivity,
+        circumferenceCm: row.wheel_tape_circumference_cm,
+        signal: getLiveSignal(input.cameraId),
       };
     }),
 
   /**
-   * Return the last 20 completed wheel-motion sessions for this camera.
-   * Used by the debug/calibration panel to verify the state machine is firing.
+   * Return the last 20 completed wheel-running sessions from the tape-crossing
+   * detector. Used by the collapsible sessions panel in the calibration UI.
    */
-  getWheelMotionSessionsRecent: protectedProcedure
+  getWheelTapeSessionsRecent: protectedProcedure
     .input(z.object({ cameraId: z.number().int() }))
     .output(z.array(z.object({
       cameraId: z.number().int(),
       startedAt: z.number().int(),
       endedAt: z.number().int(),
-      durationMs: z.number().int(),
-      peakEnergy: z.number(),
-      meanEnergy: z.number(),
-      wheelMeters: z.number(),
+      rotations: z.number(),
+      meanRps: z.number(),
+      peakRps: z.number(),
     })))
     .query(({ input }) => {
-      return getRecentWheelMotionSessions(input.cameraId);
+      return getRecentWheelTapeSessions(input.cameraId);
     }),
 });
 

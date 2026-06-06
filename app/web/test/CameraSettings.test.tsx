@@ -48,6 +48,8 @@ const CAM_BASE = {
   wheel_motion_roi_h: null as number | null,
   wheel_motion_threshold: 12,
   wheel_avg_speed_mps: 1.0,
+  wheel_tape_sensitivity: 2.0,
+  wheel_tape_circumference_cm: 13,
 };
 
 const CAM_ENABLED = {
