@@ -2,9 +2,11 @@
 // Unit and integration tests for the tape-crossing detector.
 //
 // Test surface:
-//   BrightnessSignal  — Welford rolling stats, dip detection, refractory period
-//   TapeSessionMachine — session lifecycle FSM
-//   meanBrightness    — utility
+//   BrightnessSignal    — Welford rolling stats, dip detection, refractory period,
+//                         whole-frame brightness normalisation, warmup gate
+//   TapeSessionMachine  — session lifecycle FSM
+//   meanBrightness      — utility
+//   roiMeanBrightness   — utility
 //   Narrator integration — synthetic dip sequence → diary entry with correct wheel_meters
 //
 // No real ffmpeg processes are spawned; the public ffmpeg-spawn paths are
@@ -16,7 +18,13 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { BrightnessSignal, TapeSessionMachine, meanBrightness } from '../src/wheel-tape.js';
+import {
+  BrightnessSignal,
+  TapeSessionMachine,
+  meanBrightness,
+  roiMeanBrightness,
+  type RoiPct,
+} from '../src/wheel-tape.js';
 
 // ---------------------------------------------------------------------------
 // meanBrightness — utility
@@ -42,18 +50,94 @@ describe('meanBrightness', () => {
 });
 
 // ---------------------------------------------------------------------------
-// BrightnessSignal — Welford rolling stats + dip detection
+// roiMeanBrightness — utility
+// ---------------------------------------------------------------------------
+
+describe('roiMeanBrightness', () => {
+  // 10×4 frame (40 pixels). ROI covers left half: x=0,y=0,w=50,h=100 → x:0-4,y:0-3 (20 px).
+  const FW = 10;
+  const FH = 4;
+  const halfRoi: RoiPct = { x: 0, y: 0, w: 50, h: 100 };
+
+  it('returns correct mean for a uniform ROI', () => {
+    const buf = Buffer.alloc(FW * FH, 100);
+    // All pixels same → roi mean = frame mean = 100.
+    expect(roiMeanBrightness(buf, FW, FH, halfRoi)).toBe(100);
+  });
+
+  it('isolates ROI pixels from non-ROI pixels', () => {
+    // Left half = 200, right half = 50.
+    const buf = Buffer.alloc(FW * FH, 50);
+    for (let y = 0; y < FH; y += 1) {
+      for (let x = 0; x < 5; x += 1) {
+        buf[y * FW + x] = 200;
+      }
+    }
+    // ROI covers left half (x 0–4): should be 200.
+    expect(roiMeanBrightness(buf, FW, FH, halfRoi)).toBe(200);
+    // Overall mean is (5×200 + 5×50)/10 = 125 per row → 125.
+    expect(meanBrightness(buf)).toBe(125);
+  });
+
+  it('falls back to whole-frame mean for a degenerate zero-area ROI', () => {
+    const buf = Buffer.alloc(FW * FH, 77);
+    // Zero-width ROI → fallback.
+    const zeroRoi: RoiPct = { x: 0, y: 0, w: 0, h: 50 };
+    expect(roiMeanBrightness(buf, FW, FH, zeroRoi)).toBe(77);
+  });
+
+  it('clamps ROI that extends beyond frame boundary', () => {
+    const buf = Buffer.alloc(FW * FH, 100);
+    // ROI starting at 90% with 50% width → clamps to frame right edge.
+    const clampRoi: RoiPct = { x: 90, y: 0, w: 50, h: 100 };
+    // Should not throw; result is valid brightness in 0–255.
+    const result = roiMeanBrightness(buf, FW, FH, clampRoi);
+    expect(result).toBeGreaterThanOrEqual(0);
+    expect(result).toBeLessThanOrEqual(255);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BrightnessSignal — frame layout and test helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Synthetic time base: start at t=0, increment by 35ms per frame
- * (≈28.5 fps — close enough to 30 fps for test purposes).
+ * Test frame configuration:
+ *   Frame: 20 wide × 10 tall = 200 pixels
+ *   ROI: x=40%,y=40%,w=20%,h=20% → x:8-11, y:4-5 → 4×2 = 8 pixels
+ *
+ * This small ROI allows independent control of ROI vs. background brightness
+ * to test normalisation behaviour.
  */
+const FRAME_W = 20;
+const FRAME_H = 10;
+const TEST_ROI: RoiPct = { x: 40, y: 40, w: 20, h: 20 };
+
+/**
+ * Build a test frame where all background pixels have `bgBrightness` and
+ * the ROI pixels (x:8-11, y:4-5) have `roiBrightness`.
+ */
+function makeFrame(bgBrightness: number, roiBrightness: number): Buffer {
+  const buf = Buffer.alloc(FRAME_W * FRAME_H, bgBrightness);
+  // ROI: x in [8,12), y in [4,6) — matches 40/40/20/20 pct on 20×10
+  const x0 = Math.round(FRAME_W * 40 / 100);  // 8
+  const y0 = Math.round(FRAME_H * 40 / 100);  // 4
+  const x1 = Math.round(FRAME_W * 60 / 100);  // 12
+  const y1 = Math.round(FRAME_H * 60 / 100);  // 6
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      buf[y * FRAME_W + x] = roiBrightness;
+    }
+  }
+  return buf;
+}
+
+/** Synthetic time base: 35ms per frame ≈ 28.5 fps (close enough to 30 fps). */
 const FRAME_MS = 35;
 
 /**
- * Feed N frames of constant brightness to a BrightnessSignal, starting at
- * `startMs` and incrementing by FRAME_MS per frame. Returns the final time.
+ * Feed N frames to a BrightnessSignal where ROI and background are the same
+ * brightness (simulates a stable, untriggered wheel). Returns the final time.
  */
 function feedConstant(
   signal: BrightnessSignal,
@@ -61,222 +145,224 @@ function feedConstant(
   count: number,
   startMs: number,
 ): number {
-  const buf = Buffer.alloc(4, brightness);
   let t = startMs;
   for (let i = 0; i < count; i += 1) {
-    signal.feed(buf, t);
+    signal.feed(makeFrame(brightness, brightness), FRAME_W, FRAME_H, t);
     t += FRAME_MS;
   }
   return t;
 }
 
+/**
+ * Feed N frames where only the ROI brightness alternates between two values.
+ * Background stays constant. Returns the final time.
+ */
+function feedRoiAlternating(
+  signal: BrightnessSignal,
+  bg: number,
+  roiA: number,
+  roiB: number,
+  count: number,
+  startMs: number,
+): number {
+  let t = startMs;
+  for (let i = 0; i < count; i += 1) {
+    const roi = i % 2 === 0 ? roiA : roiB;
+    signal.feed(makeFrame(bg, roi), FRAME_W, FRAME_H, t);
+    t += FRAME_MS;
+  }
+  return t;
+}
+
+// ---------------------------------------------------------------------------
+// BrightnessSignal — Welford rolling stats
+// ---------------------------------------------------------------------------
+
 describe('BrightnessSignal — Welford rolling stats', () => {
   it('rolling mean converges to constant signal value', () => {
-    const s = new BrightnessSignal(2.0);
-    // Feed 200 frames of brightness 100. After convergence mean ≈ 100.
-    let t = 1_000_000;
-    for (let i = 0; i < 200; i += 1) {
-      s.feed(Buffer.alloc(4, 100), t);
-      t += FRAME_MS;
-    }
+    const s = new BrightnessSignal(2.0, TEST_ROI);
+    // Feed 200 uniform frames (bg = roi = 100). Normalised signal = 100.
+    const t = feedConstant(s, 100, 200, 1_000_000);
     expect(s.getMean()).toBeCloseTo(100, 1);
+    void t;
   });
 
   it('rolling std is near zero for a constant signal', () => {
-    const s = new BrightnessSignal(2.0);
-    let t = 2_000_000;
-    for (let i = 0; i < 200; i += 1) {
-      s.feed(Buffer.alloc(4, 150), t);
-      t += FRAME_MS;
-    }
-    // Std should be effectively zero for a perfectly constant signal.
+    const s = new BrightnessSignal(2.0, TEST_ROI);
+    feedConstant(s, 150, 200, 2_000_000);
+    // Normalised signal is constant 150 → std ≈ 0.
     expect(s.getStd()).toBeLessThan(1);
   });
 
-  it('rolling std is non-zero for a noisy signal', () => {
-    const s = new BrightnessSignal(2.0);
-    let t = 3_000_000;
-    for (let i = 0; i < 200; i += 1) {
-      // Alternate between 100 and 200 — std should be ~50.
-      s.feed(Buffer.alloc(4, i % 2 === 0 ? 100 : 200), t);
-      t += FRAME_MS;
-    }
+  it('rolling std is non-zero for a noisy ROI signal', () => {
+    const s = new BrightnessSignal(2.0, TEST_ROI);
+    // Background stays at 150. ROI alternates 100/200. Normalised signal ≈ 100/200.
+    feedRoiAlternating(s, 150, 100, 200, 200, 3_000_000);
+    // Std of an alternating 100/200 signal ≈ 50.
     expect(s.getStd()).toBeGreaterThan(30);
   });
 });
 
+// ---------------------------------------------------------------------------
+// BrightnessSignal — dip detection (post-warmup behaviour)
+// ---------------------------------------------------------------------------
+
+/**
+ * Warmup constant: 60 frames must be consumed before dip detection arms.
+ * Feed WARMUP_COUNT frames to pass the gate, then test detection.
+ */
+const WARMUP_COUNT = 60;
+
 describe('BrightnessSignal — dip detection', () => {
-  it('counts one dip on a clear brightness drop below the adaptive threshold', () => {
-    const s = new BrightnessSignal(2.0);
+  it('counts one dip on a clear ROI brightness drop below the adaptive threshold', () => {
+    const s = new BrightnessSignal(2.0, TEST_ROI);
     let t = 10_000_000;
 
-    // Warm up the Welford window with 200 frames of brightness 200.
+    // Warm up: 200 frames, bg=200, roi=200. Signal = 200, std ≈ 0.
     t = feedConstant(s, 200, 200, t);
 
-    // After warm-up: mean ≈ 200, std ≈ 0 → threshold ≈ 200.
-    // We need a single very dark frame well below any plausible threshold.
-    // Use brightness 50 — way below 200 - 2*std.
-    const dipBuf = Buffer.alloc(4, 50);
-    const dipResult = s.feed(dipBuf, t);
+    // Dip: ROI drops to 50 while background stays at 200.
+    // frame_mean ≈ (192×200 + 8×50)/200 = 196. frame_baseline ≈ 200.
+    // normalized = 50 - (196 - 200) = 54 → huge drop from 200.
+    const dipFrame = makeFrame(200, 50);
+    const dipResult = s.feed(dipFrame, FRAME_W, FRAME_H, t);
 
     expect(dipResult).toBe(true);
     expect(s.getRecentDips(t, 5_000)).toHaveLength(1);
   });
 
   it('single-frame brightness spike above background does NOT trigger a dip', () => {
-    const s = new BrightnessSignal(2.0);
+    const s = new BrightnessSignal(2.0, TEST_ROI);
     let t = 11_000_000;
 
-    // Warm up with darkness baseline (brightness 50).
+    // Warm up with darkness (roi=bg=50).
     t = feedConstant(s, 50, 200, t);
 
-    // Feed a bright spike — should NOT be a dip (threshold is brightness BELOW mean).
-    const spikeBuf = Buffer.alloc(4, 250);
-    const spikeResult = s.feed(spikeBuf, t);
+    // ROI spike to 250 — should NOT be a dip (dip = below mean).
+    const spikeFrame = makeFrame(50, 250);
+    const spikeResult = s.feed(spikeFrame, FRAME_W, FRAME_H, t);
 
     expect(spikeResult).toBe(false);
     expect(s.getRecentDips(t, 5_000)).toHaveLength(0);
   });
 
   it('refractory period prevents double-counting within 150ms', () => {
-    const s = new BrightnessSignal(2.0);
+    const s = new BrightnessSignal(2.0, TEST_ROI);
     let t = 12_000_000;
 
-    // Warm up with bright baseline.
     t = feedConstant(s, 200, 200, t);
 
-    // First dip.
-    const dip1 = s.feed(Buffer.alloc(4, 50), t);
+    const dipFrame = makeFrame(200, 50);
+    const dip1 = s.feed(dipFrame, FRAME_W, FRAME_H, t);
     expect(dip1).toBe(true);
-    t += FRAME_MS; // 35ms later (within 150ms refractory)
+    t += FRAME_MS; // 35ms — within 150ms refractory
 
-    // Second dark frame immediately after — must be blocked by refractory.
-    const dip2 = s.feed(Buffer.alloc(4, 50), t);
+    const dip2 = s.feed(dipFrame, FRAME_W, FRAME_H, t);
     expect(dip2).toBe(false);
 
-    // One more 35ms later — still within 150ms refractory (35+35=70ms < 150ms).
-    t += FRAME_MS;
-    const dip3 = s.feed(Buffer.alloc(4, 50), t);
+    t += FRAME_MS; // 70ms total — still within refractory
+    const dip3 = s.feed(dipFrame, FRAME_W, FRAME_H, t);
     expect(dip3).toBe(false);
 
     expect(s.getRecentDips(t, 1_000)).toHaveLength(1);
   });
 
-  it('dip is allowed after the refractory window clears (≥150ms between dips)', () => {
-    const s = new BrightnessSignal(2.0);
+  it('dip is allowed after the refractory window clears (>=150ms between dips)', () => {
+    const s = new BrightnessSignal(2.0, TEST_ROI);
     let t = 13_000_000;
 
     t = feedConstant(s, 200, 200, t);
 
-    // First dip.
-    s.feed(Buffer.alloc(4, 50), t);
-    // Advance 160ms (> 150ms refractory).
-    t += 160;
+    const dipFrame = makeFrame(200, 50);
+    s.feed(dipFrame, FRAME_W, FRAME_H, t);
+    t += 160; // > 150ms refractory
 
-    // Return to bright (so mean adapts back a bit).
-    s.feed(Buffer.alloc(4, 200), t);
+    // Recovery frame.
+    s.feed(makeFrame(200, 200), FRAME_W, FRAME_H, t);
     t += FRAME_MS;
 
-    // Second dip — should fire.
-    const dip2 = s.feed(Buffer.alloc(4, 50), t);
+    const dip2 = s.feed(dipFrame, FRAME_W, FRAME_H, t);
     expect(dip2).toBe(true);
     expect(s.getRecentDips(t, 1_000)).toHaveLength(2);
   });
 
-  it('slow brightness drift does not trigger spurious dips (adaptive mean tracks drift)', () => {
-    // The real-world camera signal has natural noise (std ≈ 5–10 brightness units).
-    // When that background noise builds up std in the rolling window, the adaptive
-    // threshold is set well below the signal mean — so a slow drift that keeps
-    // the signal near the rolling mean never drops below the threshold.
-    //
-    // Strategy: warm up with realistic noise (±8 units around 200) to build std,
-    // then drift linearly from 200 → 160 over 150 frames. Since std ≈ 8 and
-    // sensitivity = 2.0, threshold ≈ mean - 16. The drift keeps the current
-    // sample within ~8 units of the rolling mean → no dip fires.
-    const s = new BrightnessSignal(2.0);
+  it('slow ROI brightness drift does not trigger spurious dips (adaptive mean tracks drift)', () => {
+    // Background stays at 150. ROI starts at 200, drifts slowly to 160 over 150 frames.
+    // With noise std ≈ 8 and sensitivity = 2.0, threshold ≈ mean - 16.
+    // The drift keeps the signal within ~8 units of the rolling mean — no dip fires.
+    const s = new BrightnessSignal(2.0, TEST_ROI);
     let t = 14_000_000;
 
-    // Warm-up: 200 frames with alternating 192/208 (realistic camera noise, std ≈ 8).
+    // Warm-up: ROI alternating 192/208 around 200 (std ≈ 8).
     for (let i = 0; i < 200; i += 1) {
-      const brightness = i % 2 === 0 ? 192 : 208;
-      s.feed(Buffer.alloc(4, brightness), t);
+      const roi = i % 2 === 0 ? 192 : 208;
+      s.feed(makeFrame(150, roi), FRAME_W, FRAME_H, t);
       t += FRAME_MS;
     }
 
     const dipsBefore = s.getRecentDips(t, 60_000).length;
 
-    // Drift: 200 → 160 over 150 frames (0.27 units/frame).
-    // With std ≈ 8 and sensitivity = 2.0: threshold ≈ mean - 16.
-    // Drift rate ensures sample stays within ≈8 units of mean → above threshold.
+    // Slow ROI drift: 200 → 160 over 150 frames (0.27 units/frame).
     for (let i = 0; i < 150; i += 1) {
-      const brightness = Math.round(200 - i * 0.27);
-      s.feed(Buffer.alloc(4, brightness), t);
+      const roi = Math.round(200 - i * 0.27);
+      s.feed(makeFrame(150, roi), FRAME_W, FRAME_H, t);
       t += FRAME_MS;
     }
 
-    // No dips should have fired during this slow drift.
     const dipsAfter = s.getRecentDips(t, 60_000).length;
     expect(dipsAfter - dipsBefore).toBe(0);
   });
 
   it('higher sensitivity triggers dips at smaller deviations', () => {
-    // sensitivity=1.0 triggers on shallower dips than sensitivity=3.5.
-    const sLow = new BrightnessSignal(1.0);
-    const sHigh = new BrightnessSignal(3.5);
+    const sLow = new BrightnessSignal(1.0, TEST_ROI);
+    const sHigh = new BrightnessSignal(3.5, TEST_ROI);
     let t = 15_000_000;
 
-    // Warm up both with brightness 200, std ≈ 0.
+    // Warm up both: bg=150, roi=200 constant → mean=200, std≈0.
     for (let i = 0; i < 200; i += 1) {
-      sLow.feed(Buffer.alloc(4, 200), t);
-      sHigh.feed(Buffer.alloc(4, 200), t);
+      sLow.feed(makeFrame(150, 200), FRAME_W, FRAME_H, t);
+      sHigh.feed(makeFrame(150, 200), FRAME_W, FRAME_H, t);
       t += FRAME_MS;
     }
 
-    // Feed a mild dip to brightness 190 (10 below mean). With std ≈ 0 both
-    // signals have threshold ≈ 200 - sensitivity*0. With sensitivity=1 and
-    // sensitivity=3.5 and std=0 the threshold is 200 for both — so neither fires.
-    // Instead we need to create some variance first then dip below it.
-    //
-    // Re-warm with noisy signal (180–220 alternating) to build std.
+    // Build std with alternating 180/220 ROI (std ≈ 20).
     for (let i = 0; i < 100; i += 1) {
-      const b = i % 2 === 0 ? 180 : 220;
-      sLow.feed(Buffer.alloc(4, b), t);
-      sHigh.feed(Buffer.alloc(4, b), t);
+      const roi = i % 2 === 0 ? 180 : 220;
+      sLow.feed(makeFrame(150, roi), FRAME_W, FRAME_H, t);
+      sHigh.feed(makeFrame(150, roi), FRAME_W, FRAME_H, t);
       t += FRAME_MS;
     }
-    // std is now ~20. threshold_low = mean - 1.0*20 ≈ 200 - 20 = 180.
-    // threshold_high = mean - 3.5*20 ≈ 200 - 70 = 130.
-    // A brightness of 160 is below threshold_low (160 < 180) but above threshold_high (160 > 130).
+    // std ≈ 20. threshold_low = mean - 1.0*20 ≈ 180. threshold_high = mean - 3.5*20 ≈ 130.
+    // ROI brightness 160: below threshold_low (160 < 180) but above threshold_high (160 > 130).
 
     t += 200; // clear refractory
 
-    const dipLow = sLow.feed(Buffer.alloc(4, 160), t);
-    const dipHigh = sHigh.feed(Buffer.alloc(4, 160), t);
+    const dipLow = sLow.feed(makeFrame(150, 160), FRAME_W, FRAME_H, t);
+    const dipHigh = sHigh.feed(makeFrame(150, 160), FRAME_W, FRAME_H, t);
 
     expect(dipLow).toBe(true);   // sensitivity=1.0 triggers
     expect(dipHigh).toBe(false); // sensitivity=3.5 does NOT trigger
   });
 
   it('counts multiple dips with refractory clearance between each', () => {
-    const s = new BrightnessSignal(2.0);
+    const s = new BrightnessSignal(2.0, TEST_ROI);
     let t = 16_000_000;
 
     t = feedConstant(s, 200, 200, t);
 
-    // 5 dips each 200ms apart (well above 150ms refractory).
     const TARGET = 5;
     for (let i = 0; i < TARGET; i += 1) {
-      s.feed(Buffer.alloc(4, 50), t);  // dip frame
+      s.feed(makeFrame(200, 50), FRAME_W, FRAME_H, t);  // dip
       t += 200;
-      s.feed(Buffer.alloc(4, 200), t); // recovery frame
-      t += 35;
+      s.feed(makeFrame(200, 200), FRAME_W, FRAME_H, t); // recovery
+      t += FRAME_MS;
     }
 
     expect(s.getRecentDips(t, 5_000)).toHaveLength(TARGET);
   });
 
   it('getLiveSnapshot returns non-null samples and correct structure', () => {
-    const s = new BrightnessSignal(2.0);
+    const s = new BrightnessSignal(2.0, TEST_ROI);
     let t = 17_000_000;
 
     t = feedConstant(s, 150, 50, t);
@@ -294,11 +380,85 @@ describe('BrightnessSignal — dip detection', () => {
 });
 
 // ---------------------------------------------------------------------------
+// BrightnessSignal — whole-frame normalisation (new behaviour)
+// ---------------------------------------------------------------------------
+
+describe('BrightnessSignal — whole-frame normalisation', () => {
+  it('global brightness drop (autoexposure) does NOT fire a dip on the normalised signal', () => {
+    // Simulate camera autoexposure dropping whole frame by 20 units.
+    // Both ROI and background drop equally → frame_mean drops → normalised stays flat.
+    const s = new BrightnessSignal(2.0, TEST_ROI);
+    let t = 20_000_000;
+
+    // Warm up at bg=200, roi=200 (200 frames well past the warmup gate).
+    t = feedConstant(s, 200, 200, t);
+
+    const dipsBefore = s.getRecentDips(t, 60_000).length;
+
+    // 10 frames of uniform global drop: all pixels 180 (drop of 20).
+    for (let i = 0; i < 10; i += 1) {
+      // Uniform frame: bg = roi = 180.
+      s.feed(makeFrame(180, 180), FRAME_W, FRAME_H, t);
+      t += FRAME_MS;
+    }
+
+    const dipsAfter = s.getRecentDips(t, 60_000).length;
+    expect(dipsAfter - dipsBefore).toBe(0);
+  });
+
+  it('local ROI drop (tape crossing) DOES fire a dip on the normalised signal', () => {
+    // Only the ROI pixels darken; background is unchanged.
+    // frame_mean barely moves; normalised drops sharply.
+    const s = new BrightnessSignal(2.0, TEST_ROI);
+    let t = 21_000_000;
+
+    // Warm up: bg=200, roi=200.
+    t = feedConstant(s, 200, 200, t);
+
+    const dipsBefore = s.getRecentDips(t, 60_000).length;
+
+    // Single tape-crossing frame: bg stays 200, ROI drops to 50.
+    s.feed(makeFrame(200, 50), FRAME_W, FRAME_H, t);
+
+    const dipsAfter = s.getRecentDips(t, 60_000).length;
+    expect(dipsAfter - dipsBefore).toBe(1);
+  });
+
+  it('warmup gate: first 60 frames produce no dips even if normalised signal crosses threshold', () => {
+    // Immediately after construction, the rolling window is empty.
+    // Even if we see a huge dip-like signal right away, no dip should fire
+    // until 60 frames have been consumed.
+    const s = new BrightnessSignal(2.0, TEST_ROI);
+    let t = 22_000_000;
+
+    // Feed 59 frames that look like dips (ROI very dark vs bright background).
+    // None should register — we're still in warmup.
+    for (let i = 0; i < 59; i += 1) {
+      s.feed(makeFrame(200, 10), FRAME_W, FRAME_H, t);
+      t += FRAME_MS;
+    }
+    expect(s.getRecentDips(t, 60_000)).toHaveLength(0);
+
+    // Frame 60 is still in warmup (gate is < 60).
+    // Frame 61 arms the detector. But now the rolling stats have converged to
+    // the dark signal, so the threshold is calibrated around it — the very-dark
+    // frames should not trigger a dip against their own established mean.
+    // Feed a clear dip AFTER warmup to verify detection is now armed.
+    // First, stabilise signal: 200 frames of normal bg=200,roi=200.
+    t = feedConstant(s, 200, 200, t);
+
+    // Now a tape-crossing dip should fire.
+    const dipResult = s.feed(makeFrame(200, 50), FRAME_W, FRAME_H, t);
+    expect(dipResult).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // TapeSessionMachine — session lifecycle FSM
 // ---------------------------------------------------------------------------
 
 describe('TapeSessionMachine — session lifecycle', () => {
-  it('first dip starts a session (idle → active)', () => {
+  it('first dip starts a session (idle -> active)', () => {
     const sessions: ReturnType<typeof makeSession>[] = [];
     const machine = new TapeSessionMachine(1, (s) => sessions.push(s));
 
@@ -317,7 +477,6 @@ describe('TapeSessionMachine — session lifecycle', () => {
     machine.onDip(t0);
     expect(machine.getState()).toBe('active');
 
-    // Advance 15s — idle timer should fire.
     await vi.advanceTimersByTimeAsync(15_000);
 
     expect(machine.getState()).toBe('idle');
@@ -354,12 +513,10 @@ describe('TapeSessionMachine — session lifecycle', () => {
     const t0 = 3_000_000;
     machine.onDip(t0);
 
-    // Dip at 14s (one second before the 15s timeout would fire).
     await vi.advanceTimersByTimeAsync(14_000);
     machine.onDip(t0 + 14_000);
-    expect(machine.getState()).toBe('active'); // timer was reset
+    expect(machine.getState()).toBe('active');
 
-    // Now advance another 15s — session ends.
     await vi.advanceTimersByTimeAsync(15_000);
     expect(machine.getState()).toBe('idle');
     expect(sessions).toHaveLength(1);
@@ -395,7 +552,6 @@ describe('TapeSessionMachine — session lifecycle', () => {
     const machine = new TapeSessionMachine(1, (s) => sessions.push(s));
 
     const t0 = 6_000_000;
-    // 4 dips spread over ~3s: [t0, t0+1000, t0+2000, t0+3000]
     machine.onDip(t0);
     machine.onDip(t0 + 1_000);
     machine.onDip(t0 + 2_000);
@@ -407,11 +563,8 @@ describe('TapeSessionMachine — session lifecycle', () => {
     expect(s).toBeDefined();
     expect(s?.startedAt).toBe(t0);
     expect(s?.rotations).toBe(4);
-    // meanRps: 4 rotations over (endedAt - t0) seconds.
-    // endedAt ≈ t0 + 3000 + 15000 = t0 + 18000.
     expect(s?.meanRps).toBeGreaterThan(0);
     expect(s?.peakRps).toBeGreaterThan(0);
-    // Peak in any 1s window: all 4 dips are in different seconds → peakRps ≥ 1.
     expect(s?.peakRps).toBeGreaterThanOrEqual(1);
     vi.useRealTimers();
   });
@@ -421,8 +574,7 @@ describe('TapeSessionMachine — session lifecycle', () => {
     const sessions: ReturnType<typeof makeSession>[] = [];
     const machine = new TapeSessionMachine(1, (s) => sessions.push(s));
 
-    const t0 = 7_000_000_000; // use a timestamp at a second boundary
-    // 3 dips within the same 1-second window.
+    const t0 = 7_000_000_000; // at a second boundary
     machine.onDip(t0);
     machine.onDip(t0 + 200);
     machine.onDip(t0 + 400);
@@ -435,7 +587,7 @@ describe('TapeSessionMachine — session lifecycle', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Narrator integration: synthetic dip sequence → diary entry
+// Narrator integration: synthetic dip sequence -> diary entry
 // ---------------------------------------------------------------------------
 
 let workdir: string;
@@ -460,7 +612,7 @@ afterEach(() => {
   void Promise.all([resetConfig(), resetDb()]);
 });
 
-describe('narrator integration — tape session → diary entry', () => {
+describe('narrator integration — tape session -> diary entry', () => {
   it('handleWheelTapeSession writes a diary entry with correct wheel_meters', async () => {
     const { handleWheelTapeSession, resetNarratorState } =
       await import('../src/narrator.js');
@@ -543,7 +695,6 @@ describe('narrator integration — tape session → diary entry', () => {
     expect((det['wheel_meters'] as number)).toBeCloseTo(1.95, 4);
     expect(det['rotations']).toBe(15);
     expect(det['merged_sessions']).toBe(1);
-    // peak_rps should be the max of 3 and 2.
     expect(det['peak_rps']).toBe(3);
   });
 
@@ -572,7 +723,6 @@ describe('narrator integration — tape session → diary entry', () => {
     const db = await import('../src/db.js');
     resetNarratorState();
 
-    // Create camera without specifying circumference — defaults to 13.0.
     const cam = db.createCamera({
       name: 'tape-cam', emoji: '🎡', stream_url: 'rtsp://x/w', enabled: true,
     });

@@ -4,18 +4,27 @@
 // ARCHITECTURE
 // ------------
 // One long-lived ffmpeg per camera where `wheel_motion_roi_x IS NOT NULL`.
-// Each ffmpeg crops to a wide horizontal STRIP ROI at 30 fps and emits raw
-// grayscale PGM frames on stdout. Per frame, the module computes the mean
-// brightness of the strip to produce a continuous brightness time-series.
+// Each ffmpeg emits a full-frame grayscale PGM stream at 30 fps. Per frame
+// the module computes:
+//   - frame_mean: mean brightness of the entire frame
+//   - roi_mean:   mean brightness of the configured ROI sub-rectangle
+//   - normalized: roi_mean - (frame_mean - frame_baseline)
+//
+// Normalising by whole-frame drift cancels camera autoexposure adjustments,
+// IR LED PWM flicker, and residual mains flicker that power_line_frequency
+// doesn't fully eliminate. A global brightness drop shows up equally in
+// frame_mean and roi_mean — subtraction cancels it out. A tape crossing the
+// ROI produces a LOCAL drop in roi_mean with negligible effect on frame_mean.
 //
 // DIP DETECTION (adaptive threshold)
 // -----------------------------------
 // A Welford rolling window over the last 150 samples (5 s at 30 fps) tracks
-// the mean μ and standard deviation σ of the brightness signal. A "dip event"
+// the mean μ and standard deviation σ of the NORMALISED signal. A "dip event"
 // fires when:
 //
-//   brightness[t] < μ - sensitivity × σ
+//   normalized[t] < μ - sensitivity × σ
 //   AND it has been ≥ 150 ms since the previous dip (refractory period)
+//   AND at least 60 frames have been received (warmup gate)
 //
 // Each dip = one wheel rotation.
 //
@@ -29,9 +38,10 @@
 //
 // LIVE SIGNAL BUFFER
 // ------------------
-// Each camera maintains a 10 s ring buffer of brightness samples (300 at
-// 30 fps) and a 60 s ring buffer of dip timestamps. getLiveSignal() returns
-// the current buffer state so the UI can render an oscilloscope.
+// Each camera maintains a 10 s ring buffer of NORMALISED brightness samples
+// (300 at 30 fps) and a 60 s ring buffer of dip timestamps. getLiveSignal()
+// returns the current buffer state so the UI can render an oscilloscope.
+// The oscilloscope therefore shows exactly what the dip detector sees.
 //
 // RESTART POLICY
 // --------------
@@ -93,6 +103,13 @@ const LIVE_BUFFER_SAMPLES = 300;
 /** Recent dip timestamp ring buffer: last 60 s. */
 const DIP_RING_SECONDS = 60;
 
+/**
+ * Number of frames to consume before dip detection is armed. Prevents false
+ * positives during ffmpeg startup / RTSP re-negotiation when the normalised
+ * signal has not yet stabilised. 60 frames = 2 s at 30 fps.
+ */
+const WARMUP_FRAMES = 60;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -120,7 +137,11 @@ export type SessionCallback = (session: WheelTapeSession) => void;
  * Returned by getLiveSignal(); consumed by the tRPC getWheelTape query.
  */
 export interface LiveSignal {
-  /** Last ~300 brightness values (0–255). Oldest first. */
+  /**
+   * Last ~300 NORMALISED brightness values. Oldest first.
+   * normalized[t] = roi_mean[t] - (frame_mean[t] - frame_baseline[t])
+   * This is exactly what the dip detector sees — the oscilloscope renders this.
+   */
   samples: number[];
   /** Approximate ms between samples at the current frame rate. */
   sampleMs: number;
@@ -142,12 +163,12 @@ export interface LiveSignal {
 // PGM stream parser — reused from wheel-motion.ts (same wire format)
 // ---------------------------------------------------------------------------
 
-type FrameCallback = (framePixels: Buffer, receivedAtMs: number) => void;
+type FrameCallback = (framePixels: Buffer, width: number, height: number, receivedAtMs: number) => void;
 
 /**
  * Stateful PGM stream parser. Feeds raw bytes from ffmpeg stdout; invokes
  * `onFrame` with the raw pixel buffer (width×height bytes, greyscale 0–255)
- * for each complete frame.
+ * plus the frame dimensions for each complete frame.
  *
  * PGM binary format (P5):
  *   P5\n<width> <height>\n255\n<width*height bytes>
@@ -155,6 +176,8 @@ type FrameCallback = (framePixels: Buffer, receivedAtMs: number) => void;
 class PgmFrameParser {
   private buf = Buffer.alloc(0);
   private frameBytes: number | null = null;
+  private frameWidth: number | null = null;
+  private frameHeight: number | null = null;
   private headerDone = false;
 
   constructor(private readonly onFrame: FrameCallback) {}
@@ -176,6 +199,8 @@ class PgmFrameParser {
           return;
         }
         this.frameBytes = dims.width * dims.height;
+        this.frameWidth = dims.width;
+        this.frameHeight = dims.height;
         this.buf = this.buf.slice(headerEnd);
         this.headerDone = true;
       }
@@ -184,11 +209,15 @@ class PgmFrameParser {
       if (this.buf.length < need) return;
 
       const frameData = this.buf.slice(0, need);
+      const w = this.frameWidth ?? 1;
+      const h = this.frameHeight ?? 1;
       this.buf = this.buf.slice(need);
       this.headerDone = false;
       this.frameBytes = null;
+      this.frameWidth = null;
+      this.frameHeight = null;
 
-      this.onFrame(frameData, Date.now());
+      this.onFrame(frameData, w, h, Date.now());
     }
   }
 
@@ -218,30 +247,51 @@ class PgmFrameParser {
 }
 
 // ---------------------------------------------------------------------------
-// Brightness signal — Welford rolling stats + dip detection
+// Brightness signal — Welford rolling stats + whole-frame normalisation + dip detection
 // ---------------------------------------------------------------------------
+
+/**
+ * ROI definition as percentage-of-frame coordinates (0–100).
+ * Matches the wheel_motion_roi_* columns in the cameras table.
+ */
+export interface RoiPct {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
 /**
  * Per-camera brightness signal processor.
  *
  * Responsibilities:
- *   1. Compute mean brightness of each frame buffer.
- *   2. Maintain an exact rolling mean/std over the last WELFORD_WINDOW samples
- *      using a circular buffer with two-pass recalculation. The buffer is only
- *      150 entries (5 s at 30 fps) so O(N) per frame is negligible (~150 adds).
- *   3. Detect dip events (brightness < mean - sensitivity × std) with refractory.
- *   4. Maintain a 10 s live ring buffer for the UI oscilloscope.
- *   5. Maintain a 60 s dip ring buffer for recent-dip queries.
- *   6. Maintain per-second rotation counts for peakRps calculation.
+ *   1. For each full-frame PGM buffer, compute roi_mean and frame_mean.
+ *   2. Maintain a rolling mean of frame_mean (frame_baseline) using a
+ *      separate WELFORD_WINDOW-sized circular buffer.
+ *   3. Produce normalized[t] = roi_mean[t] - (frame_mean[t] - frame_baseline[t]).
+ *      Global autoexposure shifts cancel; local ROI changes (tape) survive.
+ *   4. Maintain an exact rolling mean/std over the last WELFORD_WINDOW normalised
+ *      samples for adaptive threshold computation.
+ *   5. Detect dip events (normalized < mean - sensitivity × std) with refractory,
+ *      gated by a WARMUP_FRAMES startup delay.
+ *   6. Maintain a 10 s live ring buffer (normalised) for the UI oscilloscope.
+ *   7. Maintain a 60 s dip ring buffer for recent-dip queries.
+ *   8. Maintain per-second rotation counts for peakRps calculation.
  *
  * This class is pure (no I/O). Time is injected via `nowMs` arguments so tests
  * can control the clock precisely.
+ *
+ * When `roi` is null (no ROI configured), the detector never fires. When `roi`
+ * is provided but frame dimensions are 0, the ROI fallback uses the whole frame.
  */
 export class BrightnessSignal {
-  // Circular sample buffer for exact rolling stats.
+  // Circular sample buffer of NORMALISED values for adaptive stats.
   private readonly windowBuffer: number[] = [];
 
-  // Live ring buffer (300 samples → 10 s at 30 fps).
+  // Circular sample buffer of frame_mean values for the baseline rolling mean.
+  private readonly frameBaselineBuffer: number[] = [];
+
+  // Live ring buffer (300 samples → 10 s at 30 fps). Stores NORMALISED values.
   private readonly liveBuffer: number[] = [];
 
   // Dip ring buffer: timestamps of dips in the last 60 s.
@@ -251,43 +301,69 @@ export class BrightnessSignal {
   private lastDipMs = -Infinity;
 
   // Per-second rotation windows for peakRps.
-  // Each entry: { windowStart: ms, count: number }
   private readonly secondWindows: Array<{ windowStart: number; count: number }> = [];
 
-  // Cached rolling stats — recomputed from windowBuffer after every update.
+  // Frame counter for warmup gate.
+  private frameCount = 0;
+
+  // Cached rolling stats for NORMALISED signal — recomputed after every update.
   private _mean = 0;
   private _std = 0;
 
-  constructor(private readonly sensitivity: number) {}
+  constructor(
+    private readonly sensitivity: number,
+    private readonly roi: RoiPct | null,
+  ) {}
 
   /**
-   * Process one frame buffer. `nowMs` is the wall-clock time at frame receipt.
+   * Process one full-frame buffer. `width` and `height` are the PGM frame
+   * dimensions. `nowMs` is the wall-clock time at frame receipt.
    * Returns true when a dip event fires (one rotation counted).
    */
-  feed(pixels: Buffer, nowMs: number): boolean {
-    const brightness = meanBrightness(pixels);
+  feed(pixels: Buffer, width: number, height: number, nowMs: number): boolean {
+    this.frameCount += 1;
 
-    // Update live ring buffer.
-    this.liveBuffer.push(brightness);
+    const frameMean = meanBrightness(pixels);
+    const roiMean = this.roi !== null
+      ? roiMeanBrightness(pixels, width, height, this.roi)
+      : frameMean;
+
+    // Update the frame_baseline rolling buffer.
+    this.frameBaselineBuffer.push(frameMean);
+    if (this.frameBaselineBuffer.length > WELFORD_WINDOW) {
+      this.frameBaselineBuffer.shift();
+    }
+    const frameBaseline = rollingMean(this.frameBaselineBuffer);
+
+    // normalized = roi_mean - (frame_mean - frame_baseline)
+    const normalized = roiMean - (frameMean - frameBaseline);
+
+    // Update live ring buffer with normalised value.
+    this.liveBuffer.push(normalized);
     while (this.liveBuffer.length > LIVE_BUFFER_SAMPLES) this.liveBuffer.shift();
 
-    // Update circular window buffer for rolling stats.
-    this.windowBuffer.push(brightness);
+    // Update circular window buffer of normalised values for rolling stats.
+    this.windowBuffer.push(normalized);
     if (this.windowBuffer.length > WELFORD_WINDOW) {
       this.windowBuffer.shift();
     }
 
-    // Recompute exact mean and std from the window buffer.
+    // Recompute exact mean and std from the normalised window buffer.
     this.recomputeStats();
 
-    // Dip detection: brightness below adaptive threshold?
-    // Apply a minimum std floor so the detector isn't hair-trigger when the
-    // signal is constant (std ≈ 0). The floor requires a dip to be at least
-    // sensitivity × MIN_STD_FLOOR brightness units below the rolling mean.
+    // Gate dip detection on:
+    //   - ROI must be configured
+    //   - warmup window must have elapsed
+    //   - refractory period must have cleared
+    //   - at least 5 samples in window (belt-and-suspenders against first-frame edge)
+    if (this.roi === null || this.frameCount < WARMUP_FRAMES) {
+      return false;
+    }
+
     const effectiveStd = Math.max(this._std, MIN_STD_FLOOR);
     const threshold = this._mean - this.sensitivity * effectiveStd;
     const inRefractory = nowMs - this.lastDipMs < REFRACTORY_MS;
-    const isDip = brightness < threshold && !inRefractory && this.windowBuffer.length >= 5;
+    const isDip = normalized < threshold && !inRefractory && this.windowBuffer.length >= 5;
 
     if (isDip) {
       this.lastDipMs = nowMs;
@@ -333,12 +409,12 @@ export class BrightnessSignal {
     this._std = n > 1 ? Math.sqrt(sumSq / (n - 1)) : 0;
   }
 
-  /** Current rolling mean (0–255). */
+  /** Current rolling mean of the NORMALISED signal (0–255 range). */
   getMean(): number {
     return this._mean;
   }
 
-  /** Current rolling standard deviation. */
+  /** Current rolling standard deviation of the NORMALISED signal. */
   getStd(): number {
     return this._std;
   }
@@ -378,7 +454,7 @@ export class BrightnessSignal {
     return peak;
   }
 
-  /** Snapshot of the live buffer state. */
+  /** Snapshot of the live buffer state. Samples are NORMALISED values. */
   getLiveSnapshot(nowMs: number): {
     samples: number[];
     sampleMs: number;
@@ -528,7 +604,7 @@ export class TapeSessionMachine {
 }
 
 // ---------------------------------------------------------------------------
-// Mean brightness (average of all pixel values in a grayscale frame buffer)
+// Pure brightness utility functions
 // ---------------------------------------------------------------------------
 
 /**
@@ -542,6 +618,52 @@ export function meanBrightness(pixels: Buffer): number {
     sum += pixels[i] ?? 0;
   }
   return sum / pixels.length;
+}
+
+/**
+ * Compute the mean brightness of the pixels within a percentage-based ROI
+ * sub-rectangle of a greyscale frame buffer (row-major, 1 byte per pixel).
+ *
+ * ROI coordinates are expressed as percentages of the frame width/height
+ * (0–100). Clamped to frame boundaries. Falls back to `meanBrightness` when
+ * the ROI clips to zero area.
+ */
+export function roiMeanBrightness(
+  pixels: Buffer,
+  frameWidth: number,
+  frameHeight: number,
+  roi: RoiPct,
+): number {
+  const x0 = Math.max(0, Math.round(frameWidth  * roi.x / 100));
+  const y0 = Math.max(0, Math.round(frameHeight * roi.y / 100));
+  const x1 = Math.min(frameWidth,  Math.round(frameWidth  * (roi.x + roi.w) / 100));
+  const y1 = Math.min(frameHeight, Math.round(frameHeight * (roi.y + roi.h) / 100));
+
+  if (x1 <= x0 || y1 <= y0) {
+    // Degenerate ROI — fall back to whole-frame mean.
+    return meanBrightness(pixels);
+  }
+
+  let sum = 0;
+  let count = 0;
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      sum += pixels[y * frameWidth + x] ?? 0;
+      count += 1;
+    }
+  }
+  return count > 0 ? sum / count : meanBrightness(pixels);
+}
+
+/**
+ * Compute the arithmetic mean of an array of numbers.
+ * Returns 0 for an empty array.
+ */
+function rollingMean(buf: number[]): number {
+  if (buf.length === 0) return 0;
+  let sum = 0;
+  for (const v of buf) sum += v;
+  return sum / buf.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -719,13 +841,14 @@ function spawnDetectorForCamera(camera: db.CameraRow, backoffMs: number): void {
     return;
   }
 
-  // Wide horizontal strip crop at 30 fps, grayscale output.
-  const cropFilter = `crop=iw*${roiW}/100:ih*${roiH}/100:iw*${roiX}/100:ih*${roiY}/100,fps=${SAMPLE_FPS},format=gray`;
+  // Full-frame grayscale at 30 fps. ROI cropping happens in JS so that we can
+  // compute both roi_mean and frame_mean from the same buffer for normalisation.
+  const frameFilter = `fps=${SAMPLE_FPS},format=gray`;
 
   const rawProc = spawn('ffmpeg', [
     '-rtsp_transport', 'tcp',
     '-i', rtspUrl,
-    '-vf', cropFilter,
+    '-vf', frameFilter,
     '-vsync', 'vfr',
     '-f', 'image2pipe',
     '-vcodec', 'pgm',
@@ -733,8 +856,9 @@ function spawnDetectorForCamera(camera: db.CameraRow, backoffMs: number): void {
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   const proc = rawProc as DetectorHandle['proc'];
 
+  const roi: RoiPct = { x: roiX, y: roiY, w: roiW, h: roiH };
   const startedAtMs = Date.now();
-  const signal = new BrightnessSignal(sensitivity);
+  const signal = new BrightnessSignal(sensitivity, roi);
   const session = new TapeSessionMachine(
     cameraId,
     (completedSession) => {
@@ -752,8 +876,8 @@ function spawnDetectorForCamera(camera: db.CameraRow, backoffMs: number): void {
     cameraId,
     signal,
     session,
-    parser: new PgmFrameParser((framePixels, receivedAtMs) => {
-      const isDip = signal.feed(framePixels, receivedAtMs);
+    parser: new PgmFrameParser((framePixels, frameWidth, frameHeight, receivedAtMs) => {
+      const isDip = signal.feed(framePixels, frameWidth, frameHeight, receivedAtMs);
       if (isDip) {
         session.onDip(receivedAtMs);
       }
@@ -785,8 +909,8 @@ function spawnDetectorForCamera(camera: db.CameraRow, backoffMs: number): void {
   });
 
   log.info(
-    { cameraId, rtspUrl, roiX, roiY, roiW, roiH, sensitivity, sampleFps: SAMPLE_FPS },
-    'wheel-tape: detector started',
+    { cameraId, rtspUrl, roiX, roiY, roiW, roiH, sensitivity, sampleFps: SAMPLE_FPS, normalisationEnabled: true },
+    'wheel-tape: detector started (full-frame normalisation)',
   );
 }
 
