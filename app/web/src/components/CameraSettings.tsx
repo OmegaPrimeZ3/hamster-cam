@@ -9,6 +9,7 @@ import { ChevronUp, ChevronDown, Pencil, Trash2, Plus } from 'lucide-react';
 import { trpc, RouterOutputs } from '../trpc';
 import { AddCameraForm } from './AddCameraForm';
 import { activityStyle, isZoneActivity, zoneLabel } from '../lib/activity-style';
+import { WheelMotionCalibrator } from './WheelMotionCalibrator';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 
@@ -92,6 +93,7 @@ export function CameraSettings(): JSX.Element {
             {editing?.id === cam.id ? (
               <AddCameraForm existing={cam} onDone={() => setEditing(null)} />
             ) : (
+              <>
               <div
                 style={{
                   display: 'flex',
@@ -256,6 +258,14 @@ export function CameraSettings(): JSX.Element {
                   {confirmDelete === cam.id ? ' Confirm' : ''}
                 </button>
               </div>
+              {/* Wheel motion calibration — shown when wheel zone is configured */}
+              {cam.zones.includes('wheel') && (
+                <WheelMotionCalibrator
+                  cameraId={cam.id}
+                  liveSrc={cam.live_src ?? null}
+                />
+              )}
+              </>
             )}
           </li>
         ))}

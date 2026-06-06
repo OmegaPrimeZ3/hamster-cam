@@ -42,6 +42,12 @@ const CAM_BASE = {
   wheel_band_y_pct: 50,
   wheel_band_height_pct: 10,
   wheel_threshold_pct: 30,
+  wheel_motion_roi_x: null as number | null,
+  wheel_motion_roi_y: null as number | null,
+  wheel_motion_roi_w: null as number | null,
+  wheel_motion_roi_h: null as number | null,
+  wheel_motion_threshold: 12,
+  wheel_avg_speed_mps: 1.0,
 };
 
 const CAM_ENABLED = {

@@ -4,17 +4,13 @@
 // (live_src), NOT a raw RTSP URL. The Discover button populates a dropdown
 // from cameras.discover; the user can also type a name manually as a fallback.
 //
-// When 'wheel' is in the zones array, a WheelOdometerSection is rendered
-// below the zones picker — its fields travel through the same save mutation.
+// Wheel motion calibration lives in the WheelMotionCalibrator component which
+// is rendered per-camera in CameraSettings. It is a separate tRPC procedure
+// and does not travel through this form's save mutation.
 
 import { useEffect, useState } from 'react';
 import { trpc, RouterOutputs } from '../trpc';
 import { ZONE_ACTIVITIES, activityStyle, zoneLabel } from '../lib/activity-style';
-import {
-  WheelOdometerSection,
-  WHEEL_CONFIG_DEFAULTS,
-  type WheelConfig,
-} from './WheelOdometerSection';
 
 type CameraDTO = RouterOutputs['cameras']['list'][number];
 
@@ -54,18 +50,6 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const [zones, setZones] = useState<string[]>(existing?.zones ?? []);
 
-  // Wheel odometer config
-  const existingExt = existing as (CameraDTO & Partial<WheelConfig>) | undefined;
-  const [wheelConfig, setWheelConfig] = useState<WheelConfig>({
-    wheel_mark_enabled: existingExt?.wheel_mark_enabled ?? WHEEL_CONFIG_DEFAULTS.wheel_mark_enabled,
-    wheel_diameter_mm: existingExt?.wheel_diameter_mm ?? WHEEL_CONFIG_DEFAULTS.wheel_diameter_mm,
-    wheel_band_x_pct: existingExt?.wheel_band_x_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_band_x_pct,
-    wheel_band_width_pct: existingExt?.wheel_band_width_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_band_width_pct,
-    wheel_band_y_pct: existingExt?.wheel_band_y_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_band_y_pct,
-    wheel_band_height_pct: existingExt?.wheel_band_height_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_band_height_pct,
-    wheel_threshold_pct: existingExt?.wheel_threshold_pct ?? WHEEL_CONFIG_DEFAULTS.wheel_threshold_pct,
-  });
-
   function toggleZone(z: string): void {
     setZones((prev) => (prev.includes(z) ? prev.filter((x) => x !== z) : [...prev, z]));
   }
@@ -94,13 +78,15 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
     };
 
     if (existing) {
-      const payload: unknown = {
+      update.mutate({
         id: existing.id,
-        ...commonFields,
+        name: commonFields.name,
+        emoji: commonFields.emoji,
+        enabled: commonFields.enabled,
+        zones: commonFields.zones,
+        live_src: commonFields.live_src,
         stream_url: existing.stream_url ?? '',
-        ...(zones.includes('wheel') ? wheelConfig : {}),
-      };
-      (update.mutate as (input: unknown) => void)(payload);
+      });
     } else {
       create.mutate({
         name: commonFields.name,
@@ -221,16 +207,6 @@ export function AddCameraForm({ existing, onDone }: AddCameraFormProps): JSX.Ele
           })}
         </div>
       </div>
-
-      {/* Wheel odometer subsection — only shown when 'wheel' zone is active */}
-      {zones.includes('wheel') && existing && (
-        <WheelOdometerSection
-          cameraId={existing.id}
-          config={wheelConfig}
-          onChange={setWheelConfig}
-          liveSrc={existing.live_src}
-        />
-      )}
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
         <button type="submit" className="hc-btn hc-btn-primary" disabled={!formOk || submitting}>
