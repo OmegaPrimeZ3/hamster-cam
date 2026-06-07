@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic re-application of camera anti-flicker control
+Documentation=https://github.com/aaroncoppock/hamster-cam
+
+[Timer]
+# Short boot delay so the camera has time to enumerate before the first check.
+OnBootSec=90s
+# Re-check every 5 minutes. A USB reset that reverts the control to 50 Hz
+# produces visible banding within a few seconds; 5 minutes keeps the repair
+# window short while adding essentially zero overhead (~2 ms of v4l2-ctl).
+OnUnitActiveSec=5min
+Unit=v4l2-flicker-fix.service
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

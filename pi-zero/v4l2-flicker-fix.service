@@ -1,0 +1,21 @@
+[Unit]
+Description=Re-apply USB camera anti-flicker (power_line_frequency=2) after USB reset
+Documentation=https://github.com/aaroncoppock/hamster-cam
+# Only meaningful while go2rtc is up and the camera is in use. If go2rtc is
+# stopped for maintenance the timer fires harmlessly (the script detects the
+# correct value and exits silently) or detects no device and exits 0.
+After=go2rtc.service
+
+[Service]
+Type=oneshot
+# The script only logs when the value has drifted — silent if 60 Hz already.
+ExecStart=-/usr/local/sbin/v4l2-flicker-fix.sh
+# Override device path here if the camera is not at /dev/video0.
+# Environment=V4L2_DEVICE=/dev/video0
+User=root
+Group=root
+# Deny privilege escalation beyond what root already has.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
