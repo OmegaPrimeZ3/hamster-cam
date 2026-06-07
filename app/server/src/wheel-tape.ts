@@ -6,15 +6,63 @@
 // One long-lived ffmpeg per camera where `wheel_motion_roi_x IS NOT NULL`.
 // Each ffmpeg emits a full-frame grayscale PGM stream at 30 fps. Per frame
 // the module computes:
-//   - frame_mean: mean brightness of the entire frame
-//   - roi_mean:   mean brightness of the configured ROI sub-rectangle
-//   - normalized: roi_mean - (frame_mean - frame_baseline)
+//   - roi_mean:      mean brightness of the configured ROI sub-rectangle
+//   - reference:     EITHER band_ref_mean (same Y rows as ROI, X outside ROI)
+//                    OR frame_mean (whole-frame fallback when band ref unavailable)
+//   - normalized:    roi_mean - (reference - reference_baseline)
 //
-// Normalising by whole-frame drift cancels camera autoexposure adjustments,
-// IR LED PWM flicker, and residual mains flicker that power_line_frequency
-// doesn't fully eliminate. A global brightness drop shows up equally in
-// frame_mean and roi_mean — subtraction cancels it out. A tape crossing the
-// ROI produces a LOCAL drop in roi_mean with negligible effect on frame_mean.
+// ROW-BAND-LOCAL NORMALISATION
+// ----------------------------
+// Mains-flicker rolling-shutter banding produces horizontal stripes of
+// brightness that scroll up/down the frame. Whole-frame normalisation fails
+// because the frame mean averages over many bands and stays approximately
+// constant — but the ROI sits at a fixed Y position and sees only the band
+// at that Y, so its mean swings with the local band brightness.
+//
+// The fix: sample the reference from the SAME Y rows as the ROI but from X
+// columns outside the ROI. The reference sees the same band pattern at every
+// moment. Subtracting (band_ref_mean - band_baseline) from roi_mean cancels
+// the banding. A tape crossing the ROI darkens roi_mean without affecting
+// band_ref_mean — the dip survives.
+//
+// FALLBACK CONDITIONS
+// -------------------
+// Use whole-frame mean instead of band reference when:
+//   - The ROI spans the full frame width (no X columns available outside it)
+//   - The total background pixel count is < 5% of frame width on each side
+//     (band reference area too small to be reliable)
+//
+// DIP DETECTION (adaptive threshold)
+// -----------------------------------
+// A Welford rolling window over the last 150 samples (5 s at 30 fps) tracks
+// the mean μ and standard deviation σ of the NORMALISED signal. A "dip event"
+// fires when:
+//
+//   normalized[t] < μ - sensitivity × σ
+//   AND it has been ≥ 150 ms since the previous dip (refractory period)
+//   AND at least 60 frames have been received (warmup gate)
+//
+// Each dip = one wheel rotation.
+//
+// SESSION STATE MACHINE
+// ---------------------
+//   idle  → active  on first dip (after idle_timeout since last dip)
+//   active → idle   when no dip has been seen for 15 s (IDLE_TIMEOUT_MS)
+//
+// On idle transition an 'onSession' callback fires with:
+//   { cameraId, startedAt, endedAt, rotations, meanRps, peakRps }
+//
+// LIVE SIGNAL BUFFER
+// ------------------
+// Each camera maintains a 10 s ring buffer of NORMALISED brightness samples
+// (300 at 30 fps) and a 60 s ring buffer of dip timestamps. getLiveSignal()
+// returns the current buffer state so the UI can render an oscilloscope.
+// The oscilloscope therefore shows exactly what the dip detector sees.
+//
+// RESTART POLICY
+// --------------
+// Exponential backoff: initial 5 s → doubles each restart up to 60 s cap.
+// Resets to 5 s if the process was alive for > 5 min (healthy-exit heuristic).
 //
 // DIP DETECTION (adaptive threshold)
 // -----------------------------------
@@ -265,11 +313,14 @@ export interface RoiPct {
  * Per-camera brightness signal processor.
  *
  * Responsibilities:
- *   1. For each full-frame PGM buffer, compute roi_mean and frame_mean.
- *   2. Maintain a rolling mean of frame_mean (frame_baseline) using a
- *      separate WELFORD_WINDOW-sized circular buffer.
- *   3. Produce normalized[t] = roi_mean[t] - (frame_mean[t] - frame_baseline[t]).
- *      Global autoexposure shifts cancel; local ROI changes (tape) survive.
+ *   1. For each full-frame PGM buffer, compute roi_mean and the reference signal
+ *      (band_ref_mean when enough X background exists, else frame_mean).
+ *   2. Maintain a rolling mean of the chosen reference (reference_baseline) using
+ *      a separate WELFORD_WINDOW-sized circular buffer.
+ *   3. Produce normalized[t] = roi_mean[t] - (reference[t] - reference_baseline[t]).
+ *      Band-local banding cancels because reference and ROI share the same Y rows.
+ *      Global autoexposure shifts also cancel via the frame_mean fallback path.
+ *      Local ROI changes (tape) survive because they don't affect the reference.
  *   4. Maintain an exact rolling mean/std over the last WELFORD_WINDOW normalised
  *      samples for adaptive threshold computation.
  *   5. Detect dip events (normalized < mean - sensitivity × std) with refractory,
@@ -288,8 +339,9 @@ export class BrightnessSignal {
   // Circular sample buffer of NORMALISED values for adaptive stats.
   private readonly windowBuffer: number[] = [];
 
-  // Circular sample buffer of frame_mean values for the baseline rolling mean.
-  private readonly frameBaselineBuffer: number[] = [];
+  // Circular sample buffer of the chosen reference signal values for baseline rolling mean.
+  // Holds band_ref_mean values when band reference is available, else frame_mean values.
+  private readonly referenceBaselineBuffer: number[] = [];
 
   // Live ring buffer (300 samples → 10 s at 30 fps). Stores NORMALISED values.
   private readonly liveBuffer: number[] = [];
@@ -328,15 +380,23 @@ export class BrightnessSignal {
       ? roiMeanBrightness(pixels, width, height, this.roi)
       : frameMean;
 
-    // Update the frame_baseline rolling buffer.
-    this.frameBaselineBuffer.push(frameMean);
-    if (this.frameBaselineBuffer.length > WELFORD_WINDOW) {
-      this.frameBaselineBuffer.shift();
-    }
-    const frameBaseline = rollingMean(this.frameBaselineBuffer);
+    // Choose the reference signal: band_ref_mean when there are enough background
+    // pixels in the same Y rows as the ROI; otherwise fall back to frame_mean.
+    const bandRef = this.roi !== null
+      ? roiBandReferenceMean(pixels, width, height, this.roi)
+      : null;
+    const reference = bandRef !== null ? bandRef : frameMean;
 
-    // normalized = roi_mean - (frame_mean - frame_baseline)
-    const normalized = roiMean - (frameMean - frameBaseline);
+    // Update the reference baseline rolling buffer.
+    this.referenceBaselineBuffer.push(reference);
+    if (this.referenceBaselineBuffer.length > WELFORD_WINDOW) {
+      this.referenceBaselineBuffer.shift();
+    }
+    const referenceBaseline = rollingMean(this.referenceBaselineBuffer);
+
+    // normalized = roi_mean - (reference - reference_baseline)
+    // Band-local reference cancels horizontal banding; tape crossing survives.
+    const normalized = roiMean - (reference - referenceBaseline);
 
     // Update live ring buffer with normalised value.
     this.liveBuffer.push(normalized);
@@ -656,6 +716,88 @@ export function roiMeanBrightness(
 }
 
 /**
+ * Threshold for band reference viability: the combined left+right background
+ * columns must total at least this fraction of the frame width.
+ * Below this floor the band reference is too sparse to be reliable and we fall
+ * back to whole-frame mean.
+ *
+ * 5% on each side = 10% total minimum. We enforce 5% total (left+right combined)
+ * as the outer check, matching the spec's "< 5% of frame width on each side"
+ * language (either side alone < 5% is allowed if the other side compensates —
+ * but if BOTH sides are < 5% of frame width the total will be < 10%).
+ * Practically: if neither side has ≥ 5% we return null.
+ */
+const BAND_REF_MIN_FRACTION = 0.05;
+
+/**
+ * Compute the mean brightness of pixels in the SAME Y rows as `roi` but
+ * with X coordinates OUTSIDE the ROI's X range. This gives a band-local
+ * reference that cancels horizontal mains-flicker banding without being
+ * fooled by a tape crossing the ROI.
+ *
+ * Samples both left (x < roi_x0) and right (x > roi_x1) of the ROI within
+ * the same Y rows. If only one side exists and is wide enough, uses that
+ * side. If neither side has ≥ BAND_REF_MIN_FRACTION × frameWidth pixels
+ * worth of columns (roughly 5% frame-width), returns null so the caller
+ * falls back to whole-frame mean.
+ *
+ * Returns null when:
+ *   - frameWidth or frameHeight is 0
+ *   - ROI clips to the full frame width (no X background columns available)
+ *   - Available background columns are fewer than the minimum threshold
+ */
+export function roiBandReferenceMean(
+  pixels: Buffer,
+  frameWidth: number,
+  frameHeight: number,
+  roi: RoiPct,
+): number | null {
+  if (frameWidth <= 0 || frameHeight <= 0) return null;
+
+  const roiX0 = Math.max(0, Math.round(frameWidth  * roi.x / 100));
+  const roiX1 = Math.min(frameWidth,  Math.round(frameWidth  * (roi.x + roi.w) / 100));
+  const roiY0 = Math.max(0, Math.round(frameHeight * roi.y / 100));
+  const roiY1 = Math.min(frameHeight, Math.round(frameHeight * (roi.y + roi.h) / 100));
+
+  if (roiY1 <= roiY0) return null; // degenerate ROI height
+
+  // Left-side width (columns 0 .. roiX0-1) and right-side width (roiX1 .. frameWidth-1).
+  const leftWidth  = roiX0;          // number of columns to the left of ROI
+  const rightWidth = frameWidth - roiX1; // number of columns to the right of ROI
+
+  const minColumns = Math.round(frameWidth * BAND_REF_MIN_FRACTION);
+
+  const useLeft  = leftWidth  >= minColumns;
+  const useRight = rightWidth >= minColumns;
+
+  if (!useLeft && !useRight) return null; // ROI too wide — fall back to frame_mean
+
+  let sum = 0;
+  let count = 0;
+
+  for (let y = roiY0; y < roiY1; y += 1) {
+    const rowBase = y * frameWidth;
+    if (useLeft) {
+      for (let x = 0; x < roiX0; x += 1) {
+        sum += pixels[rowBase + x] ?? 0;
+        count += 1;
+      }
+    }
+    if (useRight) {
+      for (let x = roiX1; x < frameWidth; x += 1) {
+        sum += pixels[rowBase + x] ?? 0;
+        count += 1;
+      }
+    }
+  }
+
+  // Safety: should never be zero given the useLeft/useRight guards, but be explicit.
+  if (count === 0) return null;
+
+  return sum / count;
+}
+
+/**
  * Compute the arithmetic mean of an array of numbers.
  * Returns 0 for an empty array.
  */
@@ -910,7 +1052,7 @@ function spawnDetectorForCamera(camera: db.CameraRow, backoffMs: number): void {
 
   log.info(
     { cameraId, rtspUrl, roiX, roiY, roiW, roiH, sensitivity, sampleFps: SAMPLE_FPS, normalisationEnabled: true },
-    'wheel-tape: detector started (full-frame normalisation)',
+    'wheel-tape: detector started (row-band-local normalisation with frame_mean fallback)',
   );
 }
 
