@@ -890,7 +890,7 @@ describe('narrator integration — tape session -> diary entry', () => {
     expect(typeof details['camera']).toBe('string');
   });
 
-  it('dedupe: two sessions within WHEEL_DEDUPE_WINDOW_MS merge with summed rotations', async () => {
+  it('dedupe: two sessions within WHEEL_DEDUPE_GAP_MS (5 min silence) merge with summed rotations', async () => {
     const { handleWheelTapeSession, resetNarratorState } =
       await import('../src/narrator.js');
     const db = await import('../src/db.js');
@@ -906,16 +906,17 @@ describe('narrator integration — tape session -> diary entry', () => {
     db.setSetting('pet_name', 'Remy');
 
     const t0 = 1_800_100_000_000;
+    // First session: 15 rotations, gap=12s to second start (within 5 min dedupe gap).
     const first = await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 5_000, rotations: 8, meanRps: 1.6, peakRps: 3 },
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 5_000, rotations: 15, meanRps: 3.0, peakRps: 5 },
       { now: () => t0 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
     );
     expect(first).not.toBeNull();
 
-    // 12s later — within the 20s dedupe window.
-    const t1 = t0 + 12_000;
+    // Second session starts 12s after first ended — gap = 12s, well within 5 min.
+    const t1 = t0 + 5_000 + 12_000;
     const merged = await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t1, endedAt: t1 + 5_000, rotations: 7, meanRps: 1.4, peakRps: 2 },
+      { cameraId: cam.id, startedAt: t1, endedAt: t1 + 5_000, rotations: 15, meanRps: 3.0, peakRps: 4 },
       { now: () => t1 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
     );
 
@@ -924,11 +925,11 @@ describe('narrator integration — tape session -> diary entry', () => {
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries).toHaveLength(1);
     const det = JSON.parse(entries[0]!.details ?? '{}') as Record<string, unknown>;
-    // (8 + 7) rotations × 13cm / 100 = 1.95m
-    expect((det['wheel_meters'] as number)).toBeCloseTo(1.95, 4);
-    expect(det['rotations']).toBe(15);
+    // (15 + 15) rotations × 13cm / 100 = 3.9m
+    expect((det['wheel_meters'] as number)).toBeCloseTo(3.9, 4);
+    expect(det['rotations']).toBe(30);
     expect(det['merged_sessions']).toBe(1);
-    expect(det['peak_rps']).toBe(3);
+    expect(det['peak_rps']).toBe(5);
   });
 
   it('zero-duration session is rejected (returns null)', async () => {

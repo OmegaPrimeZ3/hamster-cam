@@ -144,23 +144,33 @@ let tuning: NarratorTuning = {
 const COALESCE_WINDOW_MS = 120_000;
 
 /**
- * Wheel diary-entry dedupe window. When a wheel activity entry is about to be
- * committed and the most recent prior wheel entry for the SAME camera was
- * written within this window, the new entry is MERGED into the prior one
- * (duration extended, wheel_meters/rotations accumulated, merged_sessions
- * counter incremented) rather than inserting a new row.
+ * Wheel diary-entry dedupe gap. When a wheel tape session ends and the most
+ * recent prior wheel entry for the SAME camera ended less than this many
+ * milliseconds before the NEW session STARTED, the new session is MERGED into
+ * the prior entry (duration extended to wall-clock span, wheel_meters/rotations
+ * accumulated, merged_sessions counter incremented) rather than inserting a new
+ * row.
  *
- * 20 000 ms is larger than Frigate's inertia padding (~7 500 ms for cam2) but
- * smaller than any realistic inter-session gap — chosen so Frigate re-detect
- * noise within the same physical wheel run collapses into one entry while
- * genuinely separate nocturnal sessions remain distinct rows.
+ * The gap is measured as: new_session.startedAt − prior_row.occurred_at
+ * (i.e. the silence between the previous session's end and the new session's
+ * start). Using start-to-end timestamps instead of end-to-end timestamps means
+ * two long sessions with only a few seconds of silence between them correctly
+ * merge even though their end timestamps are many minutes apart.
  *
- * This replaces the previous in-memory WheelCoalesceContext approach that
- * introduced process-restart sensitivity and duplicate-write bugs. The dedupe
- * is now DB-keyed and idempotent: if the process restarts mid-session the next
- * event simply queries the prior row and merges.
+ * 300 000 ms (5 min) is well above typical intra-run pause noise while still
+ * being much smaller than the inter-session gaps between separate nocturnal
+ * running bouts.
  */
-const WHEEL_DEDUPE_WINDOW_MS = 20_000;
+const WHEEL_DEDUPE_GAP_MS = 300_000;
+
+/**
+ * Sparse-session filter thresholds. Sessions below EITHER threshold are
+ * classified as detector noise (dusk/dawn camera-transition artefacts, stray
+ * tape reflections) and discarded before any dedupe or diary-write logic runs.
+ * A discarded session does not influence dedupe state.
+ */
+const MIN_VALID_ROTATIONS = 10;
+const MIN_VALID_MEAN_RPS = 0.4;
 
 /** Re-read tunables from `settings` (called from index.ts on startup & after settings.update). */
 export function refreshNarratorTunings(): void {
@@ -1238,17 +1248,23 @@ export async function saveManualSnapshot(input: {
 
 /**
  * Convert a completed wheel tape session into a diary entry (or merge it
- * into the most recent prior wheel entry when within WHEEL_DEDUPE_WINDOW_MS).
+ * into the most recent prior wheel entry when the silence gap is within
+ * WHEEL_DEDUPE_GAP_MS).
  *
  * Distance formula: rotations × wheel_tape_circumference_cm / 100 (read from
  * camera row at session-end time so a mid-night calibration change takes effect
  * immediately).
  *
- * Dedupe: if the most recent wheel diary entry for this camera ended within
- * WHEEL_DEDUPE_WINDOW_MS, we extend that row rather than inserting a new one.
- * This collapses intra-session brief gaps within a single physical wheel run
- * into one diary entry. When merging, rotations are summed and wheel_meters
- * is recomputed from the total rotation count.
+ * Sparse-session filter: sessions with fewer than MIN_VALID_ROTATIONS rotations
+ * OR a mean RPS below MIN_VALID_MEAN_RPS are discarded as detector noise before
+ * any dedupe or diary write. Discarded sessions do not affect dedupe state.
+ *
+ * Dedupe: if the silence gap between the prior entry's end (prior.occurred_at)
+ * and this session's start (session.startedAt) is within WHEEL_DEDUPE_GAP_MS,
+ * we extend the prior row's wall-clock span rather than inserting a new one.
+ * The merged duration_ms = new_session.endedAt − first_session.startedAt,
+ * giving correct "Remy ran from HH:MM to HH:MM (N min including pauses)"
+ * semantics. Rotations and wheel_meters are accumulated; peak_rps is the max.
  */
 export async function handleWheelTapeSession(
   session: WheelTapeSession,
@@ -1263,6 +1279,15 @@ export async function handleWheelTapeSession(
   const durationMs = session.endedAt - session.startedAt;
   if (durationMs <= 0) {
     log.warn({ cameraId: session.cameraId, durationMs }, 'wheel-tape: session has zero/negative duration — skipping');
+    return null;
+  }
+
+  // Sparse-session filter: discard detector noise before touching dedupe state.
+  if (session.rotations < MIN_VALID_ROTATIONS || session.meanRps < MIN_VALID_MEAN_RPS) {
+    log.info(
+      { cameraId: session.cameraId, rotations: session.rotations, meanRps: session.meanRps, durationMs },
+      'wheel-tape: session discarded as noise',
+    );
     return null;
   }
 
@@ -1281,12 +1306,15 @@ export async function handleWheelTapeSession(
 
   const occurredAt = session.endedAt;
 
-  // Dedupe: check whether we should merge into a recent prior wheel entry.
+  // Dedupe: compare the SILENCE GAP between prior entry's end and this session's
+  // start. Using start-of-new vs end-of-prior means two long sessions separated
+  // by only a few seconds of silence will correctly merge even when their end
+  // timestamps are many minutes apart.
   const prior = db.getRecentWheelEntryForCamera(session.cameraId);
   if (
     prior !== null &&
     prior.occurred_at !== null &&
-    occurredAt - prior.occurred_at <= WHEEL_DEDUPE_WINDOW_MS
+    session.startedAt - prior.occurred_at <= WHEEL_DEDUPE_GAP_MS
   ) {
     let priorDetails: Record<string, unknown> = {};
     if (prior.details) {

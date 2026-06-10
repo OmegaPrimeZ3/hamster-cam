@@ -273,9 +273,9 @@ describe('narrator', () => {
     vi.useRealTimers();
   });
 
-  it('wheel tape sessions within WHEEL_DEDUPE_WINDOW_MS merge into one row; sessions further apart stay distinct', async () => {
-    // Two wheel tape sessions 13s apart (within the 20s dedupe window) merge
-    // into ONE row with accumulated distance.
+  it('wheel tape sessions with <5 min silence between them merge into one row; sessions further apart stay distinct', async () => {
+    // Two wheel tape sessions with only 7s of silence between them (well within
+    // the 5 min dedupe gap) merge into ONE row with accumulated distance.
     const { handleWheelTapeSession, resetNarratorState } =
       await import('../src/narrator.js');
     const db = await import('../src/db.js');
@@ -286,26 +286,26 @@ describe('narrator', () => {
     const t0 = 1_700_000_000_000;
     const deps = { now: () => t0, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // First session: 10 rotations.
+    // First session: ends at t0 + 3_000.
     await handleWheelTapeSession(
       { cameraId: cam.id, startedAt: t0, endedAt: t0 + 3_000, rotations: 10, meanRps: 3.3, peakRps: 5 },
       deps,
     );
 
-    // 13s later — within the 20s dedupe window → merged into the first row.
+    // Second session starts 7s after first ended (10_000 - 3_000 = 7_000 ms gap → within 5 min).
     await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t0 + 10_000, endedAt: t0 + 13_000, rotations: 8, meanRps: 2.7, peakRps: 4 },
+      { cameraId: cam.id, startedAt: t0 + 10_000, endedAt: t0 + 13_000, rotations: 12, meanRps: 2.7, peakRps: 4 },
       { ...deps, now: () => t0 + 13_000 },
     );
 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
-    // Within-window → merged: exactly ONE row.
+    // Within-gap → merged: exactly ONE row.
     expect(entries.length).toBe(1);
     expect(entries[0]?.activity).toBe('wheel');
     // The merged row has a merged_sessions counter.
     const details = JSON.parse(entries[0]?.details ?? '{}') as Record<string, unknown>;
     expect(details['merged_sessions']).toBe(1);
-    // Accumulated wheel_meters: (10 + 8) × 13cm / 100 = 2.34m total.
+    // Accumulated wheel_meters: (10 + 12) × 13cm / 100 = 2.86m total.
     expect(typeof details['wheel_meters']).toBe('number');
     expect((details['wheel_meters'] as number)).toBeGreaterThan(0);
   });
@@ -1518,7 +1518,8 @@ describe('handleWheelTapeSession — tape-crossing detector integration', () => 
     expect(typeof details['camera']).toBe('string');
   });
 
-  it('dedupe: two sessions 10s apart produce one merged row with accumulated wheel_meters', async () => {
+  it('dedupe: two sessions with 10s silence gap produce one merged row with accumulated wheel_meters', async () => {
+    // First ends at t0 + 5_000; second starts at t0 + 15_000 → gap = 10s, within 5 min.
     const { handleWheelTapeSession, resetNarratorState } =
       await import('../src/narrator.js');
     const db = await import('../src/db.js');
@@ -1534,17 +1535,17 @@ describe('handleWheelTapeSession — tape-crossing detector integration', () => 
     db.setSetting('pet_name', 'Remy');
 
     const t0 = 1_700_020_000_000;
-    // First session: 5 rotations → 5 × 13/100 = 0.65m.
+    // First session: 15 rotations → 15 × 13/100 = 1.95m.
     const first = await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 5_000, rotations: 5, meanRps: 1.0, peakRps: 2.0 },
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 5_000, rotations: 15, meanRps: 3.0, peakRps: 4.0 },
       { now: () => t0 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
     );
     expect(first).not.toBeNull();
 
-    // Second session 10s after first ended — within 20s dedupe window.
+    // Second session starts 10s after first ended — gap = 10s, within 5 min dedupe gap.
     const t1 = t0 + 15_000;
     const merged = await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t1, endedAt: t1 + 5_000, rotations: 5, meanRps: 1.0, peakRps: 2.0 },
+      { cameraId: cam.id, startedAt: t1, endedAt: t1 + 5_000, rotations: 15, meanRps: 3.0, peakRps: 4.0 },
       { now: () => t1 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
     );
     expect(merged?.id).toBe(first?.id);
@@ -1552,13 +1553,14 @@ describe('handleWheelTapeSession — tape-crossing detector integration', () => 
     const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
     expect(entries.length).toBe(1);
     const det = JSON.parse(entries[0]!.details ?? '{}') as Record<string, unknown>;
-    // Accumulated: (5 + 5) × 13cm / 100 = 1.3m total.
-    expect((det['wheel_meters'] as number)).toBeCloseTo(1.3, 4);
+    // Accumulated: (15 + 15) × 13cm / 100 = 3.9m total.
+    expect((det['wheel_meters'] as number)).toBeCloseTo(3.9, 4);
     expect(det['merged_sessions']).toBe(1);
-    expect(det['rotations']).toBe(10);
+    expect(det['rotations']).toBe(30);
   });
 
-  it('two sessions 30s apart produce two separate rows', async () => {
+  it('two sessions with 6 min silence gap produce two separate rows', async () => {
+    // Gap = 360_000 ms > 300_000 ms (5 min threshold) → no merge.
     const { handleWheelTapeSession, resetNarratorState } =
       await import('../src/narrator.js');
     const db = await import('../src/db.js');
@@ -1574,14 +1576,14 @@ describe('handleWheelTapeSession — tape-crossing detector integration', () => 
 
     const t0 = 1_700_030_000_000;
     await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 5_000, rotations: 5, meanRps: 1.0, peakRps: 2.0 },
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 5_000, rotations: 30, meanRps: 1.0, peakRps: 2.0 },
       { now: () => t0 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
     );
 
-    // 30s later — outside the 20s dedupe window.
-    const t1 = t0 + 30_000;
+    // Second session starts 360_000 ms (6 min) after first ended — outside the 5 min gap.
+    const t1 = t0 + 5_000 + 360_000;
     await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t1, endedAt: t1 + 5_000, rotations: 5, meanRps: 1.0, peakRps: 2.0 },
+      { cameraId: cam.id, startedAt: t1, endedAt: t1 + 5_000, rotations: 30, meanRps: 1.0, peakRps: 2.0 },
       { now: () => t1 + 5_000, rng: () => 0, onEntryWritten: async () => {} },
     );
 
@@ -1591,6 +1593,116 @@ describe('handleWheelTapeSession — tape-crossing detector integration', () => 
     // No merged_sessions on the second row.
     const det2 = JSON.parse(entries[1]!.details ?? '{}') as Record<string, unknown>;
     expect(det2['merged_sessions']).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wheel sparse-session filter (MIN_VALID_ROTATIONS=10, MIN_VALID_MEAN_RPS=0.4)
+// ---------------------------------------------------------------------------
+
+describe('handleWheelTapeSession — sparse-session noise filter', () => {
+  it('session with rotations < 10 is discarded — no diary row written', async () => {
+    const { handleWheelTapeSession, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    resetNarratorState();
+    const cam = db.createCamera({ name: 'wheel-cam', emoji: '🎡', stream_url: 'rtsp://x/w', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_740_000_000_000;
+    const result = await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 20_000, rotations: 8, meanRps: 0.6, peakRps: 1.0 },
+      { now: () => t0 + 20_000, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    expect(result).toBeNull();
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+  });
+
+  it('session with meanRps < 0.4 is discarded — no diary row written', async () => {
+    const { handleWheelTapeSession, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    resetNarratorState();
+    const cam = db.createCamera({ name: 'wheel-cam', emoji: '🎡', stream_url: 'rtsp://x/w', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_740_100_000_000;
+    const result = await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 21_000, rotations: 5, meanRps: 0.3, peakRps: 0.6 },
+      { now: () => t0 + 21_000, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    expect(result).toBeNull();
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(0);
+  });
+
+  it('session with rotations=12 and meanRps=0.5 passes the filter and is written', async () => {
+    const { handleWheelTapeSession, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    resetNarratorState();
+    const cam = db.createCamera({ name: 'wheel-cam', emoji: '🎡', stream_url: 'rtsp://x/w', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const t0 = 1_740_200_000_000;
+    const result = await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: t0, endedAt: t0 + 24_000, rotations: 12, meanRps: 0.5, peakRps: 1.0 },
+      { now: () => t0 + 24_000, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.activity).toBe('wheel');
+    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    expect(entries.length).toBe(1);
+  });
+
+  it('noise session does not corrupt dedupe state — real sessions before and after still merge', async () => {
+    // Real session at t=0 → noise session at t=2 min (discarded) → real session at t=4 min.
+    // Gap between first real end and second real start = 4 min < 5 min → should merge.
+    const { handleWheelTapeSession, resetNarratorState } =
+      await import('../src/narrator.js');
+    const db = await import('../src/db.js');
+    resetNarratorState();
+    const cam = db.createCamera({ name: 'wheel-cam', emoji: '🎡', stream_url: 'rtsp://x/w', enabled: true });
+    db.setSetting('pet_name', 'Remy');
+
+    const base = 1_740_300_000_000;
+
+    // Real session 1: ends at base + 60_000
+    const s1Start = base;
+    const s1End = base + 60_000;
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s1Start, endedAt: s1End, rotations: 30, meanRps: 0.5, peakRps: 1.0 },
+      { now: () => s1End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    // Noise session at t+2 min: 3 rotations, meanRps 0.15 — must be discarded.
+    const noiseStart = base + 120_000;
+    const noiseEnd = noiseStart + 20_000;
+    const noiseResult = await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: noiseStart, endedAt: noiseEnd, rotations: 3, meanRps: 0.15, peakRps: 0.3 },
+      { now: () => noiseEnd, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    expect(noiseResult).toBeNull();
+
+    // Real session 2: starts at t+4 min (4 min after real session 1 ended → gap = 4 min < 5 min).
+    const s2Start = base + 240_000;
+    const s2End = s2Start + 60_000;
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s2Start, endedAt: s2End, rotations: 30, meanRps: 0.5, peakRps: 1.2 },
+      { now: () => s2End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    const entries = db.listDiaryEntriesBetween(0, base + 1_000_000);
+    // Noise session discarded, real sessions merged → exactly one diary row.
+    expect(entries.length).toBe(1);
+    expect(entries[0]!.occurred_at).toBe(s2End);
+    const det = JSON.parse(entries[0]!.details ?? '{}') as Record<string, unknown>;
+    expect(det['rotations']).toBe(60);
+    expect(det['merged_sessions']).toBe(1);
   });
 });
 
@@ -2465,14 +2577,15 @@ describe('commit-gate: false_positive and unsaved-track filtering', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Wheel diary-entry dedupe (WHEEL_DEDUPE_WINDOW_MS = 20s)
+// Wheel diary-entry dedupe (WHEEL_DEDUPE_GAP_MS = 300s / 5 min)
 // ---------------------------------------------------------------------------
 
 // Wheel diary-entry dedupe via handleWheelTapeSession (tape-crossing detector path)
 // ---------------------------------------------------------------------------
 
-describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
-  it("two wheel tape sessions on the same camera within 20s merge into one row", async () => {
+describe("wheel diary dedupe (gap-based, WHEEL_DEDUPE_GAP_MS = 5 min)", () => {
+  it("two wheel tape sessions with a 10s silence gap merge into one row", async () => {
+    // First ends at t0, second starts at t0 + 10s — gap = 10s, within 5 min.
     const { handleWheelTapeSession, resetNarratorState } =
       await import("../src/narrator.js");
     const db = await import("../src/db.js");
@@ -2483,7 +2596,7 @@ describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
     const t0 = 1_730_000_000_000;
     const deps = { now: () => t0, rng: () => 0 as number, onEntryWritten: async () => {} };
 
-    // First session: ends at t0.
+    // First session: starts 5s before t0, ends at t0.
     await handleWheelTapeSession(
       { cameraId: cam.id, startedAt: t0 - 5_000, endedAt: t0, rotations: 10, meanRps: 2.0, peakRps: 4 },
       deps,
@@ -2493,10 +2606,11 @@ describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
     expect(entries.length).toBe(1);
     const firstId = entries[0]!.id;
 
-    // Second session 10s later — within the 20s dedupe window.
-    const t1 = t0 + 10_000;
+    // Second session starts 10s after first ended (gap = 10s, << 5 min).
+    const s2Start = t0 + 10_000;
+    const t1 = s2Start + 3_000;
     await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t1 - 3_000, endedAt: t1, rotations: 6, meanRps: 2.0, peakRps: 3 },
+      { cameraId: cam.id, startedAt: s2Start, endedAt: t1, rotations: 12, meanRps: 2.0, peakRps: 3 },
       { ...deps, now: () => t1 },
     );
 
@@ -2507,11 +2621,12 @@ describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
     const details = JSON.parse(entries[0]!.details ?? "{}") as Record<string, unknown>;
     expect(typeof details["wheel_meters"]).toBe("number");
     expect(details["merged_sessions"]).toBe(1);
-    // rotations accumulated: 10 + 6 = 16
-    expect(details["rotations"]).toBe(16);
+    // rotations accumulated: 10 + 12 = 22
+    expect(details["rotations"]).toBe(22);
   });
 
-  it("two wheel tape sessions on the same camera more than 20s apart produce two distinct rows", async () => {
+  it("two wheel tape sessions with a gap just over 5 min produce two distinct rows", async () => {
+    // First ends at t0, second starts at t0 + 300_001 ms (5 min + 1 ms gap).
     const { handleWheelTapeSession, resetNarratorState } =
       await import("../src/narrator.js");
     const db = await import("../src/db.js");
@@ -2527,10 +2642,11 @@ describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
       { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
     );
 
-    // Second session 25s later — outside the 20s dedupe window.
-    const t1 = t0 + 25_000;
+    // Second session starts 300_001 ms after first ended — just outside 5 min gap.
+    const s2Start = t0 + 300_001;
+    const t1 = s2Start + 5_000;
     await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: t1 - 5_000, endedAt: t1, rotations: 10, meanRps: 2.0, peakRps: 4 },
+      { cameraId: cam.id, startedAt: s2Start, endedAt: t1, rotations: 10, meanRps: 2.0, peakRps: 4 },
       { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
     );
 
@@ -2539,7 +2655,8 @@ describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
     expect(entries.every((e) => e.activity === "wheel")).toBe(true);
   });
 
-  it("two wheel tape sessions on DIFFERENT cameras within 20s produce two distinct rows", async () => {
+  it("two wheel tape sessions on DIFFERENT cameras with small gap produce two distinct rows", async () => {
+    // Dedupe is per-camera; different cameras never merge.
     const { handleWheelTapeSession, resetNarratorState } =
       await import("../src/narrator.js");
     const db = await import("../src/db.js");
@@ -2551,14 +2668,15 @@ describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
     db.setSetting("pet_name", "Remy");
 
     const t0 = 1_730_200_000_000;
-    const t1 = t0 + 5_000;
+    const s2Start = t0 + 5_000; // only 5s gap — would merge if same camera
+    const t1 = s2Start + 5_000;
 
     await handleWheelTapeSession(
       { cameraId: camA.id, startedAt: t0 - 5_000, endedAt: t0, rotations: 10, meanRps: 2.0, peakRps: 4 },
       { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
     );
     await handleWheelTapeSession(
-      { cameraId: camB.id, startedAt: t1 - 5_000, endedAt: t1, rotations: 10, meanRps: 2.0, peakRps: 4 },
+      { cameraId: camB.id, startedAt: s2Start, endedAt: t1, rotations: 10, meanRps: 2.0, peakRps: 4 },
       { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
     );
 
@@ -2567,7 +2685,8 @@ describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
     expect(entries.every((e) => e.activity === "wheel")).toBe(true);
   });
 
-  it("merged row duration never exceeds new_end_time minus first_start_time", async () => {
+  it("merged row duration_ms equals new_session.endedAt minus first_session.startedAt (wall-clock span)", async () => {
+    // Verify the wall-clock span semantics: duration includes the silence gap.
     const { handleWheelTapeSession, resetNarratorState } =
       await import("../src/narrator.js");
     const db = await import("../src/db.js");
@@ -2575,27 +2694,138 @@ describe("wheel diary dedupe (WHEEL_DEDUPE_WINDOW_MS)", () => {
     const cam = db.createCamera({ name: "wheel-cam", emoji: "🎡", stream_url: "rtsp://x/w", enabled: true });
     db.setSetting("pet_name", "Remy");
 
-    const t0 = 1_730_300_005_000; // end of first session
-    const firstStart = t0 - 5_000;
+    const firstStart = 1_730_300_000_000;
+    const firstEnd = firstStart + 5_000;        // session 1: 5s active
 
     await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: firstStart, endedAt: t0, rotations: 10, meanRps: 2.0, peakRps: 4 },
-      { now: () => t0, rng: () => 0, onEntryWritten: async () => {} },
+      { cameraId: cam.id, startedAt: firstStart, endedAt: firstEnd, rotations: 10, meanRps: 2.0, peakRps: 4 },
+      { now: () => firstEnd, rng: () => 0, onEntryWritten: async () => {} },
     );
 
-    const t1 = t0 + 8_000; // 8s later — within 20s window
-    const secondStart = t1 - 3_000;
+    const secondStart = firstEnd + 8_000;       // 8s silence
+    const secondEnd = secondStart + 3_000;      // session 2: 3s active
     await handleWheelTapeSession(
-      { cameraId: cam.id, startedAt: secondStart, endedAt: t1, rotations: 6, meanRps: 2.0, peakRps: 3 },
-      { now: () => t1, rng: () => 0, onEntryWritten: async () => {} },
+      { cameraId: cam.id, startedAt: secondStart, endedAt: secondEnd, rotations: 12, meanRps: 2.0, peakRps: 3 },
+      { now: () => secondEnd, rng: () => 0, onEntryWritten: async () => {} },
     );
 
-    const entries = db.listDiaryEntriesBetween(0, t0 + 1_000_000);
+    const entries = db.listDiaryEntriesBetween(0, firstStart + 1_000_000);
     expect(entries.length).toBe(1);
     const merged = entries[0]!;
-    expect(merged.occurred_at).toBe(t1);
-    const maxAllowedDuration = merged.occurred_at - firstStart;
-    expect(merged.duration_ms).toBeLessThanOrEqual(maxAllowedDuration);
-    expect(merged.duration_ms).toBeGreaterThan(0);
+    expect(merged.occurred_at).toBe(secondEnd);
+    // Wall-clock span: secondEnd − firstStart = 5_000 + 8_000 + 3_000 = 16_000 ms
+    expect(merged.duration_ms).toBe(secondEnd - firstStart);
+  });
+
+  // Production bug: two long sessions with only 14s silence between them.
+  // End-to-end diff is ~104s but GAP (new.startedAt - prior.occurred_at) = 14s.
+  it("production case: two 90-138s sessions with 14s silence gap merge correctly", async () => {
+    const { handleWheelTapeSession, resetNarratorState } =
+      await import("../src/narrator.js");
+    const db = await import("../src/db.js");
+    resetNarratorState();
+    const cam = db.createCamera({ name: "cam2", emoji: "📷", stream_url: "rtsp://x/cam2", enabled: true });
+    db.setSetting("pet_name", "Remy");
+
+    // Session 967: ended at 03:43:23, duration 138s → started 03:41:05
+    const s1End = 1_730_400_000_000;
+    const s1Start = s1End - 138_000;
+
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s1Start, endedAt: s1End, rotations: 60, meanRps: 1.2, peakRps: 2.5 },
+      { now: () => s1End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    // Session 968: started 14s after 967 ended, duration 90s
+    const s2Start = s1End + 14_000;
+    const s2End = s2Start + 90_000;
+
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s2Start, endedAt: s2End, rotations: 50, meanRps: 1.1, peakRps: 2.0 },
+      { now: () => s2End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    const entries = db.listDiaryEntriesBetween(0, s1Start + 1_000_000);
+    // 14s silence << 5 min → must merge into one row.
+    expect(entries.length).toBe(1);
+    const merged = entries[0]!;
+    expect(merged.occurred_at).toBe(s2End);
+    expect(merged.duration_ms).toBe(s2End - s1Start);
+    const det = JSON.parse(merged.details ?? "{}") as Record<string, unknown>;
+    expect(det["rotations"]).toBe(110);
+    expect(det["merged_sessions"]).toBe(1);
+  });
+
+  it("two sessions with exactly 5 min + 1 ms silence do NOT merge", async () => {
+    // Boundary: gap = 300_001 ms > 300_000 ms → separate rows.
+    const { handleWheelTapeSession, resetNarratorState } =
+      await import("../src/narrator.js");
+    const db = await import("../src/db.js");
+    resetNarratorState();
+    const cam = db.createCamera({ name: "wheel-cam", emoji: "🎡", stream_url: "rtsp://x/w", enabled: true });
+    db.setSetting("pet_name", "Remy");
+
+    const s1End = 1_730_500_000_000;
+    const s1Start = s1End - 5_000;
+
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s1Start, endedAt: s1End, rotations: 30, meanRps: 1.0, peakRps: 2.0 },
+      { now: () => s1End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    const s2Start = s1End + 300_001;
+    const s2End = s2Start + 5_000;
+
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s2Start, endedAt: s2End, rotations: 30, meanRps: 1.0, peakRps: 2.0 },
+      { now: () => s2End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    const entries = db.listDiaryEntriesBetween(0, s1Start + 1_000_000);
+    expect(entries.length).toBe(2);
+  });
+
+  it("three sessions each 30s apart all merge into one row; duration spans all three", async () => {
+    const { handleWheelTapeSession, resetNarratorState } =
+      await import("../src/narrator.js");
+    const db = await import("../src/db.js");
+    resetNarratorState();
+    const cam = db.createCamera({ name: "wheel-cam", emoji: "🎡", stream_url: "rtsp://x/w", enabled: true });
+    db.setSetting("pet_name", "Remy");
+
+    // Session 1: 60s active
+    const s1Start = 1_730_600_000_000;
+    const s1End = s1Start + 60_000;
+    // Session 2: 30s silence, 60s active
+    const s2Start = s1End + 30_000;
+    const s2End = s2Start + 60_000;
+    // Session 3: 30s silence, 60s active
+    const s3Start = s2End + 30_000;
+    const s3End = s3Start + 60_000;
+
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s1Start, endedAt: s1End, rotations: 30, meanRps: 0.5, peakRps: 1.0 },
+      { now: () => s1End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s2Start, endedAt: s2End, rotations: 30, meanRps: 0.5, peakRps: 1.2 },
+      { now: () => s2End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+    await handleWheelTapeSession(
+      { cameraId: cam.id, startedAt: s3Start, endedAt: s3End, rotations: 30, meanRps: 0.5, peakRps: 1.5 },
+      { now: () => s3End, rng: () => 0, onEntryWritten: async () => {} },
+    );
+
+    const entries = db.listDiaryEntriesBetween(0, s1Start + 1_000_000);
+    expect(entries.length).toBe(1);
+    const merged = entries[0]!;
+    expect(merged.occurred_at).toBe(s3End);
+    // Wall-clock span: s3End − s1Start = 60 + 30 + 60 + 30 + 60 = 240_000 ms
+    expect(merged.duration_ms).toBe(s3End - s1Start);
+    const det = JSON.parse(merged.details ?? "{}") as Record<string, unknown>;
+    expect(det["rotations"]).toBe(90);
+    expect(det["merged_sessions"]).toBe(2);
+    // peak_rps should be the max across all sessions
+    expect(det["peak_rps"]).toBe(1.5);
   });
 });
