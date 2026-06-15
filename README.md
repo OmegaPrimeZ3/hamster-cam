@@ -1,5 +1,21 @@
 # remy-hamster
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/Node-%E2%89%A524-339933?logo=node.js&logoColor=white)](.nvmrc)
+[![pnpm](https://img.shields.io/badge/pnpm-11-F69220?logo=pnpm&logoColor=white)](pnpm-workspace.yaml)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](tsconfig.base.json)
+[![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](app/web/package.json)
+[![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white)](app/web/package.json)
+[![Fastify](https://img.shields.io/badge/Fastify-5-000000?logo=fastify&logoColor=white)](app/server/package.json)
+[![tRPC](https://img.shields.io/badge/tRPC-10-2596BE?logo=trpc&logoColor=white)](app/server/package.json)
+[![SQLite](https://img.shields.io/badge/SQLite-better--sqlite3-003B57?logo=sqlite&logoColor=white)](app/server/package.json)
+[![PWA](https://img.shields.io/badge/PWA-ready-5A0FC8?logo=pwa&logoColor=white)](app/web/vite.config.ts)
+[![Frigate](https://img.shields.io/badge/Frigate-0.17-1E90FF?logo=homeassistant&logoColor=white)](mac-mini/)
+[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-Zero%202%20W-A22846?logo=raspberrypi&logoColor=white)](pi-zero/)
+[![Tested with Playwright](https://img.shields.io/badge/Tested%20with-Playwright-2EAD33?logo=playwright&logoColor=white)](e2e/)
+[![Self-hosted](https://img.shields.io/badge/Self--hosted-100%25-1abc9c)](#architecture)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+
 > A weekend-buildable, child-friendly pet camera. Cheap Pi-Zero cameras,
 > on-device AI, a storybook activity diary, and a tiny AI ghostwriter
 > that tucks your hamster in at night.
