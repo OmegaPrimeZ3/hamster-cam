@@ -373,7 +373,7 @@ function DistanceTile({ meters, distanceUnit, isLoading }: DistanceTileProps): J
   const value = meters > 0 ? formatMeters(meters, distanceUnit) : '—';
   return (
     <div
-      aria-label={`Distance this week: ${value}`}
+      aria-label={`Distance in the last 7 days: ${value}`}
       style={{
         flex: '0 0 auto',
         scrollSnapAlign: 'start',
@@ -393,7 +393,7 @@ function DistanceTile({ meters, distanceUnit, isLoading }: DistanceTileProps): J
     >
       <span aria-hidden style={{ fontSize: 20, lineHeight: 1 }}>🏃</span>
       <span style={{ fontSize: 13, fontWeight: 500, opacity: 0.8, letterSpacing: '0.01em' }}>
-        This week
+        Last 7 days
       </span>
       <span style={{ opacity: isLoading ? 0.5 : 1 }}>{isLoading ? '…' : value}</span>
     </div>

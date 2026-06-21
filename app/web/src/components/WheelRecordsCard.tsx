@@ -151,7 +151,7 @@ export function WheelRecordsContent({
           hasData={data.todayMeters > 0 || data.todaySeconds > 0}
         />
         <PeriodCell
-          label="This week"
+          label="Last 7 days"
           distance={fmt(data.weekMeters)}
           time={formatSeconds(data.weekSeconds)}
           accent="#FFA94D"

@@ -1254,7 +1254,7 @@ const statsRouter = router({
     .output(z.object({
       /** Total wheel metres run in the last 24 hours (rolling window). */
       todayMeters: z.number(),
-      /** Total wheel metres in the current 7-day window (Sun-origin local week). */
+      /** Total wheel metres in the last 7 days (rolling window). */
       weekMeters: z.number(),
       /** All-time cumulative wheel metres. */
       allTimeMeters: z.number(),
@@ -1271,7 +1271,7 @@ const statsRouter = router({
       })),
       /** Total wheel time in the last 24 hours (rolling window), whole seconds (sum of wheel diary entry duration_ms). */
       todaySeconds: z.number().int(),
-      /** Total wheel time this week in whole seconds. */
+      /** Total wheel time in the last 7 days (rolling window), whole seconds. */
       weekSeconds: z.number().int(),
       /** All-time total wheel time in whole seconds. */
       allTimeSeconds: z.number().int(),
@@ -1280,21 +1280,21 @@ const statsRouter = router({
       const now = Date.now();
       const todayStart = startOfLocalDay(new Date(now));
 
-      // "Today" distance/time is a rolling last-24-hours window (not the local
-      // calendar day) so the figure always reflects the most recent full day of
-      // activity regardless of the wall clock.
+      // Both "today" and "week" are rolling trailing windows (last 24h / last
+      // 7 days), not calendar anchors. This keeps the natural ordering
+      // 24h ≤ 7d ≤ all-time — a Sunday-anchored week would reset mid-window and
+      // could read lower than the trailing 24h. Matches the StatsStrip tile,
+      // which already uses a rolling 7-day window.
       const dayAgo = now - 24 * 60 * 60 * 1000;
-
-      // Week: Sunday-based, same pattern as startOfLocalDay.
-      const weekStart = startOfLocalWeek(new Date(now));
+      const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
 
       const todayMeters = db.sumWheelMetersBetween(dayAgo, now);
-      const weekMeters = db.sumWheelMetersBetween(weekStart, now);
+      const weekMeters = db.sumWheelMetersBetween(weekAgo, now);
       const allTimeMeters = db.sumAllWheelMeters();
 
       // Wheel time in seconds (truncated, not rounded, to stay conservative).
       const todaySeconds = Math.trunc(db.sumWheelDurationMsBetween(dayAgo, now) / 1000);
-      const weekSeconds = Math.trunc(db.sumWheelDurationMsBetween(weekStart, now) / 1000);
+      const weekSeconds = Math.trunc(db.sumWheelDurationMsBetween(weekAgo, now) / 1000);
       const allTimeSeconds = Math.trunc(db.sumAllWheelDurationMs() / 1000);
 
       // Daily series for the last 14 days.
@@ -2101,14 +2101,6 @@ export type AppRouter = typeof appRouter;
 function startOfLocalDay(d: Date): number {
   const copy = new Date(d);
   copy.setHours(0, 0, 0, 0);
-  return copy.getTime();
-}
-
-/** Start of the current week in local time (Sunday = 0). */
-function startOfLocalWeek(d: Date): number {
-  const copy = new Date(d);
-  copy.setHours(0, 0, 0, 0);
-  copy.setDate(copy.getDate() - copy.getDay());
   return copy.getTime();
 }
 
