@@ -144,7 +144,7 @@ export function WheelRecordsContent({
         }}
       >
         <PeriodCell
-          label="Today"
+          label="Last 24h"
           distance={fmt(data.todayMeters)}
           time={formatSeconds(data.todaySeconds)}
           accent="#FF7AAF"
@@ -259,11 +259,15 @@ export function WheelRecordsCard(): JSX.Element | null {
 
   useEffect(() => {
     if (!records.data) return;
-    const { todayMeters, bestDayMeters } = records.data;
+    const { bestDayMeters, bestDayDate } = records.data;
 
-    // New day record: today >= all-time best (and there's distance today so we
-    // don't celebrate 0 == 0 on a quiet day).
-    const isNewDayRecord = todayMeters > 0 && todayMeters >= bestDayMeters;
+    // New day record: the best-ever calendar day IS today. Keyed on the
+    // calendar date (not the rolling-24h todayMeters, which can span two days
+    // and exceed any single day's total — that would misfire the celebration).
+    const todayUTC = new Date();
+    todayUTC.setUTCHours(0, 0, 0, 0);
+    const todayKey = todayUTC.toISOString().slice(0, 10);
+    const isNewDayRecord = bestDayMeters > 0 && bestDayDate === todayKey;
 
     if (isNewDayRecord && !recordFiredRef.current) {
       recordFiredRef.current = true;

@@ -1252,7 +1252,7 @@ const statsRouter = router({
   wheelRecords: protectedProcedure
     .input(z.void())
     .output(z.object({
-      /** Total wheel metres run today (local calendar day). */
+      /** Total wheel metres run in the last 24 hours (rolling window). */
       todayMeters: z.number(),
       /** Total wheel metres in the current 7-day window (Sun-origin local week). */
       weekMeters: z.number(),
@@ -1269,7 +1269,7 @@ const statsRouter = router({
         date: z.string(),
         meters: z.number(),
       })),
-      /** Total wheel time today in whole seconds (sum of wheel diary entry duration_ms). */
+      /** Total wheel time in the last 24 hours (rolling window), whole seconds (sum of wheel diary entry duration_ms). */
       todaySeconds: z.number().int(),
       /** Total wheel time this week in whole seconds. */
       weekSeconds: z.number().int(),
@@ -1279,17 +1279,21 @@ const statsRouter = router({
     .query(() => {
       const now = Date.now();
       const todayStart = startOfLocalDay(new Date(now));
-      const todayEnd = todayStart + 24 * 60 * 60 * 1000;
+
+      // "Today" distance/time is a rolling last-24-hours window (not the local
+      // calendar day) so the figure always reflects the most recent full day of
+      // activity regardless of the wall clock.
+      const dayAgo = now - 24 * 60 * 60 * 1000;
 
       // Week: Sunday-based, same pattern as startOfLocalDay.
       const weekStart = startOfLocalWeek(new Date(now));
 
-      const todayMeters = db.sumWheelMetersBetween(todayStart, todayEnd);
+      const todayMeters = db.sumWheelMetersBetween(dayAgo, now);
       const weekMeters = db.sumWheelMetersBetween(weekStart, now);
       const allTimeMeters = db.sumAllWheelMeters();
 
       // Wheel time in seconds (truncated, not rounded, to stay conservative).
-      const todaySeconds = Math.trunc(db.sumWheelDurationMsBetween(todayStart, todayEnd) / 1000);
+      const todaySeconds = Math.trunc(db.sumWheelDurationMsBetween(dayAgo, now) / 1000);
       const weekSeconds = Math.trunc(db.sumWheelDurationMsBetween(weekStart, now) / 1000);
       const allTimeSeconds = Math.trunc(db.sumAllWheelDurationMs() / 1000);
 

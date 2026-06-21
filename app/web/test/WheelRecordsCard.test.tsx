@@ -46,11 +46,11 @@ describe('WheelRecordsContent', () => {
     expect(screen.getByText('Wheel Records')).toBeInTheDocument();
   });
 
-  it('renders "Today", "This week", "All time" chip labels', () => {
+  it('renders "Last 24h", "This week", "All time" chip labels', () => {
     renderWithProviders(
       <WheelRecordsContent data={BASE_DATA} distanceUnit="mi" showRecord={false} />,
     );
-    expect(screen.getByText('Today')).toBeInTheDocument();
+    expect(screen.getByText('Last 24h')).toBeInTheDocument();
     expect(screen.getByText('This week')).toBeInTheDocument();
     expect(screen.getByText('All time')).toBeInTheDocument();
   });
