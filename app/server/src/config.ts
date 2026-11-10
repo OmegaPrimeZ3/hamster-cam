@@ -77,6 +77,13 @@ const envSchema = z.object({
   // If unset or the file is absent the recap video is produced silently.
   // See app/server/assets/MUSIC_NOTICE.md for the recommended track.
   RECAP_MUSIC_PATH: z.string().optional(),
+
+  // Camera watchdog — reboots a Pi over ssh when Frigate gets no frames from
+  // its camera for 5 minutes. Unset CAMERA_WATCHDOG_HOSTS = feature off.
+  // Format: "<frigate camera name>=<user>@<host>", comma-separated.
+  CAMERA_WATCHDOG_HOSTS: z.string().optional(),
+  CAMERA_WATCHDOG_SSH_KEY: z.string().optional().default('/opt/hamster-cam/secrets/camera-watchdog/id_ed25519'),
+  CAMERA_WATCHDOG_KNOWN_HOSTS: z.string().optional().default('/opt/hamster-cam/secrets/camera-watchdog/known_hosts'),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

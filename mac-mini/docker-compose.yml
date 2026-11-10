@@ -66,6 +66,10 @@ services:
       # Snapshots + nightly time-lapse MP4s.
       # Path inside container matches STORAGE_PATH in .env.
       - ./storage:/opt/hamster-cam/storage
+      # Camera watchdog ssh key + known_hosts (host-only, never in git).
+      # Optional — the watchdog stays off unless CAMERA_WATCHDOG_HOSTS is set.
+      # See docs/SETUP_PI_ZERO.md "Step 7b".
+      - ./secrets/camera-watchdog:/opt/hamster-cam/secrets/camera-watchdog:ro
     depends_on:
       mosquitto:
         condition: service_healthy

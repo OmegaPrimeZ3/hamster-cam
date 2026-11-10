@@ -1,0 +1,12 @@
+# /etc/sudoers.d/camera-watchdog-reboot
+#
+# Lets the `hamster` user run exactly one privileged command without a
+# password: reboot. Paired with a forced-command authorized_keys entry so the
+# server's camera-watchdog key can do nothing on this Pi EXCEPT reboot it.
+# See docs/SETUP_PI_ZERO.md "Step 7b".
+#
+# Validate BEFORE installing (a broken sudoers file locks you out of sudo):
+#   sudo visudo -cf /tmp/camera-watchdog-reboot.sudoers && \
+#   sudo install -m 0440 -o root -g root /tmp/camera-watchdog-reboot.sudoers \
+#     /etc/sudoers.d/camera-watchdog-reboot
+hamster ALL=(root) NOPASSWD: /usr/bin/systemctl reboot

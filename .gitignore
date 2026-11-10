@@ -33,6 +33,10 @@ coverage/
 /mac-mini/frigate-config.yml
 !/mac-mini/frigate-config.example.yml
 
+# Host-only secrets (camera-watchdog ssh key, etc.)
+/mac-mini/secrets/
+secrets/camera-watchdog/
+
 # SQLite database files and on-host storage
 /db/*.db
 /db/*.db-*

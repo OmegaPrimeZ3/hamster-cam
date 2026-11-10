@@ -398,6 +398,24 @@ the limit.
 **If the key is missing or revoked,** the recap job logs and exits
 cleanly. Every other feature keeps working.
 
+### Camera watchdog (auto-reboot a silent Pi)
+
+**What it does.** If Frigate gets effectively no frames (under 1 fps) from a camera for 5
+minutes, the backend ssh-es into that camera's Pi Zero and reboots it.
+Repeat reboots of a still-dead camera back off (15m → 2h cap), it never
+acts while Frigate itself is down, and every attempt is written to the
+audit log (`camera.watchdog_reboot`).
+
+**How to enable.** Generate a dedicated ssh key on the server, install
+it on each Pi as a forced-command key that can *only* reboot, then set
+`CAMERA_WATCHDOG_HOSTS` in `.env`. Full walkthrough:
+[docs/SETUP_PI_ZERO.md → Step 7b](docs/SETUP_PI_ZERO.md#step-7b---optional-let-the-server-reboot-a-silent-pi).
+
+**Cost.** Free — plain ssh on your LAN.
+
+**If it's not configured** (or the key files are missing), the watchdog
+logs once at boot and stays off. Every other feature keeps working.
+
 ### Read-aloud TTS
 
 **What it does.** A speaker icon appears on every diary card. Tap it

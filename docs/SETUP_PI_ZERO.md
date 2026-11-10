@@ -337,6 +337,86 @@ and the RTSP port; persistent failures escalate from "restart the
 service" to "reboot the Pi".
 
 
+## Step 7b - (Optional) Let the server reboot a silent Pi
+
+The Pi-local watchdog above can't see a wedged USB camera: go2rtc keeps
+its HTTP and RTSP ports open with no producer, so the probes pass while
+Frigate gets 0 fps forever. The app's **camera watchdog**
+(`app/server/src/camera-watchdog.ts`) closes that gap from the server
+side: when Frigate's `camera_fps` for a camera has been under 1 for 5 minutes,
+it ssh-es into that camera's Pi and reboots it. Repeat reboots of a
+still-dead camera back off 15m → 30m → 1h → 2h (cap); the backoff resets
+when frames return. Nothing happens while Frigate itself is unreachable.
+Every reboot attempt lands in the audit log as `camera.watchdog_reboot`.
+
+The ssh key it uses is locked to a single forced command on the Pi, so
+even a leaked key can only reboot the camera.
+
+**1. On the Mac Mini — generate the key and pin the Pis' host keys:**
+
+```
+cd /opt/hamster-cam
+mkdir -p secrets/camera-watchdog && chmod 700 secrets/camera-watchdog
+ssh-keygen -t ed25519 -N '' -C hamster-app-camera-watchdog \
+  -f secrets/camera-watchdog/id_ed25519
+ssh-keyscan -t ed25519 192.168.1.201 192.168.1.202 \
+  > secrets/camera-watchdog/known_hosts
+# The container runs as uid 1000 and ssh refuses group/world-readable keys.
+chown -R 1000:1000 secrets/camera-watchdog
+chmod 600 secrets/camera-watchdog/id_ed25519
+cat secrets/camera-watchdog/id_ed25519.pub   # copy this for step 2
+```
+
+Compare the scanned fingerprints (`ssh-keygen -lf secrets/camera-watchdog/known_hosts`)
+against each Pi's own (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
+on the Pi). **After any SD-card swap / reflash** the Pi's host key changes
+and reboots will fail with a host-key error in the app log — re-run the
+`ssh-keyscan` line.
+
+**2. On each Pi — allow passwordless reboot and install the restricted key:**
+
+```
+# From the dev machine
+scp pi-zero/camera-watchdog-reboot.sudoers hamster@hamster-cam-1.local:/tmp/
+
+ssh -t hamster@hamster-cam-1.local '
+  sudo visudo -cf /tmp/camera-watchdog-reboot.sudoers &&
+  sudo install -m 0440 -o root -g root /tmp/camera-watchdog-reboot.sudoers \
+    /etc/sudoers.d/camera-watchdog-reboot
+  rm /tmp/camera-watchdog-reboot.sudoers
+'
+
+# Append the key with a forced command. Replace <MINI_LAN_IP> with the
+# Mac Mini's LAN IP (container ssh is NATed to it) and paste the .pub line.
+ssh hamster@hamster-cam-1.local "cat >> ~/.ssh/authorized_keys" <<'KEY'
+restrict,from="<MINI_LAN_IP>",command="sudo -n /usr/bin/systemctl reboot" ssh-ed25519 AAAA...paste... hamster-app-camera-watchdog
+KEY
+```
+
+Repeat for every Pi.
+
+**3. On the Mac Mini — enable it in `.env` and recreate the app container:**
+
+```
+CAMERA_WATCHDOG_HOSTS=hamster_cam_1=hamster@192.168.1.201,hamster_cam_2=hamster@192.168.1.202
+```
+
+The names on the left must be the Frigate camera names. Then
+`docker compose up -d hamster-app` and look for `camera watchdog started`
+in `docker logs hamster-app`.
+
+**4. Prove the path end-to-end (this WILL reboot the Pi):**
+
+```
+docker exec hamster-app ssh -F /dev/null -T -o BatchMode=yes \
+  -i /opt/hamster-cam/secrets/camera-watchdog/id_ed25519 \
+  -o UserKnownHostsFile=/opt/hamster-cam/secrets/camera-watchdog/known_hosts \
+  hamster@192.168.1.202
+```
+
+Limits: this needs the Pi's network stack alive. A Pi that is fully hung
+(no WiFi, no sshd) is the BCM2835 hardware watchdog's job, or a smart plug's.
+
 ## Step 8 - Verify the stream
 
 From your dev machine:

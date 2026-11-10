@@ -50,6 +50,7 @@ import { startMqttSubscriber, type MqttSubscriber } from './mqtt.js';
 import { flushPendingEntries, handleWheelTapeSession, refreshNarratorTunings } from './narrator.js';
 import { initVapidKeys } from './push.js';
 import { startFrigateStatsPoller, stopFrigateStatsPoller } from './frigate.js';
+import { startCameraWatchdog, stopCameraWatchdog } from './camera-watchdog.js';
 import { initWheelTapeDetectors, onSession, shutdownWheelTapeDetectors } from './wheel-tape.js';
 import { registerDiaryStream } from './diary-stream.js';
 import { closeWss, registerLiveWsProxy } from './live-ws.js';
@@ -442,6 +443,12 @@ export async function startRuntime(): Promise<RuntimeHandles> {
 
   startFrigateStatsPoller();
 
+  // Optional: reboot a Pi whose camera has gone silent for 5 min. No-op
+  // unless CAMERA_WATCHDOG_HOSTS is set; never blocks or fails boot.
+  await startCameraWatchdog().catch((err: unknown) => {
+    app.log.warn({ err }, 'camera watchdog failed to start; continuing');
+  });
+
   // Wire wheel-tape sessions → narrator diary entries before starting the
   // detectors so no session is dropped during startup.
   onSession((session) => {
@@ -509,6 +516,7 @@ async function shutdown(handles: RuntimeHandles, sig: string): Promise<void> {
     try { t.stop(); } catch { /* noop */ }
   }
   stopFrigateStatsPoller();
+  stopCameraWatchdog();
   // Stop wheel-tape detectors before flushing the narrator so in-flight
   // sessions don't fire callbacks after the narrator has already flushed.
   shutdownWheelTapeDetectors();

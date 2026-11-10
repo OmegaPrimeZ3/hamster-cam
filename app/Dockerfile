@@ -103,8 +103,11 @@ FROM node:24-bookworm-slim AS runtime
 # the wheel odometer (optical rotation counting), Send-a-Clip (recording-window
 # extraction), and the nightly time-lapse (snapshot stitching). Install as root
 # (before the USER switch below); --no-install-recommends keeps it lean.
+# openssh-client — the camera watchdog (src/camera-watchdog.ts) reboots a
+# silent Pi via a forced-command ssh key. Unused unless CAMERA_WATCHDOG_HOSTS
+# is set.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as a non-root user. The default `node` user (uid 1000) is already
