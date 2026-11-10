@@ -404,7 +404,10 @@ cleanly. Every other feature keeps working.
 minutes, the backend ssh-es into that camera's Pi Zero and reboots it.
 Repeat reboots of a still-dead camera back off (15m → 2h cap), it never
 acts while Frigate itself is down, and every attempt is written to the
-audit log (`camera.watchdog_reboot`).
+audit log (`camera.watchdog_reboot`). Before rebooting it probes go2rtc for
+a fresh frame: if the Pi is still streaming, the stall is Frigate's, so the
+Pi is left alone and a `camera.watchdog_frigate_stalled` audit row is
+written instead.
 
 **How to enable.** Generate a dedicated ssh key on the server, install
 it on each Pi as a forced-command key that can *only* reboot, then set

@@ -19,6 +19,13 @@
 //   - A camera name Frigate doesn't report is skipped (typo guard).
 //   - Per-camera exponential backoff between reboots (15m → 2h cap) so a
 //     permanently dead camera doesn't reboot-loop its Pi every 5 minutes.
+//   - Before rebooting, actively probe go2rtc for one fresh frame. Low Frigate
+//     fps does NOT always mean a dead Pi: verified live 2026-11-10, Frigate's
+//     own capture process for a camera died while the Pi streamed fine, and
+//     Frigate kept reporting a stale 0.4 fps. A frame from go2rtc's
+//     /api/frame.jpeg pulls a keyframe across Pi camera → Pi go2rtc → Mini
+//     restream regardless of other consumers, so it proves the Pi is healthy.
+//     Then the fault is Frigate's — warn + audit, never reboot the Pi.
 
 import { execFile as execFileCb } from 'node:child_process';
 import { access, constants as fsConstants } from 'node:fs/promises';
@@ -41,7 +48,12 @@ export const MIN_ALIVE_FPS = 1;
 export const CHECK_INTERVAL_MS = 30_000;
 export const INITIAL_BACKOFF_MS = 15 * 60_000;
 export const MAX_BACKOFF_MS = 2 * 60 * 60_000;
+export const STALL_RECHECK_MS = 5 * 60_000;
 const SSH_TIMEOUT_MS = 30_000;
+const PROBE_TIMEOUT_MS = 20_000;
+// Frigate's embedded go2rtc API port — reachable on the compose network but
+// not published to the host.
+const GO2RTC_PORT = '1984';
 
 /** Frigate camera name → ssh target (`user@host`). */
 export type HostMap = ReadonlyMap<string, string>;
@@ -72,6 +84,8 @@ export interface CameraWatchdogDeps {
   pollStats: () => Promise<Map<string, CameraStats>>;
   /** Reboot the Pi at `target`. Rejects on failure. */
   reboot: (target: string) => Promise<void>;
+  /** True when go2rtc can serve a fresh frame for `camera` (Pi is streaming). */
+  probeFrame: (camera: string) => Promise<boolean>;
 }
 
 interface CameraState {
@@ -79,6 +93,7 @@ interface CameraState {
   nextRebootAllowedAt: number;
   backoffMs: number;
   rebootsSinceAlive: number;
+  frigateStallReported: boolean;
 }
 
 export class CameraWatchdog {
@@ -92,6 +107,7 @@ export class CameraWatchdog {
         nextRebootAllowedAt: 0,
         backoffMs: INITIAL_BACKOFF_MS,
         rebootsSinceAlive: 0,
+        frigateStallReported: false,
       });
     }
   }
@@ -126,16 +142,47 @@ export class CameraWatchdog {
         s.backoffMs = INITIAL_BACKOFF_MS;
         s.nextRebootAllowedAt = 0;
         s.rebootsSinceAlive = 0;
+        s.frigateStallReported = false;
         continue;
       }
 
       const silentMs = now - s.lastAliveAt;
       if (silentMs < STALE_MS || now < s.nextRebootAllowedAt) continue;
 
+      if (await this.deps.probeFrame(camera)) {
+        // The Pi is streaming; Frigate's capture is what stalled. Rebooting
+        // the Pi would fix nothing. Re-probe later without escalating.
+        s.nextRebootAllowedAt = now + STALL_RECHECK_MS;
+        if (!s.frigateStallReported) {
+          s.frigateStallReported = true;
+          this.reportFrigateStall(camera, silentMs);
+        }
+        continue;
+      }
+
       s.nextRebootAllowedAt = now + s.backoffMs;
       s.backoffMs = Math.min(s.backoffMs * 2, MAX_BACKOFF_MS);
       s.rebootsSinceAlive += 1;
       await this.rebootPi(camera, target, silentMs, s.rebootsSinceAlive);
+    }
+  }
+
+  private reportFrigateStall(camera: string, silentMs: number): void {
+    const silentSec = Math.round(silentMs / 1000);
+    log.warn(
+      { camera, silentSec },
+      'Frigate shows no frames but the Pi is streaming (go2rtc served a fresh frame) — Frigate capture is stalled; NOT rebooting the Pi. Restart Frigate: docker restart hamster-frigate',
+    );
+    try {
+      insertAudit({
+        actor_user_id: null,
+        action: 'camera.watchdog_frigate_stalled',
+        target_type: 'camera',
+        target_id: camera,
+        details: { silentSec },
+      });
+    } catch (err) {
+      log.warn({ err: (err as Error).message }, 'audit insert failed');
     }
   }
 
@@ -182,6 +229,23 @@ export function sshReboot(keyPath: string, knownHostsPath: string) {
   };
 }
 
+/** Real probe: ask Frigate's embedded go2rtc for one JPEG frame. */
+export function go2rtcFrameProbe(frigateUrl: string) {
+  const base = new URL(frigateUrl);
+  base.port = GO2RTC_PORT;
+  return async (camera: string): Promise<boolean> => {
+    const url = new URL('/api/frame.jpeg', base);
+    url.searchParams.set('src', camera);
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      if (!res.ok || !res.headers.get('content-type')?.startsWith('image/')) return false;
+      return (await res.arrayBuffer()).byteLength > 0;
+    } catch {
+      return false; // unreachable / timed out → can't prove the Pi is alive
+    }
+  };
+}
+
 let handle: ReturnType<typeof setInterval> | null = null;
 
 /** Boot hook. Silent no-op unless CAMERA_WATCHDOG_HOSTS is configured. */
@@ -214,6 +278,7 @@ export async function startCameraWatchdog(): Promise<void> {
     now: Date.now,
     pollStats: () => pollFrigateStats(),
     reboot: sshReboot(key, knownHosts),
+    probeFrame: go2rtcFrameProbe(cfg.FRIGATE_URL),
   });
   let running = false;
   handle = setInterval(() => {

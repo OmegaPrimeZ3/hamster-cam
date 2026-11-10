@@ -349,6 +349,13 @@ still-dead camera back off 15m → 30m → 1h → 2h (cap); the backoff resets
 when frames return. Nothing happens while Frigate itself is unreachable.
 Every reboot attempt lands in the audit log as `camera.watchdog_reboot`.
 
+Before rebooting, it asks Frigate's embedded go2rtc (`http://<frigate>:1984/api/frame.jpeg`)
+for one fresh frame. If a frame arrives, the Pi is fine and **Frigate's own
+capture process is what stalled** (seen in production: Frigate kept
+reporting a stale 0.4 fps for a dead ffmpeg). The Pi is left alone, the app
+logs a warning, and it writes one `camera.watchdog_frigate_stalled` audit row.
+The fix for that case is `docker restart hamster-frigate`.
+
 The ssh key it uses is locked to a single forced command on the Pi, so
 even a leaked key can only reboot the camera.
 

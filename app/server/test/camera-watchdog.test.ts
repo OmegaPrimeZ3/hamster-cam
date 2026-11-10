@@ -42,16 +42,20 @@ async function harness(hostsRaw = 'cam1=hamster@10.0.0.1,cam2=hamster@10.0.0.2')
   let t = 1_000_000;
   let stats = new Map<string, CameraStats>([['cam1', live(30)], ['cam2', live(30)]]);
   const reboot = vi.fn<(target: string) => Promise<void>>().mockResolvedValue();
+  // Default: go2rtc can't serve a frame → the Pi really is silent.
+  const probeFrame = vi.fn<(camera: string) => Promise<boolean>>().mockResolvedValue(false);
   const wd = new mod.CameraWatchdog({
     hosts: mod.parseHostMap(hostsRaw),
     now: () => t,
     pollStats: async () => stats,
     reboot,
+    probeFrame,
   });
   return {
     mod,
     wd,
     reboot,
+    probeFrame,
     advance: async (ms: number) => { t += ms; await wd.tick(); },
     setStats: (m: Map<string, CameraStats>) => { stats = m; },
   };
@@ -149,6 +153,62 @@ describe('CameraWatchdog', () => {
     const { listAudit } = await import('../src/db.js');
     const details = JSON.parse(listAudit({ action_prefix: 'camera.%' })[0]!.details!);
     expect(details).toMatchObject({ ok: false, error: 'Connection timed out' });
+  });
+});
+
+describe('CameraWatchdog: Frigate stalled but Pi streaming', () => {
+  it('does not reboot when go2rtc still serves a frame; audits the stall once', async () => {
+    const h = await harness();
+    h.probeFrame.mockResolvedValue(true);
+    h.setStats(new Map([['cam1', live(30)], ['cam2', live(0.4)]]));
+    await h.advance(5 * MIN);
+    expect(h.probeFrame).toHaveBeenCalledWith('cam2');
+    expect(h.reboot).not.toHaveBeenCalled();
+
+    // Re-probes every 5 min, never reboots, audits only once per episode.
+    for (let i = 0; i < 6; i++) await h.advance(5 * MIN);
+    expect(h.reboot).not.toHaveBeenCalled();
+    expect(h.probeFrame.mock.calls.length).toBeGreaterThanOrEqual(6);
+    const { listAudit } = await import('../src/db.js');
+    const rows = listAudit({ action_prefix: 'camera.%' });
+    expect(rows.map((r) => r.action)).toEqual(['camera.watchdog_frigate_stalled']);
+  });
+
+  it('reboots once the Pi stops serving frames too', async () => {
+    const h = await harness();
+    h.probeFrame.mockResolvedValue(true);
+    h.setStats(new Map([['cam1', live(30)], ['cam2', live(0)]]));
+    await h.advance(5 * MIN);
+    expect(h.reboot).not.toHaveBeenCalled();
+
+    h.probeFrame.mockResolvedValue(false);
+    await h.advance(4 * MIN);
+    expect(h.reboot).not.toHaveBeenCalled(); // still inside the 5-min recheck
+    await h.advance(1 * MIN);
+    expect(h.reboot).toHaveBeenCalledWith('hamster@10.0.0.2');
+  });
+
+  it('never probes a healthy camera', async () => {
+    const h = await harness();
+    await h.advance(30 * MIN);
+    expect(h.probeFrame).not.toHaveBeenCalled();
+  });
+});
+
+describe('go2rtcFrameProbe', () => {
+  it('targets port 1984 on the Frigate host and requires an image body', async () => {
+    const { go2rtcFrameProbe } = await import('../src/camera-watchdog.js');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    fetchSpy.mockResolvedValueOnce(new Response(new Uint8Array([0xff, 0xd8]), { headers: { 'content-type': 'image/jpeg' } }));
+    await expect(go2rtcFrameProbe('http://frigate:5000')('hamster_cam_2')).resolves.toBe(true);
+    expect(String(fetchSpy.mock.calls[0]![0])).toBe('http://frigate:1984/api/frame.jpeg?src=hamster_cam_2');
+
+    fetchSpy.mockResolvedValueOnce(new Response('{"error":"x"}', { status: 404, headers: { 'content-type': 'application/json' } }));
+    await expect(go2rtcFrameProbe('http://frigate:5000')('x')).resolves.toBe(false);
+
+    fetchSpy.mockRejectedValueOnce(new Error('timeout'));
+    await expect(go2rtcFrameProbe('http://frigate:5000')('x')).resolves.toBe(false);
+    fetchSpy.mockRestore();
   });
 });
 
